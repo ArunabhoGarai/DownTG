@@ -3,7 +3,7 @@ import os
 import time
 import logging
 import asyncio
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Callable
 from pathlib import Path
 
 from telegram import (
@@ -45,6 +45,10 @@ from terabox_downloader import (
     is_terabox_url,
     extract_terabox_info,
     download_terabox_media,
+)
+from mtproto_uploader import (
+    is_mtproto_active,
+    upload_media_mtproto,
 )
 
 logger = logging.getLogger(__name__)
@@ -304,10 +308,45 @@ async def send_media_to_chat(
     url: str,
     quality: str,
     info: Optional[Dict[str, Any]],
+    progress_status_updater: Optional[Callable[[str], None]] = None,
 ):
-    """Sends audio or video to chat with metadata caption."""
+    """Sends audio or video to chat with metadata caption via MTProto (up to 2GB) or standard Bot API."""
     platform_badge = get_platform_badge(url)
-    if quality == "audio":
+    is_audio = (quality == "audio")
+    caption = f"🎵 **{title}**\n{platform_badge}" if is_audio else f"🎬 **{title}**\n{platform_badge}"
+
+    file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+
+    # 1. Attempt MTProto upload (supports up to 2GB with live upload percentage)
+    if is_mtproto_active() or file_size > 50 * 1024 * 1024:
+        async def _mtproto_progress(current: int, total: int):
+            if progress_status_updater and total > 0:
+                pct = int((current / total) * 100)
+                cur_str = format_bytes(current)
+                tot_str = format_bytes(total)
+                text = f"📤 **Uploading to Telegram: {pct}%**\n`[{cur_str} / {tot_str}]`"
+                try:
+                    res = progress_status_updater(text)
+                    if asyncio.iscoroutine(res):
+                        await res
+                except Exception:
+                    pass
+
+        mtproto_success = await upload_media_mtproto(
+            chat_id=chat_id,
+            file_path=file_path,
+            title=title,
+            caption=caption,
+            duration_sec=duration_sec,
+            thumbnail_path=None,
+            is_audio=is_audio,
+            progress_callback=_mtproto_progress,
+        )
+        if mtproto_success:
+            return
+
+    # 2. Standard HTTP Bot API upload (for files <= 50MB)
+    if is_audio:
         with open(file_path, "rb") as audio_file:
             await bot.send_audio(
                 chat_id=chat_id,
@@ -315,7 +354,7 @@ async def send_media_to_chat(
                 title=title,
                 performer=uploader,
                 duration=duration_sec,
-                caption=f"🎵 **{title}**\n{platform_badge}",
+                caption=caption,
                 parse_mode=constants.ParseMode.MARKDOWN,
             )
     else:
@@ -325,7 +364,7 @@ async def send_media_to_chat(
             await bot.send_video(
                 chat_id=chat_id,
                 video=video_file,
-                caption=f"🎬 **{title}**\n{platform_badge}",
+                caption=caption,
                 duration=duration_sec,
                 width=width,
                 height=height,
@@ -498,6 +537,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         url=url,
                         quality="480",
                         info=dl_info or info,
+                        progress_status_updater=lambda txt: status_msg.edit_text(txt, parse_mode=constants.ParseMode.MARKDOWN),
                     )
 
                     # Delete the status message on completion
@@ -683,6 +723,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 url=url,
                 quality=quality,
                 info=info,
+                progress_status_updater=lambda txt: edit_query_message(query, txt),
             )
 
             # Clear out / delete the quality selector panel message on successful upload

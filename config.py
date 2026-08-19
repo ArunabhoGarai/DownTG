@@ -11,8 +11,15 @@ load_dotenv(BASE_DIR / ".env")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_USER_ID = os.getenv("ADMIN_USER_ID", "").strip()
 
-# Max allowed file size to send via Telegram Bot API (Telegram default limit is 50MB)
-MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", 50))
+# Telegram MTProto Credentials for 2GB file upload support (get from my.telegram.org)
+TELEGRAM_API_ID = os.getenv("TELEGRAM_API_ID", "").strip()
+TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "").strip()
+IS_MTPROTO_ENABLED = bool(TELEGRAM_API_ID and TELEGRAM_API_HASH)
+
+# Max allowed file size (2000MB / 2GB for MTProto, 50MB for standard HTTP Bot API)
+DEFAULT_MAX_MB = 2000 if IS_MTPROTO_ENABLED else 50
+_raw_max_mb = os.getenv("MAX_FILE_SIZE_MB", "").strip()
+MAX_FILE_SIZE_MB = int(_raw_max_mb) if _raw_max_mb.isdigit() else DEFAULT_MAX_MB
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 
 # Download directories
@@ -23,8 +30,9 @@ DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", 2))
 
 # Quality presets
+best_label = "⚡ Best Quality (<2GB)" if IS_MTPROTO_ENABLED else "⚡ Best Quality (<50MB)"
 QUALITIES = {
-    "best": "Best (<50MB)",
+    "best": best_label,
     "720": "720p HD",
     "480": "480p SD",
     "360": "360p Low",

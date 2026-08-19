@@ -2,8 +2,9 @@ import sys
 import logging
 from telegram.ext import ApplicationBuilder
 
-from config import BOT_TOKEN
+from config import BOT_TOKEN, IS_MTPROTO_ENABLED
 from handlers import register_handlers
+from mtproto_uploader import start_mtproto, stop_mtproto
 
 # Configure logging
 logging.basicConfig(
@@ -11,6 +12,20 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+
+async def on_startup(app):
+    """Startup hook to initialize MTProto client if enabled."""
+    if IS_MTPROTO_ENABLED:
+        logger.info("Initializing Telegram MTProto Client...")
+        await start_mtproto()
+    else:
+        logger.info("MTProto is not configured. Running with standard 50MB HTTP Bot API.")
+
+
+async def on_shutdown(app):
+    """Shutdown hook to cleanly close MTProto client."""
+    await stop_mtproto()
 
 
 def main():
@@ -30,8 +45,14 @@ def main():
 
     logger.info("Starting Telegram Video Downloader Bot...")
 
-    # Build Telegram Bot application
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    # Build Telegram Bot application with MTProto lifecycle hooks
+    application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(on_startup)
+        .post_shutdown(on_shutdown)
+        .build()
+    )
 
     # Register handlers
     register_handlers(application)
