@@ -52,8 +52,9 @@ async def extract_terabox_info(url: str) -> Tuple[bool, Dict[str, Any], Optional
 
     try:
         connector = aiohttp.TCPConnector(ssl=False)
-        async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
-            async with session.get(target_api, timeout=20) as resp:
+        client_timeout = aiohttp.ClientTimeout(total=75, connect=15)
+        async with aiohttp.ClientSession(connector=connector, headers=headers, timeout=client_timeout) as session:
+            async with session.get(target_api) as resp:
                 if resp.status != 200:
                     return False, {}, f"TeraBox resolver API returned HTTP {resp.status}"
 
