@@ -26,16 +26,14 @@ def get_platform_badge(url: str) -> str:
         if "/shorts/" in url_lower:
             return "🔴 YouTube Shorts"
         return "▶️ YouTube"
-    elif "instagram.com" in url_lower or "instagr.am" in url_lower:
-        if "/reel/" in url_lower or "/reels/" in url_lower or "/share/r/" in url_lower:
+    elif "instagram.com" in url_lower:
+        if "/reel/" in url_lower or "/reels/" in url_lower:
             return "📸 Instagram Reel"
-        elif "/stories/" in url_lower:
-            return "📸 Instagram Story"
         return "📸 Instagram"
-    elif "facebook.com" in url_lower or "fb.watch" in url_lower or "fb.com" in url_lower or "fb.gg" in url_lower:
-        if "/reel/" in url_lower or "/reels/" in url_lower or "/share/r/" in url_lower:
+    elif "facebook.com" in url_lower or "fb.watch" in url_lower or "fb.com" in url_lower:
+        if "/reel/" in url_lower or "/reels/" in url_lower:
             return "🔵 Facebook Reel"
-        return "🔵 Facebook Video"
+        return "🔵 Facebook"
     elif "tiktok.com" in url_lower:
         return "🎵 TikTok"
     elif "twitter.com" in url_lower or "x.com" in url_lower:
@@ -67,77 +65,43 @@ def format_bytes(size: Optional[int]) -> str:
     return f"{size:.1f} TB"
 
 
-def get_base_ydl_opts(url: Optional[str] = None) -> Dict[str, Any]:
-    """Returns standard base options for yt-dlp with per-platform cookie and client isolation."""
-    url_lower = (url or "").lower()
-    
+def get_base_ydl_opts() -> Dict[str, Any]:
+    """Returns standard base options for yt-dlp."""
     opts = {
         'quiet': True,
         'no_warnings': True,
         'nocheckcertificate': True,
         'ignoreerrors': False,
         'logtostderr': False,
-        'noplaylist': False,
+        'noplaylist': True,
         'remote_components': ['ejs:github'],
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'ios', 'mweb', 'web'],
+                'player_client': ['android', 'web'],
             }
         },
         'http_headers': {
             'User-Agent': (
                 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                 'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/125.0.0.0 Safari/537.36'
+                'Chrome/124.0.0.0 Safari/537.36'
             ),
             'Accept-Language': 'en-US,en;q=0.9',
             'Sec-Fetch-Mode': 'navigate',
         },
     }
     
-    # Platform-specific cookie resolution (prevents Instagram cookies from breaking YouTube)
-    possible_cookie_paths = []
-    if "instagram.com" in url_lower or "instagr.am" in url_lower:
-        possible_cookie_paths = [
-            BASE_DIR / "instagram_cookies.txt",
-            BASE_DIR / "cookies.txt",
-            Path("instagram_cookies.txt"),
-            Path("cookies.txt"),
-            Path.home() / "DownTG" / "DownTG" / "instagram_cookies.txt",
-            Path.home() / "DownTG" / "DownTG" / "cookies.txt",
-        ]
-    elif "facebook.com" in url_lower or "fb.watch" in url_lower or "fb.com" in url_lower:
-        possible_cookie_paths = [
-            BASE_DIR / "facebook_cookies.txt",
-            BASE_DIR / "cookies.txt",
-            Path("facebook_cookies.txt"),
-            Path("cookies.txt"),
-            Path.home() / "DownTG" / "DownTG" / "facebook_cookies.txt",
-            Path.home() / "DownTG" / "DownTG" / "cookies.txt",
-        ]
-    else:  # YouTube and general sites
-        possible_cookie_paths = [
-            BASE_DIR / "youtube_cookies.txt",
-            BASE_DIR / "cookies.txt",
-            Path("youtube_cookies.txt"),
-            Path("cookies.txt"),
-            Path.home() / "DownTG" / "DownTG" / "youtube_cookies.txt",
-            Path.home() / "DownTG" / "DownTG" / "cookies.txt",
-        ]
-
+    # Check for cookies file in multiple locations
+    possible_cookie_paths = [
+        BASE_DIR / "cookies.txt",
+        Path("cookies.txt"),
+        Path.home() / "DownTG" / "DownTG" / "cookies.txt",
+    ]
     for cp in possible_cookie_paths:
         if cp.exists() and cp.is_file() and cp.stat().st_size > 0:
             opts['cookiefile'] = str(cp)
             logger.info(f"Using cookies file from: {cp}")
             break
-
-    # If cookies are provided, let yt-dlp use its full default client suite
-    if 'cookiefile' in opts:
-        opts['extractor_args'] = {
-            'youtube': {
-                'player_client': ['web', 'mweb', 'android', 'ios'],
-            }
-        }
 
     return opts
 
@@ -145,24 +109,14 @@ def get_base_ydl_opts(url: Optional[str] = None) -> Dict[str, Any]:
 async def extract_media_info(url: str) -> Tuple[bool, Dict[str, Any], Optional[str]]:
     """
     Extracts metadata from the given URL without downloading.
-    Handles single media items as well as Instagram/Facebook carousels.
     Returns (success, info_dict, error_message).
     """
     def _extract():
-        opts = get_base_ydl_opts(url)
+        opts = get_base_ydl_opts()
         opts['extract_flat'] = False
         with yt_dlp.YoutubeDL(opts) as ydl:
             try:
                 info = ydl.extract_info(url, download=False)
-                if not info:
-                    return False, {}, "No media found at URL."
-
-                # Handle Instagram / Facebook carousels & multi-item posts
-                if info.get("_type") == "playlist" and info.get("entries"):
-                    entries = [e for e in info["entries"] if e]
-                    if entries:
-                        info = entries[0]
-
                 return True, info, None
             except Exception as e:
                 return False, {}, str(e)
@@ -185,7 +139,7 @@ async def download_media(
     output_template = str(DOWNLOAD_DIR / f"{download_id}_%(title).100B.%(ext)s")
 
     def _download():
-        opts = get_base_ydl_opts(url)
+        opts = get_base_ydl_opts()
         opts['outtmpl'] = output_template
 
         if progress_hook:
@@ -219,15 +173,6 @@ async def download_media(
         with yt_dlp.YoutubeDL(opts) as ydl:
             try:
                 info = ydl.extract_info(url, download=True)
-                if not info:
-                    return False, None, None, "No video data returned."
-
-                # Handle playlist/carousel entries
-                if info.get("_type") == "playlist" and info.get("entries"):
-                    entries = [e for e in info["entries"] if e]
-                    if entries:
-                        info = entries[0]
-
                 downloaded_file = None
 
                 # Find downloaded file
