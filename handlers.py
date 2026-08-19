@@ -226,8 +226,112 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def send_media_to_chat(
+    bot,
+    chat_id: int,
+    file_path: str,
+    title: str,
+    uploader: str,
+    duration_sec: Optional[int],
+    url: str,
+    quality: str,
+    info: Optional[Dict[str, Any]],
+):
+    """Sends audio or video to chat with metadata caption."""
+    platform_badge = get_platform_badge(url)
+    if quality == "audio":
+        with open(file_path, "rb") as audio_file:
+            await bot.send_audio(
+                chat_id=chat_id,
+                audio=audio_file,
+                title=title,
+                performer=uploader,
+                duration=duration_sec,
+                caption=f"🎵 **{title}**\n{platform_badge}",
+                parse_mode=constants.ParseMode.MARKDOWN,
+            )
+    else:
+        width = info.get("width") if info else None
+        height = info.get("height") if info else None
+        with open(file_path, "rb") as video_file:
+            await bot.send_video(
+                chat_id=chat_id,
+                video=video_file,
+                caption=f"🎬 **{title}**\n{platform_badge}",
+                duration=duration_sec,
+                width=width,
+                height=height,
+                supports_streaming=True,
+                parse_mode=constants.ParseMode.MARKDOWN,
+            )
+
+
+async def show_quality_panel(
+    update: Update,
+    status_msg,
+    cache_key: str,
+    url: str,
+    title: str,
+    uploader: str,
+    duration: str,
+    thumbnail: Optional[str],
+    reason: Optional[str] = None,
+):
+    """Displays the interactive quality options panel when default download cannot complete."""
+    platform = get_platform_badge(url)
+    reply_markup = build_quality_keyboard(cache_key)
+
+    reason_text = f"\n⚠️ *{reason}*\n" if reason else ""
+    caption = (
+        f"{platform}\n"
+        f"📌 **{title}**\n\n"
+        f"👤 **Author:** {uploader}\n"
+        f"⏱ **Duration:** {duration}\n"
+        f"{reason_text}\n"
+        f"👇 *Choose quality to download:*"
+    )
+
+    try:
+        if thumbnail:
+            if status_msg:
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+            await update.message.reply_photo(
+                photo=thumbnail,
+                caption=caption,
+                reply_markup=reply_markup,
+                parse_mode=constants.ParseMode.MARKDOWN,
+            )
+        else:
+            if status_msg:
+                await status_msg.edit_text(
+                    caption,
+                    reply_markup=reply_markup,
+                    parse_mode=constants.ParseMode.MARKDOWN,
+                )
+            else:
+                await update.message.reply_text(
+                    caption,
+                    reply_markup=reply_markup,
+                    parse_mode=constants.ParseMode.MARKDOWN,
+                )
+    except Exception as e:
+        logger.warning(f"Could not render quality panel with photo: {e}")
+        if status_msg:
+            try:
+                await status_msg.edit_text(
+                    caption,
+                    reply_markup=reply_markup,
+                    parse_mode=constants.ParseMode.MARKDOWN,
+                )
+            except Exception:
+                pass
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Detects URLs in user messages and displays download options."""
+    """Detects URLs, attempts 480p default download, and falls back to quality panel on failure."""
     if not update.message or not update.message.text:
         return
 
@@ -241,11 +345,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     url = match.group(0)
     user_id = update.effective_user.id
-    platform = get_platform_badge(url)
 
     status_msg = await update.message.reply_text(
         f"🔍 **Analyzing link...**\n`{url}`",
-        parse_mode=constants.ParseMode.MARKDOWN
+        parse_mode=constants.ParseMode.MARKDOWN,
     )
 
     # Extract metadata without downloading
@@ -259,7 +362,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             err_text = "❌ Video not found or has been deleted."
         else:
             err_text = f"❌ Failed to fetch video:\n`{err[:150]}`"
-        
+
         await status_msg.edit_text(err_text, parse_mode=constants.ParseMode.MARKDOWN)
         return
 
@@ -267,16 +370,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     duration = format_duration(info.get("duration"))
     uploader = info.get("uploader", "Unknown Author")
     thumbnail = info.get("thumbnail")
+    duration_sec = info.get("duration")
     format_choices = build_format_choices(info)
 
-    # Store URL and info in cache
+    # Store URL and info in cache for fallback panel
     cache_key = generate_cache_key(user_id)
     URL_CACHE[cache_key] = {
         "url": url,
         "title": title,
         "duration": duration,
         "uploader": uploader,
-        "duration_sec": info.get("duration"),
+        "duration_sec": duration_sec,
+        "thumbnail": thumbnail,
         "format_choices": format_choices,
     }
 
@@ -285,42 +390,84 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for k in list(URL_CACHE.keys())[:-50]:
             URL_CACHE.pop(k, None)
 
-    reply_markup = build_quality_keyboard(cache_key)
+    # 1. Attempt 480p auto-download by default
+    try:
+        await status_msg.edit_text(
+            f"⏳ **Downloading (480p default)...**\n📌 *{title}*",
+            parse_mode=constants.ParseMode.MARKDOWN,
+        )
+    except Exception:
+        pass
 
-    caption = (
-        f"{platform}\n"
-        f"📌 **{title}**\n\n"
-        f"👤 **Author:** {uploader}\n"
-        f"⏱ **Duration:** {duration}\n\n"
-        f"👇 *Choose quality to download:*"
-    )
+    downloaded_file = None
+    default_succeeded = False
+    fail_reason = None
 
     try:
-        if thumbnail:
-            await status_msg.delete()
-            await update.message.reply_photo(
-                photo=thumbnail,
-                caption=caption,
-                reply_markup=reply_markup,
-                parse_mode=constants.ParseMode.MARKDOWN
-            )
-        else:
-            await status_msg.edit_text(
-                caption,
-                reply_markup=reply_markup,
-                parse_mode=constants.ParseMode.MARKDOWN
-            )
+        async with get_semaphore():
+            success, downloaded_file, dl_info, error_msg = await download_media(url, quality="480")
+
+            if success and downloaded_file and os.path.exists(downloaded_file):
+                file_size = os.path.getsize(downloaded_file)
+                if file_size <= MAX_FILE_SIZE_BYTES:
+                    # Update status to uploading
+                    try:
+                        await status_msg.edit_text(
+                            f"📤 **Uploading {format_bytes(file_size)} to Telegram...**",
+                            parse_mode=constants.ParseMode.MARKDOWN,
+                        )
+                    except Exception:
+                        pass
+
+                    # Send media file
+                    await send_media_to_chat(
+                        bot=context.bot,
+                        chat_id=update.effective_chat.id,
+                        file_path=downloaded_file,
+                        title=title,
+                        uploader=uploader,
+                        duration_sec=duration_sec,
+                        url=url,
+                        quality="480",
+                        info=dl_info or info,
+                    )
+
+                    # Delete the status message on completion
+                    try:
+                        await status_msg.delete()
+                    except Exception:
+                        pass
+
+                    default_succeeded = True
+                    URL_CACHE.pop(cache_key, None)
+                else:
+                    fail_reason = f"480p file is {format_bytes(file_size)}, exceeding Telegram's {MAX_FILE_SIZE_MB}MB limit"
+            else:
+                fail_reason = error_msg or "480p stream could not be downloaded"
     except Exception as e:
-        logger.warning(f"Could not send thumbnail, falling back to text: {e}")
-        await status_msg.edit_text(
-            caption,
-            reply_markup=reply_markup,
-            parse_mode=constants.ParseMode.MARKDOWN
+        logger.error(f"Error during default 480p download: {e}", exc_info=True)
+        fail_reason = str(e)[:100]
+    finally:
+        if downloaded_file:
+            remove_file_safely(downloaded_file)
+
+    # 2. If 480p failed or exceeded size limit, show the interactive quality options panel
+    if not default_succeeded:
+        await show_quality_panel(
+            update=update,
+            status_msg=status_msg,
+            cache_key=cache_key,
+            url=url,
+            title=title,
+            uploader=uploader,
+            duration=duration,
+            thumbnail=thumbnail,
+            reason=fail_reason,
         )
 
 
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles quality selection button clicks and downloads media."""
+    """Handles quality selection button clicks and deletes the panel when finished."""
     query = update.callback_query
     await query.answer()
 
@@ -331,7 +478,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     if action == "cancel":
         cache_key = parts[1] if len(parts) > 1 else ""
         URL_CACHE.pop(cache_key, None)
-        await query.edit_message_caption(caption="❌ Download cancelled.") if query.message.photo else await query.edit_message_text(text="❌ Download cancelled.")
+        try:
+            await query.message.delete()
+        except Exception:
+            await edit_query_message(query, "❌ Cancelled.")
         return
 
     if action in {"formats", "back"}:
@@ -416,10 +566,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     # Update message status to downloading
     status_text = f"⏳ **Downloading [{quality_label}]...**\n📌 *{title}*\n\nPlease wait..."
-    if query.message.photo:
-        await query.edit_message_caption(caption=status_text, parse_mode=constants.ParseMode.MARKDOWN)
-    else:
-        await query.edit_message_text(text=status_text, parse_mode=constants.ParseMode.MARKDOWN)
+    await edit_query_message(query, status_text)
 
     # Perform download with concurrency semaphore to safeguard CPU & RAM
     downloaded_file = None
@@ -438,18 +585,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                     f"❌ **Download failed:**\n`{err[:200]}`\n\n"
                     "Choose another available format or try again."
                 )
-                if query.message.photo:
-                    await query.edit_message_caption(
-                        caption=error_response,
-                        reply_markup=failure_markup,
-                        parse_mode=constants.ParseMode.MARKDOWN,
-                    )
-                else:
-                    await query.edit_message_text(
-                        text=error_response,
-                        reply_markup=failure_markup,
-                        parse_mode=constants.ParseMode.MARKDOWN,
-                    )
+                await edit_query_message(query, error_response, failure_markup)
                 return
 
             # Check file size
@@ -459,60 +595,29 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 warning_msg = (
                     f"⚠️ **File Too Large!**\n\n"
                     f"Downloaded file size is **{size_str}**, which exceeds Telegram's **{MAX_FILE_SIZE_MB}MB** limit.\n\n"
-                    "💡 **Suggestion:** Try downloading in a lower resolution (e.g. 480p or 360p) or Audio Only (MP3)."
+                    "💡 **Suggestion:** Try downloading in a lower resolution (e.g. 360p) or Audio Only (MP3)."
                 )
-                if query.message.photo:
-                    await query.edit_message_caption(
-                        caption=warning_msg,
-                        reply_markup=failure_markup,
-                        parse_mode=constants.ParseMode.MARKDOWN,
-                    )
-                else:
-                    await query.edit_message_text(
-                        text=warning_msg,
-                        reply_markup=failure_markup,
-                        parse_mode=constants.ParseMode.MARKDOWN,
-                    )
+                await edit_query_message(query, warning_msg, failure_markup)
                 return
 
             # Update status to uploading
             upload_status = f"📤 **Uploading {format_bytes(file_size)} to Telegram...**"
-            if query.message.photo:
-                await query.edit_message_caption(caption=upload_status, parse_mode=constants.ParseMode.MARKDOWN)
-            else:
-                await query.edit_message_text(text=upload_status, parse_mode=constants.ParseMode.MARKDOWN)
+            await edit_query_message(query, upload_status)
 
             # Send media file
-            chat_id = update.effective_chat.id
-            platform_badge = get_platform_badge(url)
+            await send_media_to_chat(
+                bot=context.bot,
+                chat_id=update.effective_chat.id,
+                file_path=downloaded_file,
+                title=title,
+                uploader=uploader,
+                duration_sec=duration_sec,
+                url=url,
+                quality=quality,
+                info=info,
+            )
 
-            if quality == "audio":
-                with open(downloaded_file, "rb") as audio_file:
-                    await context.bot.send_audio(
-                        chat_id=chat_id,
-                        audio=audio_file,
-                        title=title,
-                        performer=uploader,
-                        duration=duration_sec,
-                        caption=f"🎵 **{title}**\n{platform_badge}",
-                        parse_mode=constants.ParseMode.MARKDOWN
-                    )
-            else:
-                width = info.get("width") if info else None
-                height = info.get("height") if info else None
-                with open(downloaded_file, "rb") as video_file:
-                    await context.bot.send_video(
-                        chat_id=chat_id,
-                        video=video_file,
-                        caption=f"🎬 **{title}**\n{platform_badge}",
-                        duration=duration_sec,
-                        width=width,
-                        height=height,
-                        supports_streaming=True,
-                        parse_mode=constants.ParseMode.MARKDOWN
-                    )
-
-            # Delete status message on success
+            # Clear out / delete the quality selector panel message on successful upload
             try:
                 await query.message.delete()
             except Exception:
@@ -523,17 +628,13 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         logger.error(f"Error during download or upload: {e}", exc_info=True)
         err_msg = f"❌ An error occurred: {str(e)[:150]}"
         try:
-            if query.message.photo:
-                await query.edit_message_caption(caption=err_msg, reply_markup=failure_markup)
-            else:
-                await query.edit_message_text(text=err_msg, reply_markup=failure_markup)
+            await edit_query_message(query, err_msg, failure_markup)
         except Exception:
             pass
     finally:
         # Always remove temporary file from disk
         if downloaded_file:
             remove_file_safely(downloaded_file)
-        # Preserve failed requests so a user can select another real format.
         if completed:
             URL_CACHE.pop(cache_key, None)
 
