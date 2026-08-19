@@ -74,11 +74,6 @@ def get_base_ydl_opts() -> Dict[str, Any]:
         'ignoreerrors': False,
         'logtostderr': False,
         'noplaylist': True,
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['android', 'ios', 'tv_embedded', 'mweb', 'web'],
-            }
-        },
         'http_headers': {
             'User-Agent': (
                 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -143,17 +138,16 @@ async def download_media(
                 'preferredcodec': 'mp3',
                 'preferredquality': '192',
             }]
-        elif quality == "720":
-            opts['format'] = 'bv*[height<=?720]+ba/b[height<=?720]/bv*[width<=?720]+ba/b[width<=?720]/b/best'
-            opts['merge_output_format'] = 'mp4'
-        elif quality == "480":
-            opts['format'] = 'bv*[height<=?480]+ba/b[height<=?480]/bv*[width<=?480]+ba/b[width<=?480]/b/best'
-            opts['merge_output_format'] = 'mp4'
-        elif quality == "360":
-            opts['format'] = 'bv*[height<=?360]+ba/b[height<=?360]/bv*[width<=?360]+ba/b[width<=?360]/b/best'
+        elif quality in {"720", "480", "360"}:
+            # Keep yt-dlp's resilient default selector and use its documented
+            # resolution preference. This selects the best format at or below
+            # the requested resolution, or the smallest available one if none
+            # exists below it. It also works correctly for vertical videos.
+            opts['format'] = 'bv*+ba/b'
+            opts['format_sort'] = [f'res:{quality}']
             opts['merge_output_format'] = 'mp4'
         else:  # "best"
-            opts['format'] = 'bv*+ba/b/best'
+            opts['format'] = 'bv*+ba/b'
             opts['merge_output_format'] = 'mp4'
 
         with yt_dlp.YoutubeDL(opts) as ydl:
