@@ -37,6 +37,10 @@ from facebook_downloader import (
     extract_facebook_info,
     download_facebook_media,
 )
+from generic_downloader import (
+    extract_generic_info,
+    download_generic_media,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +66,12 @@ URL_CACHE: Dict[str, Dict[str, Any]] = {}
 MAX_FORMAT_CHOICES = 8
 
 
+def is_youtube_url(url: str) -> bool:
+    """Check if URL belongs to YouTube."""
+    u = url.lower()
+    return "youtube.com" in u or "youtu.be" in u
+
+
 def is_instagram_url(url: str) -> bool:
     """Check if URL belongs to Instagram."""
     return "instagram.com" in url.lower()
@@ -75,12 +85,14 @@ def is_facebook_url(url: str) -> bool:
 
 async def route_extract_info(url: str) -> Tuple[bool, Dict[str, Any], Optional[str]]:
     """Routes metadata extraction to the dedicated platform downloader."""
-    if is_instagram_url(url):
+    if is_youtube_url(url):
+        return await extract_media_info(url)
+    elif is_instagram_url(url):
         return await extract_instagram_info(url)
     elif is_facebook_url(url):
         return await extract_facebook_info(url)
     else:
-        return await extract_media_info(url)
+        return await extract_generic_info(url)
 
 
 async def route_download_media(
@@ -89,12 +101,14 @@ async def route_download_media(
     format_selector: Optional[str] = None
 ) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]], Optional[str]]:
     """Routes media download to the dedicated platform downloader."""
-    if is_instagram_url(url):
+    if is_youtube_url(url):
+        return await download_media(url, quality=quality, format_selector=format_selector)
+    elif is_instagram_url(url):
         return await download_instagram_media(url, quality=quality, format_selector=format_selector)
     elif is_facebook_url(url):
         return await download_facebook_media(url, quality=quality, format_selector=format_selector)
     else:
-        return await download_media(url, quality=quality, format_selector=format_selector)
+        return await download_generic_media(url, quality=quality, format_selector=format_selector)
 
 
 def generate_cache_key(user_id: int) -> str:
@@ -237,11 +251,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = (
         f"👋 **Hello, {user.first_name}!**\n\n"
         "I am your **Universal Media Downloader Bot** 🚀\n\n"
-        "**Supported Platforms:**\n"
-        "• 🔴 **YouTube**: Standard Videos, Shorts & Audio\n"
+        "**Supported Sources (Any Non-DRM Video):**\n"
+        "• 🔴 **YouTube**: Videos, Shorts & MP3\n"
         "• 📸 **Instagram**: Reels, Posts & Stories\n"
         "• 🔵 **Facebook**: Videos & Reels\n"
-        "• 🎵 **TikTok & 🐦 Twitter/X**\n\n"
+        "• 🎵 **TikTok & 🐦 X / Twitter**\n"
+        "• 🌐 **Reddit, Pinterest, Vimeo, Twitch, Threads, Dailymotion**\n"
+        "• 🔗 **Direct MP4 / WebM / HLS video URLs**\n\n"
         "👉 **How to use:**\n"
         "Simply send or forward me any video link!"
     )
@@ -255,13 +271,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles the /help command."""
     help_text = (
         "📖 **How to Download Media:**\n\n"
-        "1. Copy a video/reel/shorts link from YouTube, Instagram, or Facebook.\n"
+        "1. Copy a video link from **YouTube**, **Instagram**, **Facebook**, **TikTok**, **Twitter/X**, **Reddit**, or any non-DRM site.\n"
         "2. Paste and send the link here.\n"
-        "3. Select your desired quality from the interactive buttons.\n"
-        "4. The bot will download and send the media right back to you!\n\n"
+        "3. The bot will automatically download it in 480p (or show quality options if needed) and send the video directly to you!\n\n"
         "⚠️ **Note on File Limits:**\n"
         f"• Telegram standard bot limit is **{MAX_FILE_SIZE_MB}MB** per file.\n"
-        "• For large YouTube videos, choose 720p, 480p, 360p, or Audio Only (MP3)."
+        "• DRM-protected services (like Netflix, Prime, Disney+) cannot be downloaded."
     )
     await update.message.reply_text(
         help_text,
