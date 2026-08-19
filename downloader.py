@@ -67,8 +67,10 @@ def format_bytes(size: Optional[int]) -> str:
     return f"{size:.1f} TB"
 
 
-def get_base_ydl_opts() -> Dict[str, Any]:
-    """Returns standard base options for yt-dlp."""
+def get_base_ydl_opts(url: Optional[str] = None) -> Dict[str, Any]:
+    """Returns standard base options for yt-dlp with per-platform cookie and client isolation."""
+    url_lower = (url or "").lower()
+    
     opts = {
         'quiet': True,
         'no_warnings': True,
@@ -79,7 +81,7 @@ def get_base_ydl_opts() -> Dict[str, Any]:
         'remote_components': ['ejs:github'],
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'web'],
+                'player_client': ['android', 'ios'],
             }
         },
         'http_headers': {
@@ -93,13 +95,36 @@ def get_base_ydl_opts() -> Dict[str, Any]:
         },
     }
     
-    # Check for cookies file in multiple locations
-    possible_cookie_paths = [
-        BASE_DIR / "cookies.txt",
-        BASE_DIR / "instagram_cookies.txt",
-        Path("cookies.txt"),
-        Path.home() / "DownTG" / "DownTG" / "cookies.txt",
-    ]
+    # Platform-specific cookie resolution (prevents Instagram cookies from breaking YouTube)
+    possible_cookie_paths = []
+    if "instagram.com" in url_lower or "instagr.am" in url_lower:
+        possible_cookie_paths = [
+            BASE_DIR / "instagram_cookies.txt",
+            BASE_DIR / "cookies.txt",
+            Path("instagram_cookies.txt"),
+            Path("cookies.txt"),
+            Path.home() / "DownTG" / "DownTG" / "instagram_cookies.txt",
+            Path.home() / "DownTG" / "DownTG" / "cookies.txt",
+        ]
+    elif "facebook.com" in url_lower or "fb.watch" in url_lower or "fb.com" in url_lower:
+        possible_cookie_paths = [
+            BASE_DIR / "facebook_cookies.txt",
+            BASE_DIR / "cookies.txt",
+            Path("facebook_cookies.txt"),
+            Path("cookies.txt"),
+            Path.home() / "DownTG" / "DownTG" / "facebook_cookies.txt",
+            Path.home() / "DownTG" / "DownTG" / "cookies.txt",
+        ]
+    else:  # YouTube and general sites
+        possible_cookie_paths = [
+            BASE_DIR / "youtube_cookies.txt",
+            BASE_DIR / "cookies.txt",
+            Path("youtube_cookies.txt"),
+            Path("cookies.txt"),
+            Path.home() / "DownTG" / "DownTG" / "youtube_cookies.txt",
+            Path.home() / "DownTG" / "DownTG" / "cookies.txt",
+        ]
+
     for cp in possible_cookie_paths:
         if cp.exists() and cp.is_file() and cp.stat().st_size > 0:
             opts['cookiefile'] = str(cp)
@@ -116,7 +141,7 @@ async def extract_media_info(url: str) -> Tuple[bool, Dict[str, Any], Optional[s
     Returns (success, info_dict, error_message).
     """
     def _extract():
-        opts = get_base_ydl_opts()
+        opts = get_base_ydl_opts(url)
         opts['extract_flat'] = False
         with yt_dlp.YoutubeDL(opts) as ydl:
             try:
@@ -152,7 +177,7 @@ async def download_media(
     output_template = str(DOWNLOAD_DIR / f"{download_id}_%(title).100B.%(ext)s")
 
     def _download():
-        opts = get_base_ydl_opts()
+        opts = get_base_ydl_opts(url)
         opts['outtmpl'] = output_template
 
         if progress_hook:
