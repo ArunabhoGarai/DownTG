@@ -3,7 +3,7 @@ import os
 import time
 import logging
 import asyncio
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from pathlib import Path
 
 from telegram import (
@@ -29,6 +29,14 @@ from downloader import (
     format_duration,
     format_bytes,
 )
+from instagram_downloader import (
+    extract_instagram_info,
+    download_instagram_media,
+)
+from facebook_downloader import (
+    extract_facebook_info,
+    download_facebook_media,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +60,41 @@ URL_REGEX = re.compile(
 # Global short cache for callback query payloads to keep callback_data under 64 bytes
 URL_CACHE: Dict[str, Dict[str, Any]] = {}
 MAX_FORMAT_CHOICES = 8
+
+
+def is_instagram_url(url: str) -> bool:
+    """Check if URL belongs to Instagram."""
+    return "instagram.com" in url.lower()
+
+
+def is_facebook_url(url: str) -> bool:
+    """Check if URL belongs to Facebook."""
+    u = url.lower()
+    return "facebook.com" in u or "fb.watch" in u or "fb.com" in u
+
+
+async def route_extract_info(url: str) -> Tuple[bool, Dict[str, Any], Optional[str]]:
+    """Routes metadata extraction to the dedicated platform downloader."""
+    if is_instagram_url(url):
+        return await extract_instagram_info(url)
+    elif is_facebook_url(url):
+        return await extract_facebook_info(url)
+    else:
+        return await extract_media_info(url)
+
+
+async def route_download_media(
+    url: str,
+    quality: str = "best",
+    format_selector: Optional[str] = None
+) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]], Optional[str]]:
+    """Routes media download to the dedicated platform downloader."""
+    if is_instagram_url(url):
+        return await download_instagram_media(url, quality=quality, format_selector=format_selector)
+    elif is_facebook_url(url):
+        return await download_facebook_media(url, quality=quality, format_selector=format_selector)
+    else:
+        return await download_media(url, quality=quality, format_selector=format_selector)
 
 
 def generate_cache_key(user_id: int) -> str:
@@ -351,8 +394,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=constants.ParseMode.MARKDOWN,
     )
 
-    # Extract metadata without downloading
-    success, info, error_msg = await extract_media_info(url)
+    # Extract metadata without downloading (routed to dedicated engine)
+    success, info, error_msg = await route_extract_info(url)
 
     if not success or not info:
         err = error_msg or "Unable to retrieve video information."
@@ -405,7 +448,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         async with get_semaphore():
-            success, downloaded_file, dl_info, error_msg = await download_media(url, quality="480")
+            success, downloaded_file, dl_info, error_msg = await route_download_media(url, quality="480")
 
             if success and downloaded_file and os.path.exists(downloaded_file):
                 file_size = os.path.getsize(downloaded_file)
@@ -573,7 +616,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     completed = False
     try:
         async with get_semaphore():
-            success, downloaded_file, info, error_msg = await download_media(
+            success, downloaded_file, info, error_msg = await route_download_media(
                 url,
                 quality=quality,
                 format_selector=format_selector,
