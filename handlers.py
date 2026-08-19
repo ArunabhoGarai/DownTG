@@ -310,6 +310,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def edit_status_msg_safe(msg, text: str):
+    """Safely edit status text without crashing on transient HTTP transport errors."""
+    if not msg:
+        return
+    try:
+        await msg.edit_text(text, parse_mode=constants.ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.debug(f"Status message edit suppressed: {e}")
+
+
 async def send_media_to_chat(
     bot,
     chat_id: int,
@@ -356,6 +366,9 @@ async def send_media_to_chat(
         )
         if mtproto_success:
             return
+        elif file_size > 50 * 1024 * 1024:
+            logger.error(f"MTProto upload failed for large file ({format_bytes(file_size)}). Cannot fallback to 50MB HTTP Bot API.")
+            raise RuntimeError(f"MTProto upload failed for {format_bytes(file_size)} file.")
 
     # 2. Standard HTTP Bot API upload (for files <= 50MB)
     if is_audio:
@@ -561,7 +574,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         url=url,
                         quality="480",
                         info=dl_info or info,
-                        progress_status_updater=lambda txt: status_msg.edit_text(txt, parse_mode=constants.ParseMode.MARKDOWN),
+                        progress_status_updater=lambda txt: edit_status_msg_safe(status_msg, txt),
                     )
 
                     # Delete the status message on completion

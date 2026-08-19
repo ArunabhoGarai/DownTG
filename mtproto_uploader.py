@@ -140,26 +140,63 @@ async def upload_media_mtproto(
         if thumbnail_path and os.path.exists(thumbnail_path):
             valid_thumb = thumbnail_path
 
+        # Truncate caption to Telegram limit (1024 chars)
+        safe_caption = caption[:1020] if caption else ""
+
+        try:
+            from pyrogram.enums import ParseMode
+            pyro_parse_mode = ParseMode.MARKDOWN
+        except Exception:
+            pyro_parse_mode = None
+
         if is_audio:
-            await _CLIENT.send_audio(
-                chat_id=chat_id,
-                audio=file_path,
-                title=title,
-                caption=caption,
-                duration=int(duration_sec) if duration_sec else None,
-                thumb=valid_thumb,
-                progress=_pyro_progress,
-            )
+            try:
+                await _CLIENT.send_audio(
+                    chat_id=chat_id,
+                    audio=file_path,
+                    title=title,
+                    caption=safe_caption,
+                    duration=int(duration_sec) if duration_sec else None,
+                    thumb=valid_thumb,
+                    parse_mode=pyro_parse_mode,
+                    progress=_pyro_progress,
+                )
+            except Exception as e_inner:
+                logger.warning(f"Retrying audio upload without markdown parse_mode: {e_inner}")
+                await _CLIENT.send_audio(
+                    chat_id=chat_id,
+                    audio=file_path,
+                    title=title,
+                    caption=safe_caption,
+                    duration=int(duration_sec) if duration_sec else None,
+                    thumb=valid_thumb,
+                    parse_mode=None,
+                    progress=_pyro_progress,
+                )
         else:
-            await _CLIENT.send_video(
-                chat_id=chat_id,
-                video=file_path,
-                caption=caption,
-                duration=int(duration_sec) if duration_sec else None,
-                thumb=valid_thumb,
-                supports_streaming=True,
-                progress=_pyro_progress,
-            )
+            try:
+                await _CLIENT.send_video(
+                    chat_id=chat_id,
+                    video=file_path,
+                    caption=safe_caption,
+                    duration=int(duration_sec) if duration_sec else None,
+                    thumb=valid_thumb,
+                    supports_streaming=True,
+                    parse_mode=pyro_parse_mode,
+                    progress=_pyro_progress,
+                )
+            except Exception as e_inner:
+                logger.warning(f"Retrying video upload without markdown parse_mode: {e_inner}")
+                await _CLIENT.send_video(
+                    chat_id=chat_id,
+                    video=file_path,
+                    caption=safe_caption,
+                    duration=int(duration_sec) if duration_sec else None,
+                    thumb=valid_thumb,
+                    supports_streaming=True,
+                    parse_mode=None,
+                    progress=_pyro_progress,
+                )
 
         return True
 
