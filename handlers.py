@@ -41,6 +41,11 @@ from generic_downloader import (
     extract_generic_info,
     download_generic_media,
 )
+from terabox_downloader import (
+    is_terabox_url,
+    extract_terabox_info,
+    download_terabox_media,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +90,9 @@ def is_facebook_url(url: str) -> bool:
 
 async def route_extract_info(url: str) -> Tuple[bool, Dict[str, Any], Optional[str]]:
     """Routes metadata extraction to the dedicated platform downloader."""
-    if is_youtube_url(url):
+    if is_terabox_url(url):
+        return await extract_terabox_info(url)
+    elif is_youtube_url(url):
         return await extract_media_info(url)
     elif is_instagram_url(url):
         return await extract_instagram_info(url)
@@ -101,7 +108,9 @@ async def route_download_media(
     format_selector: Optional[str] = None
 ) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]], Optional[str]]:
     """Routes media download to the dedicated platform downloader."""
-    if is_youtube_url(url):
+    if is_terabox_url(url):
+        return await download_terabox_media(url, quality=quality, format_selector=format_selector)
+    elif is_youtube_url(url):
         return await download_media(url, quality=quality, format_selector=format_selector)
     elif is_instagram_url(url):
         return await download_instagram_media(url, quality=quality, format_selector=format_selector)
@@ -255,6 +264,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 🔴 **YouTube**: Videos, Shorts & MP3\n"
         "• 📸 **Instagram**: Reels, Posts & Stories\n"
         "• 🔵 **Facebook**: Videos & Reels\n"
+        "• 📦 **TeraBox**: Cloud videos & shares\n"
         "• 🎵 **TikTok & 🐦 X / Twitter**\n"
         "• 🌐 **Reddit, Pinterest, Vimeo, Twitch, Threads, Dailymotion**\n"
         "• 🔗 **Direct MP4 / WebM / HLS video URLs**\n\n"
@@ -697,9 +707,197 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             URL_CACHE.pop(cache_key, None)
 
 
+from config import (
+    QUALITIES,
+    MAX_FILE_SIZE_BYTES,
+    MAX_FILE_SIZE_MB,
+    MAX_CONCURRENT_DOWNLOADS,
+    ADMIN_USER_ID,
+    BASE_DIR,
+)
+
+
+def is_admin(user_id: int) -> bool:
+    """Check if the user is authorized to manage cookies."""
+    if not ADMIN_USER_ID:
+        return True  # If not configured, allow bot owner
+    return str(user_id) == str(ADMIN_USER_ID)
+
+
+def get_cookie_target_path(platform: str) -> Optional[Tuple[str, Path]]:
+    """Resolves platform name to its isolated cookie file path."""
+    p = platform.lower().strip()
+    if p in ("yt", "youtube"):
+        return "YouTube", BASE_DIR / "cookies.txt"
+    elif p in ("ig", "instagram", "insta"):
+        return "Instagram", BASE_DIR / "cooky" / "instagram" / "cookies.txt"
+    elif p in ("fb", "facebook"):
+        return "Facebook", BASE_DIR / "cooky" / "facebook" / "cookies.txt"
+    elif p in ("gen", "generic", "other", "all"):
+        return "Generic", BASE_DIR / "cooky" / "generic" / "cookies.txt"
+    return None
+
+
+async def setcookie_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sets raw cookie text for a specific platform. Usage: /setcookie <platform> <cookie_text>"""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("⛔ You are not authorized to use this command.")
+        return
+
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text(
+            "📝 **Usage:** `/setcookie <platform> <cookie_text>`\n\n"
+            "**Supported Platforms:**\n"
+            "• `youtube` (or `yt`)\n"
+            "• `instagram` (or `ig`)\n"
+            "• `facebook` (or `fb`)\n"
+            "• `generic` (or `gen`)\n\n"
+            "💡 *Alternatively, you can just send the `cookies.txt` file as a document directly to this chat!*",
+            parse_mode=constants.ParseMode.MARKDOWN,
+        )
+        return
+
+    platform_key = context.args[0]
+    cookie_content = update.message.text.split(None, 2)[2].strip()
+
+    target = get_cookie_target_path(platform_key)
+    if not target:
+        await update.message.reply_text("❌ Unknown platform. Choose: `youtube`, `instagram`, `facebook`, or `generic`.")
+        return
+
+    plat_name, file_path = target
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(cookie_content)
+
+    line_count = len(cookie_content.strip().splitlines())
+    await update.message.reply_text(
+        f"✅ **Saved {plat_name} Cookies!**\n"
+        f"📁 Path: `{file_path.name}`\n"
+        f"📊 Lines: `{line_count}`",
+        parse_mode=constants.ParseMode.MARKDOWN,
+    )
+
+
+async def clearcookie_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Clears/deletes cookies for a platform. Usage: /clearcookie <platform>"""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("⛔ You are not authorized to use this command.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("📝 **Usage:** `/clearcookie <youtube|instagram|facebook|generic>`")
+        return
+
+    target = get_cookie_target_path(context.args[0])
+    if not target:
+        await update.message.reply_text("❌ Unknown platform. Choose: `youtube`, `instagram`, `facebook`, or `generic`.")
+        return
+
+    plat_name, file_path = target
+    if file_path.exists():
+        file_path.unlink()
+        await update.message.reply_text(f"🗑️ **Cleared {plat_name} Cookies.**", parse_mode=constants.ParseMode.MARKDOWN)
+    else:
+        await update.message.reply_text(f"ℹ️ No existing cookie file found for {plat_name}.")
+
+
+async def cookiestatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Shows cookie status for all isolated platforms."""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("⛔ You are not authorized to use this command.")
+        return
+
+    platforms = [
+        ("🔴 YouTube", BASE_DIR / "cookies.txt"),
+        ("📸 Instagram", BASE_DIR / "cooky" / "instagram" / "cookies.txt"),
+        ("🔵 Facebook", BASE_DIR / "cooky" / "facebook" / "cookies.txt"),
+        ("🌐 Generic", BASE_DIR / "cooky" / "generic" / "cookies.txt"),
+    ]
+
+    status_lines = ["🍪 **Cookie Storage Status:**\n"]
+    for name, path in platforms:
+        if path.exists() and path.is_file() and path.stat().st_size > 0:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = len(f.readlines())
+            size_kb = path.stat().st_size / 1024
+            status_lines.append(f"• {name}: ✅ **Active** (`{lines}` lines, `{size_kb:.1f} KB`)")
+        else:
+            status_lines.append(f"• {name}: ⚪ *Not set*")
+
+    status_lines.append("\n💡 *To update, send a `cookies.txt` file as document or use `/setcookie`.*")
+    await update.message.reply_text("\n".join(status_lines), parse_mode=constants.ParseMode.MARKDOWN)
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles uploaded cookie files (.txt) sent as documents."""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+
+    doc = update.message.document
+    if not doc:
+        return
+
+    filename = (doc.file_name or "").lower()
+    caption = (update.message.caption or "").lower()
+
+    # Determine platform from caption or filename
+    target_platform = None
+    if "instagram" in filename or "instagram" in caption or "insta" in caption or "ig" in caption:
+        target_platform = "instagram"
+    elif "facebook" in filename or "facebook" in caption or "fb" in caption:
+        target_platform = "facebook"
+    elif "generic" in filename or "generic" in caption:
+        target_platform = "generic"
+    elif "youtube" in filename or "youtube" in caption or "yt" in caption or "cookies.txt" in filename:
+        target_platform = "youtube"
+
+    if not target_platform:
+        await update.message.reply_text(
+            "📁 **Received document:**\n"
+            "Please send the file with a caption specifying the platform, for example:\n"
+            "`instagram`, `facebook`, `youtube`, or `generic`",
+            parse_mode=constants.ParseMode.MARKDOWN,
+        )
+        return
+
+    target = get_cookie_target_path(target_platform)
+    if not target:
+        return
+
+    plat_name, target_path = target
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+
+    status_msg = await update.message.reply_text(f"⏳ Saving {plat_name} cookies...")
+    try:
+        tg_file = await doc.get_file()
+        await tg_file.download_to_drive(custom_path=str(target_path))
+
+        with open(target_path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = len(f.readlines())
+
+        await status_msg.edit_text(
+            f"✅ **{plat_name} Cookies Updated!**\n"
+            f"📁 Saved to: `{target_path.name}`\n"
+            f"📊 Total lines: `{lines}`",
+            parse_mode=constants.ParseMode.MARKDOWN,
+        )
+    except Exception as e:
+        logger.error(f"Error saving cookie document: {e}", exc_info=True)
+        await status_msg.edit_text(f"❌ Failed to save cookie file: {e}")
+
+
 def register_handlers(application):
     """Register all bot command and message handlers."""
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("setcookie", setcookie_command))
+    application.add_handler(CommandHandler("clearcookie", clearcookie_command))
+    application.add_handler(CommandHandler("cookiestatus", cookiestatus_command))
     application.add_handler(CallbackQueryHandler(handle_callback_query))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

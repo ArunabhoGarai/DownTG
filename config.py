@@ -9,6 +9,7 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_USER_ID = os.getenv("ADMIN_USER_ID", "").strip()
 
 # Max allowed file size to send via Telegram Bot API (Telegram default limit is 50MB)
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", 50))

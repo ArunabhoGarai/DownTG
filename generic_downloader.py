@@ -11,9 +11,15 @@ from config import DOWNLOAD_DIR, BASE_DIR
 logger = logging.getLogger(__name__)
 
 
+# Dedicated Generic/Universal cookies directory
+GENERIC_COOKIE_DIR = BASE_DIR / "cooky" / "generic"
+GENERIC_COOKIE_DIR.mkdir(parents=True, exist_ok=True)
+GENERIC_COOKIE_FILE = GENERIC_COOKIE_DIR / "cookies.txt"
+
+
 def get_generic_ydl_opts() -> Dict[str, Any]:
     """Returns standalone yt-dlp options for generic / universal non-DRM video sources."""
-    return {
+    opts = {
         'quiet': True,
         'no_warnings': True,
         'nocheckcertificate': True,
@@ -29,6 +35,19 @@ def get_generic_ydl_opts() -> Dict[str, Any]:
             'Accept-Language': 'en-US,en;q=0.9',
         },
     }
+
+    possible_cookie_paths = [
+        GENERIC_COOKIE_FILE,
+        BASE_DIR / "cooky" / "generic_cookies.txt",
+        Path.home() / "DownTG" / "DownTG" / "cooky" / "generic" / "cookies.txt",
+    ]
+    for cp in possible_cookie_paths:
+        if cp.exists() and cp.is_file() and cp.stat().st_size > 0:
+            opts['cookiefile'] = str(cp)
+            logger.info(f"Using Generic cookies from: {cp}")
+            break
+
+    return opts
 
 
 import aiohttp
