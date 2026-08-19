@@ -270,10 +270,9 @@ async def download_terabox_media(
             'socket_timeout': 60,
             'retries': 20,
             'fragment_retries': 30,
-            'buffersize': 1024 * 1024 * 16,
-            'http_chunk_size': 10485760,
-            'hls_use_mpegts': True,
-            'concurrent_fragment_downloads': 5,
+            'skip_unavailable_fragments': True,
+            'keep_fragments': False,
+            'buffersize': 1024 * 1024 * 8,
             'http_headers': {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
                 'Referer': 'https://www.terabox.com/',
