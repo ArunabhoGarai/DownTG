@@ -1,5 +1,6 @@
 import os
 import uuid
+import shutil
 import asyncio
 import logging
 from pathlib import Path
@@ -9,6 +10,21 @@ import yt_dlp
 from config import DOWNLOAD_DIR, MAX_FILE_SIZE_BYTES, BASE_DIR
 
 logger = logging.getLogger(__name__)
+
+# Auto-detect and register Deno binary in PATH so systemd service finds it
+for _p in [
+    Path("/usr/local/bin/deno"),
+    Path("/usr/bin/deno"),
+    Path.home() / ".deno" / "bin" / "deno",
+    Path("/home/ubuntu/.deno/bin/deno"),
+]:
+    if _p.exists() and _p.is_file():
+        _deno_dir = str(_p.parent)
+        _cur_path = os.environ.get("PATH", "")
+        if _deno_dir not in _cur_path:
+            os.environ["PATH"] = f"{_deno_dir}:{_cur_path}"
+        logger.info(f"Registered Deno binary in PATH from: {_p}")
+        break
 
 # Initialize static-ffmpeg if available so ffmpeg is in PATH
 try:
@@ -90,12 +106,18 @@ def get_base_ydl_opts() -> Dict[str, Any]:
             'Sec-Fetch-Mode': 'navigate',
         },
     }
-    
+
+    # Pass Deno js_runtime if detected
+    deno_bin = shutil.which("deno")
+    if deno_bin:
+        opts['js_runtimes'] = {'deno': {'path': str(deno_bin)}}
+
     # Check for cookies file in multiple locations
     possible_cookie_paths = [
         BASE_DIR / "cookies.txt",
         Path("cookies.txt"),
         Path.home() / "DownTG" / "DownTG" / "cookies.txt",
+        Path("/home/ubuntu/DownTG/DownTG/cookies.txt"),
     ]
     for cp in possible_cookie_paths:
         if cp.exists() and cp.is_file() and cp.stat().st_size > 0:
