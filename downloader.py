@@ -74,6 +74,13 @@ def get_base_ydl_opts() -> Dict[str, Any]:
         'ignoreerrors': False,
         'logtostderr': False,
         'noplaylist': True,
+        'remote_components': ['ejs:github'],
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'ios'],
+                'player_skip': ['webpage', 'configs'],
+            }
+        },
         'http_headers': {
             'User-Agent': (
                 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -85,10 +92,17 @@ def get_base_ydl_opts() -> Dict[str, Any]:
         },
     }
     
-    # Check for cookies file in project root
-    cookie_file = BASE_DIR / "cookies.txt"
-    if cookie_file.exists():
-        opts['cookiefile'] = str(cookie_file)
+    # Check for cookies file in multiple locations
+    possible_cookie_paths = [
+        BASE_DIR / "cookies.txt",
+        Path("cookies.txt"),
+        Path.home() / "DownTG" / "DownTG" / "cookies.txt",
+    ]
+    for cp in possible_cookie_paths:
+        if cp.exists() and cp.is_file() and cp.stat().st_size > 0:
+            opts['cookiefile'] = str(cp)
+            logger.info(f"Using cookies file from: {cp}")
+            break
 
     return opts
 
