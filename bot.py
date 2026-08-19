@@ -1,6 +1,7 @@
 import sys
 import logging
 from telegram.ext import ApplicationBuilder
+from telegram.request import HTTPXRequest
 
 from config import BOT_TOKEN, IS_MTPROTO_ENABLED
 from handlers import register_handlers
@@ -45,10 +46,19 @@ def main():
 
     logger.info("Starting Telegram Video Downloader Bot...")
 
-    # Build Telegram Bot application with MTProto lifecycle hooks
+    # Generous HTTP request timeouts to prevent httpx.ReadTimeout during large operations
+    request_client = HTTPXRequest(
+        connect_timeout=60.0,
+        read_timeout=120.0,
+        write_timeout=120.0,
+        pool_timeout=60.0,
+    )
+
+    # Build Telegram Bot application with MTProto lifecycle hooks and extended timeouts
     application = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
+        .request(request_client)
         .post_init(on_startup)
         .post_shutdown(on_shutdown)
         .build()

@@ -252,19 +252,22 @@ async def edit_query_message(
     text: str,
     reply_markup: Optional[InlineKeyboardMarkup] = None,
 ):
-    """Edit a callback message whether it is a photo caption or plain text."""
-    if query.message.photo:
-        await query.edit_message_caption(
-            caption=text,
-            reply_markup=reply_markup,
-            parse_mode=constants.ParseMode.MARKDOWN,
-        )
-    else:
-        await query.edit_message_text(
-            text=text,
-            reply_markup=reply_markup,
-            parse_mode=constants.ParseMode.MARKDOWN,
-        )
+    """Edit a callback message whether it is a photo caption or plain text with exception safety."""
+    try:
+        if query.message.photo:
+            await query.edit_message_caption(
+                caption=text,
+                reply_markup=reply_markup,
+                parse_mode=constants.ParseMode.MARKDOWN,
+            )
+        else:
+            await query.edit_message_text(
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode=constants.ParseMode.MARKDOWN,
+            )
+    except Exception as e:
+        logger.debug(f"Non-critical query message edit suppressed: {e}")
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
