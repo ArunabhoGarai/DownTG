@@ -366,9 +366,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(err_text, parse_mode=constants.ParseMode.MARKDOWN)
         return
 
-    title = info.get("title", "Untitled Video")
+    raw_title = str(info.get("title") or info.get("description") or "Untitled Media").strip()
+    first_line = raw_title.split("\n")[0].strip()
+    title = (first_line[:75] + "...") if len(first_line) > 75 else (first_line or "Media")
     duration = format_duration(info.get("duration"))
-    uploader = info.get("uploader", "Unknown Author")
+    uploader = info.get("uploader") or info.get("channel") or info.get("creator") or "Unknown"
     thumbnail = info.get("thumbnail")
     duration_sec = info.get("duration")
     format_choices = build_format_choices(info)
