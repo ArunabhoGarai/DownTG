@@ -26,8 +26,9 @@ MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 DOWNLOAD_DIR = BASE_DIR / os.getenv("DOWNLOAD_DIR", "downloads")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-# Concurrency limits for server/EC2 resource protection
-MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", 2))
+# Concurrency limits for server/EC2 resource protection (settable in .env)
+_raw_concurrent = os.getenv("MAX_CONCURRENT_DOWNLOADS", "2").strip()
+MAX_CONCURRENT_DOWNLOADS = int(_raw_concurrent) if _raw_concurrent.isdigit() and int(_raw_concurrent) > 0 else 2
 
 # Quality presets
 best_label = "⚡ Best Quality (<2GB)" if IS_MTPROTO_ENABLED else "⚡ Best Quality (<50MB)"

@@ -55,6 +55,7 @@ logger = logging.getLogger(__name__)
 
 # Concurrency semaphore (initialized lazily)
 _SEMAPHORE: asyncio.Semaphore = None
+ACTIVE_TASKS: Dict[str, asyncio.Task] = {}
 
 
 def get_semaphore() -> asyncio.Semaphore:
@@ -62,6 +63,14 @@ def get_semaphore() -> asyncio.Semaphore:
     if _SEMAPHORE is None:
         _SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
     return _SEMAPHORE
+
+
+def get_active_downloads_count() -> int:
+    """Returns number of currently running download tasks."""
+    finished = [tid for tid, t in list(ACTIVE_TASKS.items()) if t.done()]
+    for tid in finished:
+        ACTIVE_TASKS.pop(tid, None)
+    return len(ACTIVE_TASKS)
 
 # URL matching regex
 URL_REGEX = re.compile(
@@ -453,9 +462,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = match.group(0)
     user_id = update.effective_user.id
 
+    # Check concurrent download capacity before analyzing link
+    if get_active_downloads_count() >= MAX_CONCURRENT_DOWNLOADS:
+        await update.message.reply_text(
+            f"⚠️ **Server Busy:** `{MAX_CONCURRENT_DOWNLOADS}` downloads are already in progress. Please try again after some time.",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_to_message_id=update.message.message_id,
+        )
+        return
+
     status_msg = await update.message.reply_text(
         f"🔍 **Analyzing link...**\n`{url}`",
         parse_mode=constants.ParseMode.MARKDOWN,
+        reply_to_message_id=update.message.message_id,
     )
 
     # Extract metadata without downloading (routed to dedicated engine)
@@ -509,8 +528,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     downloaded_file = None
     default_succeeded = False
     fail_reason = None
+    task_id = f"{user_id}_{time.time()}"
 
     try:
+        ACTIVE_TASKS[task_id] = asyncio.current_task()
         async with get_semaphore():
             success, downloaded_file, dl_info, error_msg = await route_download_media(url, quality="480")
 
@@ -556,6 +577,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error during default 480p download: {e}", exc_info=True)
         fail_reason = str(e)[:100]
     finally:
+        ACTIVE_TASKS.pop(task_id, None)
         if downloaded_file:
             remove_file_safely(downloaded_file)
 
@@ -672,6 +694,20 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         else build_quality_keyboard(cache_key)
     )
 
+    # Check if user is authorized to interact with this panel in group chats
+    requester_id = cache_key.split("_")[0] if cache_key else None
+    if requester_id and str(query.from_user.id) != requester_id and not is_admin(query.from_user.id):
+        await query.answer("⚠️ Only the user who sent this link can select the quality.", show_alert=True)
+        return
+
+    # Check concurrency limit before starting download
+    if get_active_downloads_count() >= MAX_CONCURRENT_DOWNLOADS:
+        await query.answer(
+            f"⚠️ Server Busy: {MAX_CONCURRENT_DOWNLOADS} downloads already in progress. Please try again in a moment.",
+            show_alert=True,
+        )
+        return
+
     # Update message status to downloading
     status_text = f"⏳ **Downloading [{quality_label}]...**\n📌 *{title}*\n\nPlease wait..."
     await edit_query_message(query, status_text)
@@ -679,7 +715,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     # Perform download with concurrency semaphore to safeguard CPU & RAM
     downloaded_file = None
     completed = False
+    task_id = f"{query.from_user.id}_{time.time()}"
+
     try:
+        ACTIVE_TASKS[task_id] = asyncio.current_task()
         async with get_semaphore():
             success, downloaded_file, info, error_msg = await route_download_media(
                 url,
@@ -741,6 +780,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception:
             pass
     finally:
+        ACTIVE_TASKS.pop(task_id, None)
         # Always remove temporary file from disk
         if downloaded_file:
             remove_file_safely(downloaded_file)
@@ -774,6 +814,8 @@ def get_cookie_target_path(platform: str) -> Optional[Tuple[str, Path]]:
         return "Instagram", BASE_DIR / "cooky" / "instagram" / "cookies.txt"
     elif p in ("fb", "facebook"):
         return "Facebook", BASE_DIR / "cooky" / "facebook" / "cookies.txt"
+    elif p in ("tb", "terabox", "tera"):
+        return "TeraBox", BASE_DIR / "cooky" / "terabox" / "cookies.txt"
     elif p in ("gen", "generic", "other", "all"):
         return "Generic", BASE_DIR / "cooky" / "generic" / "cookies.txt"
     return None
@@ -793,6 +835,7 @@ async def setcookie_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• `youtube` (or `yt`)\n"
             "• `instagram` (or `ig`)\n"
             "• `facebook` (or `fb`)\n"
+            "• `terabox` (or `tb`)\n"
             "• `generic` (or `gen`)\n\n"
             "💡 *Alternatively, you can just send the `cookies.txt` file as a document directly to this chat!*",
             parse_mode=constants.ParseMode.MARKDOWN,
@@ -804,7 +847,7 @@ async def setcookie_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     target = get_cookie_target_path(platform_key)
     if not target:
-        await update.message.reply_text("❌ Unknown platform. Choose: `youtube`, `instagram`, `facebook`, or `generic`.")
+        await update.message.reply_text("❌ Unknown platform. Choose: `youtube`, `instagram`, `facebook`, `terabox`, or `generic`.")
         return
 
     plat_name, file_path = target
@@ -829,12 +872,12 @@ async def clearcookie_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if not context.args:
-        await update.message.reply_text("📝 **Usage:** `/clearcookie <youtube|instagram|facebook|generic>`")
+        await update.message.reply_text("📝 **Usage:** `/clearcookie <youtube|instagram|facebook|terabox|generic>`")
         return
 
     target = get_cookie_target_path(context.args[0])
     if not target:
-        await update.message.reply_text("❌ Unknown platform. Choose: `youtube`, `instagram`, `facebook`, or `generic`.")
+        await update.message.reply_text("❌ Unknown platform. Choose: `youtube`, `instagram`, `facebook`, `terabox`, or `generic`.")
         return
 
     plat_name, file_path = target
@@ -856,6 +899,7 @@ async def cookiestatus_command(update: Update, context: ContextTypes.DEFAULT_TYP
         ("🔴 YouTube", BASE_DIR / "cookies.txt"),
         ("📸 Instagram", BASE_DIR / "cooky" / "instagram" / "cookies.txt"),
         ("🔵 Facebook", BASE_DIR / "cooky" / "facebook" / "cookies.txt"),
+        ("📦 TeraBox", BASE_DIR / "cooky" / "terabox" / "cookies.txt"),
         ("🌐 Generic", BASE_DIR / "cooky" / "generic" / "cookies.txt"),
     ]
 
@@ -892,6 +936,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_platform = "instagram"
     elif "facebook" in filename or "facebook" in caption or "fb" in caption:
         target_platform = "facebook"
+    elif "terabox" in filename or "terabox" in caption or "tera" in caption or "tb" in caption:
+        target_platform = "terabox"
     elif "generic" in filename or "generic" in caption:
         target_platform = "generic"
     elif "youtube" in filename or "youtube" in caption or "yt" in caption or "cookies.txt" in filename:
@@ -901,7 +947,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "📁 **Received document:**\n"
             "Please send the file with a caption specifying the platform, for example:\n"
-            "`instagram`, `facebook`, `youtube`, or `generic`",
+            "`instagram`, `facebook`, `terabox`, `youtube`, or `generic`",
             parse_mode=constants.ParseMode.MARKDOWN,
         )
         return
@@ -932,10 +978,53 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(f"❌ Failed to save cookie file: {e}")
 
 
+async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to terminate all active download processes and reset temporary storage."""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("⛔ You are not authorized to use this command.")
+        return
+
+    killed_count = 0
+    for tid, task in list(ACTIVE_TASKS.items()):
+        if not task.done():
+            task.cancel()
+            killed_count += 1
+    ACTIVE_TASKS.clear()
+    URL_CACHE.clear()
+
+    # Clean orphaned files in downloads folder
+    from config import DOWNLOAD_DIR
+    cleaned_files = 0
+    try:
+        for f in DOWNLOAD_DIR.iterdir():
+            if f.is_file() and not f.name.startswith("."):
+                try:
+                    f.unlink()
+                    cleaned_files += 1
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    await update.message.reply_text(
+        f"🔄 **Server Reset & Refreshed!**\n\n"
+        f"• Terminated active tasks: `{killed_count}`\n"
+        f"• Cleaned temporary files: `{cleaned_files}`\n"
+        f"• Concurrency slots available: `{MAX_CONCURRENT_DOWNLOADS}/{MAX_CONCURRENT_DOWNLOADS}`\n"
+        f"• State: 🟢 **Ready for new downloads**",
+        parse_mode=constants.ParseMode.MARKDOWN,
+        reply_to_message_id=update.message.message_id,
+    )
+
+
 def register_handlers(application):
     """Register all bot command and message handlers."""
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("refresh", refresh_command))
+    application.add_handler(CommandHandler("killtasks", refresh_command))
+    application.add_handler(CommandHandler("reset", refresh_command))
     application.add_handler(CommandHandler("setcookie", setcookie_command))
     application.add_handler(CommandHandler("clearcookie", clearcookie_command))
     application.add_handler(CommandHandler("cookiestatus", cookiestatus_command))
