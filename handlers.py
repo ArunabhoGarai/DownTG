@@ -3,7 +3,7 @@ import os
 import time
 import logging
 import asyncio
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 from pathlib import Path
 
 from telegram import (
@@ -51,10 +51,141 @@ URL_REGEX = re.compile(
 
 # Global short cache for callback query payloads to keep callback_data under 64 bytes
 URL_CACHE: Dict[str, Dict[str, Any]] = {}
+MAX_FORMAT_CHOICES = 8
 
 
 def generate_cache_key(user_id: int) -> str:
     return f"{user_id}_{int(time.time() * 1000) % 1000000}"
+
+
+def build_format_choices(info: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Return a compact set of real, downloadable video format choices."""
+    candidates = []
+    for fmt in info.get("formats") or []:
+        format_id = str(fmt.get("format_id") or "")
+        vcodec = fmt.get("vcodec")
+        acodec = fmt.get("acodec")
+
+        # Do not present storyboards, audio-only streams, DRM formats, or
+        # entries with no direct media URL as download choices.
+        if (
+            not format_id
+            or not fmt.get("url")
+            or fmt.get("has_drm")
+            or not vcodec
+            or vcodec == "none"
+        ):
+            continue
+
+        height = int(fmt.get("height") or 0)
+        width = int(fmt.get("width") or 0)
+        has_audio = bool(acodec and acodec != "none")
+        extension = str(fmt.get("ext") or "video").upper()
+        size = format_bytes(fmt.get("filesize") or fmt.get("filesize_approx"))
+        resolution = f"{height}p" if height else (f"{width}w" if width else "Video")
+        audio_note = "" if has_audio else " + audio"
+        try:
+            bitrate = float(fmt.get("tbr") or 0)
+        except (TypeError, ValueError):
+            bitrate = 0
+
+        # For a video-only stream, merge the exact selected video with the
+        # best available audio. If no audio exists, retain the selected video
+        # rather than silently changing to a different video format.
+        selector = format_id if has_audio else f"{format_id}+bestaudio/{format_id}"
+        label = f"{resolution} | {extension} | {size}{audio_note} | {format_id}"
+        candidates.append({
+            "selector": selector,
+            "label": label[:64],
+            "height": height,
+            "width": width,
+            "has_audio": has_audio,
+            "extension": extension,
+            "bitrate": bitrate,
+        })
+
+    # Prefer a direct (video+audio) file, then MP4, for each resolution. One
+    # format per resolution keeps the Telegram keyboard useful and compact.
+    candidates.sort(
+        key=lambda item: (
+            item["height"],
+            item["width"],
+            item["has_audio"],
+            item["extension"] == "MP4",
+            item["bitrate"],
+        ),
+        reverse=True,
+    )
+
+    choices = []
+    seen_resolutions = set()
+    for candidate in candidates:
+        resolution_key = (candidate["width"], candidate["height"])
+        if resolution_key in seen_resolutions:
+            continue
+        seen_resolutions.add(resolution_key)
+        choices.append({"selector": candidate["selector"], "label": candidate["label"]})
+
+    # Show lower resolutions first; they are more likely to fit Telegram's
+    # file-size limit.
+    choices.reverse()
+    return choices[:MAX_FORMAT_CHOICES]
+
+
+def build_quality_keyboard(cache_key: str) -> InlineKeyboardMarkup:
+    """Build the standard quality menu for a cached URL."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⚡ Best Quality (<50MB)", callback_data=f"dl:best:{cache_key}"),
+        ],
+        [
+            InlineKeyboardButton("🎬 720p", callback_data=f"dl:720:{cache_key}"),
+            InlineKeyboardButton("📺 480p", callback_data=f"dl:480:{cache_key}"),
+            InlineKeyboardButton("📱 360p", callback_data=f"dl:360:{cache_key}"),
+        ],
+        [
+            InlineKeyboardButton("🎛 Available formats", callback_data=f"formats:{cache_key}"),
+        ],
+        [
+            InlineKeyboardButton("🎵 Audio Only (MP3)", callback_data=f"dl:audio:{cache_key}"),
+        ],
+        [
+            InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{cache_key}"),
+        ],
+    ])
+
+
+def build_format_keyboard(cache_key: str, choices: List[Dict[str, str]]) -> InlineKeyboardMarkup:
+    """Build a menu whose buttons select a concrete yt-dlp format ID."""
+    keyboard = [
+        [InlineKeyboardButton(choice["label"], callback_data=f"fmt:{index}:{cache_key}")]
+        for index, choice in enumerate(choices)
+    ]
+    keyboard.append([
+        InlineKeyboardButton("◀ Back", callback_data=f"back:{cache_key}"),
+        InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{cache_key}"),
+    ])
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def edit_query_message(
+    query,
+    text: str,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+):
+    """Edit a callback message whether it is a photo caption or plain text."""
+    if query.message.photo:
+        await query.edit_message_caption(
+            caption=text,
+            reply_markup=reply_markup,
+            parse_mode=constants.ParseMode.MARKDOWN,
+        )
+    else:
+        await query.edit_message_text(
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode=constants.ParseMode.MARKDOWN,
+        )
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -136,6 +267,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     duration = format_duration(info.get("duration"))
     uploader = info.get("uploader", "Unknown Author")
     thumbnail = info.get("thumbnail")
+    format_choices = build_format_choices(info)
 
     # Store URL and info in cache
     cache_key = generate_cache_key(user_id)
@@ -145,6 +277,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "duration": duration,
         "uploader": uploader,
         "duration_sec": info.get("duration"),
+        "format_choices": format_choices,
     }
 
     # Clean old cache entries (keep last 50)
@@ -152,24 +285,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for k in list(URL_CACHE.keys())[:-50]:
             URL_CACHE.pop(k, None)
 
-    # Build Quality Selection Keyboard
-    keyboard = [
-        [
-            InlineKeyboardButton("⚡ Best Quality (<50MB)", callback_data=f"dl:best:{cache_key}"),
-        ],
-        [
-            InlineKeyboardButton("🎬 720p", callback_data=f"dl:720:{cache_key}"),
-            InlineKeyboardButton("📺 480p", callback_data=f"dl:480:{cache_key}"),
-            InlineKeyboardButton("📱 360p", callback_data=f"dl:360:{cache_key}"),
-        ],
-        [
-            InlineKeyboardButton("🎵 Audio Only (MP3)", callback_data=f"dl:audio:{cache_key}"),
-        ],
-        [
-            InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{cache_key}"),
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    reply_markup = build_quality_keyboard(cache_key)
 
     caption = (
         f"{platform}\n"
@@ -218,26 +334,85 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_caption(caption="❌ Download cancelled.") if query.message.photo else await query.edit_message_text(text="❌ Download cancelled.")
         return
 
-    if action != "dl" or len(parts) < 3:
+    if action in {"formats", "back"}:
+        cache_key = parts[1] if len(parts) > 1 else ""
+        cached_data = URL_CACHE.get(cache_key)
+        if not cached_data:
+            await edit_query_message(query, "⚠️ This download request has expired. Please send the link again.")
+            return
+
+        if action == "back":
+            await edit_query_message(
+                query,
+                f"📌 **{cached_data['title']}**\n\n👇 *Choose quality to download:*",
+                build_quality_keyboard(cache_key),
+            )
+            return
+
+        choices = cached_data.get("format_choices") or []
+        if not choices:
+            await edit_query_message(
+                query,
+                "⚠️ yt-dlp did not report any directly downloadable video formats for this link. "
+                "Update yt-dlp and try the link again.",
+                build_quality_keyboard(cache_key),
+            )
+            return
+
+        await edit_query_message(
+            query,
+            "🎛 **Available formats**\n\n"
+            "These are the actual video formats yt-dlp found for this link. "
+            "A `+ audio` option merges the selected video stream with audio.\n\n"
+            "Choose one to download:",
+            build_format_keyboard(cache_key, choices),
+        )
         return
 
-    quality = parts[1]
-    cache_key = parts[2]
-
-    cached_data = URL_CACHE.get(cache_key)
-    if not cached_data:
-        msg = "⚠️ This download request has expired. Please send the link again."
-        if query.message.photo:
-            await query.edit_message_caption(caption=msg)
-        else:
-            await query.edit_message_text(text=msg)
+    format_selector = None
+    selected_choices = None
+    if action == "fmt" and len(parts) >= 3:
+        try:
+            format_index = int(parts[1])
+        except ValueError:
+            return
+        cache_key = parts[2]
+        cached_data = URL_CACHE.get(cache_key)
+        if not cached_data:
+            await edit_query_message(query, "⚠️ This download request has expired. Please send the link again.")
+            return
+        selected_choices = cached_data.get("format_choices") or []
+        if not 0 <= format_index < len(selected_choices):
+            await edit_query_message(
+                query,
+                "⚠️ That format is no longer available. Please choose another one.",
+                build_format_keyboard(cache_key, selected_choices),
+            )
+            return
+        selected_format = selected_choices[format_index]
+        quality = "format"
+        quality_label = selected_format["label"]
+        format_selector = selected_format["selector"]
+    elif action == "dl" and len(parts) >= 3:
+        quality = parts[1]
+        cache_key = parts[2]
+        cached_data = URL_CACHE.get(cache_key)
+        if not cached_data:
+            await edit_query_message(query, "⚠️ This download request has expired. Please send the link again.")
+            return
+        quality_label = QUALITIES.get(quality, quality)
+    else:
         return
 
     url = cached_data["url"]
     title = cached_data["title"]
     uploader = cached_data.get("uploader", "")
     duration_sec = cached_data.get("duration_sec")
-    quality_label = QUALITIES.get(quality, quality)
+    failure_markup = (
+        build_format_keyboard(cache_key, selected_choices)
+        if selected_choices is not None
+        else build_quality_keyboard(cache_key)
+    )
 
     # Update message status to downloading
     status_text = f"⏳ **Downloading [{quality_label}]...**\n📌 *{title}*\n\nPlease wait..."
@@ -248,17 +423,33 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     # Perform download with concurrency semaphore to safeguard CPU & RAM
     downloaded_file = None
+    completed = False
     try:
         async with get_semaphore():
-            success, downloaded_file, info, error_msg = await download_media(url, quality=quality)
+            success, downloaded_file, info, error_msg = await download_media(
+                url,
+                quality=quality,
+                format_selector=format_selector,
+            )
 
             if not success or not downloaded_file or not os.path.exists(downloaded_file):
                 err = error_msg or "Failed to download media."
-                error_response = f"❌ **Download failed:**\n`{err[:200]}`"
+                error_response = (
+                    f"❌ **Download failed:**\n`{err[:200]}`\n\n"
+                    "Choose another available format or try again."
+                )
                 if query.message.photo:
-                    await query.edit_message_caption(caption=error_response, parse_mode=constants.ParseMode.MARKDOWN)
+                    await query.edit_message_caption(
+                        caption=error_response,
+                        reply_markup=failure_markup,
+                        parse_mode=constants.ParseMode.MARKDOWN,
+                    )
                 else:
-                    await query.edit_message_text(text=error_response, parse_mode=constants.ParseMode.MARKDOWN)
+                    await query.edit_message_text(
+                        text=error_response,
+                        reply_markup=failure_markup,
+                        parse_mode=constants.ParseMode.MARKDOWN,
+                    )
                 return
 
             # Check file size
@@ -271,9 +462,17 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                     "💡 **Suggestion:** Try downloading in a lower resolution (e.g. 480p or 360p) or Audio Only (MP3)."
                 )
                 if query.message.photo:
-                    await query.edit_message_caption(caption=warning_msg, parse_mode=constants.ParseMode.MARKDOWN)
+                    await query.edit_message_caption(
+                        caption=warning_msg,
+                        reply_markup=failure_markup,
+                        parse_mode=constants.ParseMode.MARKDOWN,
+                    )
                 else:
-                    await query.edit_message_text(text=warning_msg, parse_mode=constants.ParseMode.MARKDOWN)
+                    await query.edit_message_text(
+                        text=warning_msg,
+                        reply_markup=failure_markup,
+                        parse_mode=constants.ParseMode.MARKDOWN,
+                    )
                 return
 
             # Update status to uploading
@@ -318,22 +517,25 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 await query.message.delete()
             except Exception:
                 pass
+            completed = True
 
     except Exception as e:
         logger.error(f"Error during download or upload: {e}", exc_info=True)
         err_msg = f"❌ An error occurred: {str(e)[:150]}"
         try:
             if query.message.photo:
-                await query.edit_message_caption(caption=err_msg)
+                await query.edit_message_caption(caption=err_msg, reply_markup=failure_markup)
             else:
-                await query.edit_message_text(text=err_msg)
+                await query.edit_message_text(text=err_msg, reply_markup=failure_markup)
         except Exception:
             pass
     finally:
         # Always remove temporary file from disk
         if downloaded_file:
             remove_file_safely(downloaded_file)
-        URL_CACHE.pop(cache_key, None)
+        # Preserve failed requests so a user can select another real format.
+        if completed:
+            URL_CACHE.pop(cache_key, None)
 
 
 def register_handlers(application):
