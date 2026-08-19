@@ -115,7 +115,8 @@ async def extract_media_info(url: str) -> Tuple[bool, Dict[str, Any], Optional[s
 async def download_media(
     url: str,
     quality: str = "best",
-    progress_hook: Optional[Callable[[Dict[str, Any]], None]] = None
+    progress_hook: Optional[Callable[[Dict[str, Any]], None]] = None,
+    format_selector: Optional[str] = None,
 ) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]], Optional[str]]:
     """
     Downloads media from URL with the chosen quality preset.
@@ -131,7 +132,13 @@ async def download_media(
         if progress_hook:
             opts['progress_hooks'] = [progress_hook]
 
-        if quality == "audio":
+        # A selector supplied by the format menu is built from a format ID that
+        # yt-dlp just reported for this specific URL. It takes precedence over
+        # the generic quality presets below.
+        if format_selector:
+            opts['format'] = format_selector
+            opts['merge_output_format'] = 'mp4'
+        elif quality == "audio":
             opts['format'] = 'bestaudio/ba/b/best'
             opts['postprocessors'] = [{
                 'key': 'FFmpegExtractAudio',
