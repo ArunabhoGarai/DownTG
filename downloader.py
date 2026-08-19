@@ -77,8 +77,7 @@ def get_base_ydl_opts() -> Dict[str, Any]:
         'remote_components': ['ejs:github'],
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'ios'],
-                'player_skip': ['webpage', 'configs'],
+                'player_client': ['android', 'web'],
             }
         },
         'http_headers': {
