@@ -1,0 +1,29 @@
+[Unit]
+Description=Telegram Media Downloader Bot Service
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/downloader_tg
+ExecStart=/home/ubuntu/downloader_tg/.venv/bin/python bot.py
+Restart=always
+RestartSec=5
+
+# 🛡️ Resource Protection Settings (Ensures other EC2 processes are not hampered)
+# 1. Lower process priority so web servers / databases get CPU first
+Nice=10
+
+# 2. Limit CPU usage (e.g., max 60% of a single core)
+CPUQuota=60%
+
+# 3. Limit RAM consumption (prevents OOM crashes)
+MemoryMax=350M
+MemoryHigh=300M
+
+# 4. Standard logging via systemd journal
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
