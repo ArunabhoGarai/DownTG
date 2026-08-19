@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, Callable
 import yt_dlp
 
-from config import DOWNLOAD_DIR, MAX_FILE_SIZE_BYTES
+from config import DOWNLOAD_DIR, MAX_FILE_SIZE_BYTES, BASE_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -76,8 +76,7 @@ def get_base_ydl_opts() -> Dict[str, Any]:
         'noplaylist': True,
         'extractor_args': {
             'youtube': {
-                'player_client': ['mweb', 'web', 'android', 'ios'],
-                'player_skip': ['webpage', 'configs'],
+                'player_client': ['android', 'ios', 'tv_embedded', 'mweb', 'web'],
             }
         },
         'http_headers': {
@@ -91,8 +90,8 @@ def get_base_ydl_opts() -> Dict[str, Any]:
         },
     }
     
-    # Check for cookies file if provided
-    cookie_file = Path("cookies.txt")
+    # Check for cookies file in project root
+    cookie_file = BASE_DIR / "cookies.txt"
     if cookie_file.exists():
         opts['cookiefile'] = str(cookie_file)
 
@@ -138,24 +137,23 @@ async def download_media(
             opts['progress_hooks'] = [progress_hook]
 
         if quality == "audio":
-            opts['format'] = 'bestaudio/best'
+            opts['format'] = 'bestaudio/ba/b/best'
             opts['postprocessors'] = [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
                 'preferredquality': '192',
             }]
         elif quality == "720":
-            opts['format'] = 'bestvideo[height<=720]+bestaudio/best[height<=720]/best'
+            opts['format'] = 'bv*[height<=?720]+ba/b[height<=?720]/bv*[width<=?720]+ba/b[width<=?720]/b/best'
             opts['merge_output_format'] = 'mp4'
         elif quality == "480":
-            opts['format'] = 'bestvideo[height<=480]+bestaudio/best[height<=480]/best'
+            opts['format'] = 'bv*[height<=?480]+ba/b[height<=?480]/bv*[width<=?480]+ba/b[width<=?480]/b/best'
             opts['merge_output_format'] = 'mp4'
         elif quality == "360":
-            opts['format'] = 'bestvideo[height<=360]+bestaudio/best[height<=360]/best'
+            opts['format'] = 'bv*[height<=?360]+ba/b[height<=?360]/bv*[width<=?360]+ba/b[width<=?360]/b/best'
             opts['merge_output_format'] = 'mp4'
-        else: # "best"
-            # Prefer best quality mp4
-            opts['format'] = 'bestvideo+bestaudio/best'
+        else:  # "best"
+            opts['format'] = 'bv*+ba/b/best'
             opts['merge_output_format'] = 'mp4'
 
         with yt_dlp.YoutubeDL(opts) as ydl:
