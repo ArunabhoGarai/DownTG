@@ -26,14 +26,16 @@ def get_platform_badge(url: str) -> str:
         if "/shorts/" in url_lower:
             return "🔴 YouTube Shorts"
         return "▶️ YouTube"
-    elif "instagram.com" in url_lower:
-        if "/reel/" in url_lower or "/reels/" in url_lower:
+    elif "instagram.com" in url_lower or "instagr.am" in url_lower:
+        if "/reel/" in url_lower or "/reels/" in url_lower or "/share/r/" in url_lower:
             return "📸 Instagram Reel"
+        elif "/stories/" in url_lower:
+            return "📸 Instagram Story"
         return "📸 Instagram"
-    elif "facebook.com" in url_lower or "fb.watch" in url_lower or "fb.com" in url_lower:
-        if "/reel/" in url_lower or "/reels/" in url_lower:
+    elif "facebook.com" in url_lower or "fb.watch" in url_lower or "fb.com" in url_lower or "fb.gg" in url_lower:
+        if "/reel/" in url_lower or "/reels/" in url_lower or "/share/r/" in url_lower:
             return "🔵 Facebook Reel"
-        return "🔵 Facebook"
+        return "🔵 Facebook Video"
     elif "tiktok.com" in url_lower:
         return "🎵 TikTok"
     elif "twitter.com" in url_lower or "x.com" in url_lower:
@@ -73,7 +75,7 @@ def get_base_ydl_opts() -> Dict[str, Any]:
         'nocheckcertificate': True,
         'ignoreerrors': False,
         'logtostderr': False,
-        'noplaylist': True,
+        'noplaylist': False,
         'remote_components': ['ejs:github'],
         'extractor_args': {
             'youtube': {
@@ -84,7 +86,7 @@ def get_base_ydl_opts() -> Dict[str, Any]:
             'User-Agent': (
                 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                 'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/124.0.0.0 Safari/537.36'
+                'Chrome/125.0.0.0 Safari/537.36'
             ),
             'Accept-Language': 'en-US,en;q=0.9',
             'Sec-Fetch-Mode': 'navigate',
@@ -94,6 +96,7 @@ def get_base_ydl_opts() -> Dict[str, Any]:
     # Check for cookies file in multiple locations
     possible_cookie_paths = [
         BASE_DIR / "cookies.txt",
+        BASE_DIR / "instagram_cookies.txt",
         Path("cookies.txt"),
         Path.home() / "DownTG" / "DownTG" / "cookies.txt",
     ]
@@ -109,6 +112,7 @@ def get_base_ydl_opts() -> Dict[str, Any]:
 async def extract_media_info(url: str) -> Tuple[bool, Dict[str, Any], Optional[str]]:
     """
     Extracts metadata from the given URL without downloading.
+    Handles single media items as well as Instagram/Facebook carousels.
     Returns (success, info_dict, error_message).
     """
     def _extract():
@@ -117,6 +121,15 @@ async def extract_media_info(url: str) -> Tuple[bool, Dict[str, Any], Optional[s
         with yt_dlp.YoutubeDL(opts) as ydl:
             try:
                 info = ydl.extract_info(url, download=False)
+                if not info:
+                    return False, {}, "No media found at URL."
+
+                # Handle Instagram / Facebook carousels & multi-item posts
+                if info.get("_type") == "playlist" and info.get("entries"):
+                    entries = [e for e in info["entries"] if e]
+                    if entries:
+                        info = entries[0]
+
                 return True, info, None
             except Exception as e:
                 return False, {}, str(e)
@@ -173,6 +186,15 @@ async def download_media(
         with yt_dlp.YoutubeDL(opts) as ydl:
             try:
                 info = ydl.extract_info(url, download=True)
+                if not info:
+                    return False, None, None, "No video data returned."
+
+                # Handle playlist/carousel entries
+                if info.get("_type") == "playlist" and info.get("entries"):
+                    entries = [e for e in info["entries"] if e]
+                    if entries:
+                        info = entries[0]
+
                 downloaded_file = None
 
                 # Find downloaded file
