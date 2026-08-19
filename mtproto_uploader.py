@@ -10,6 +10,7 @@ from config import (
     TELEGRAM_API_ID,
     TELEGRAM_API_HASH,
     IS_MTPROTO_ENABLED,
+    BASE_DIR,
 )
 
 logger = logging.getLogger(__name__)
@@ -26,14 +27,25 @@ def get_mtproto_client():
 
     if _CLIENT is None:
         try:
+            # Check for native C crypto acceleration
+            try:
+                import tgcrypto
+                logger.info("⚡ Native C crypto (TgCrypto) detected: High-speed uploads active!")
+            except ImportError:
+                logger.warning(
+                    "⚠️ TgCrypto C-extension not found. Using pure Python fallback. "
+                    "For 5x-10x faster MTProto uploads on EC2, run: pip install tgcrypto"
+                )
+
             from pyrogram import Client
             _CLIENT = Client(
                 name="tgbot_mtproto",
                 api_id=int(TELEGRAM_API_ID),
                 api_hash=TELEGRAM_API_HASH,
                 bot_token=BOT_TOKEN,
-                in_memory=True,
+                workdir=str(BASE_DIR),
                 no_updates=True,
+                workers=8,
             )
             logger.info("Pyrogram MTProto Client initialized successfully.")
         except Exception as e:
@@ -102,14 +114,20 @@ async def upload_media_mtproto(
             return False
 
     try:
-        # Prepare progress throttle wrapper (updates Telegram message at most once per 2.5 seconds)
+        # Prepare progress throttle wrapper (updates Telegram message at most once per 4.0 seconds)
         last_update_time = 0
+        last_percent = -1
 
         async def _pyro_progress(current: int, total: int):
-            nonlocal last_update_time
+            nonlocal last_update_time, last_percent
             now = time.time()
-            if progress_callback and (now - last_update_time >= 2.5 or current >= total):
+            current_pct = int((current / total) * 100) if total > 0 else 0
+            if progress_callback and (
+                (now - last_update_time >= 4.0 and current_pct >= last_percent + 4)
+                or current >= total
+            ):
                 last_update_time = now
+                last_percent = current_pct
                 try:
                     res = progress_callback(current, total)
                     if asyncio.iscoroutine(res):
