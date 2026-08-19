@@ -81,7 +81,7 @@ def get_base_ydl_opts(url: Optional[str] = None) -> Dict[str, Any]:
         'remote_components': ['ejs:github'],
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'ios'],
+                'player_client': ['android', 'ios', 'mweb', 'web'],
             }
         },
         'http_headers': {
@@ -130,6 +130,14 @@ def get_base_ydl_opts(url: Optional[str] = None) -> Dict[str, Any]:
             opts['cookiefile'] = str(cp)
             logger.info(f"Using cookies file from: {cp}")
             break
+
+    # If cookies are provided, let yt-dlp use its full default client suite
+    if 'cookiefile' in opts:
+        opts['extractor_args'] = {
+            'youtube': {
+                'player_client': ['web', 'mweb', 'android', 'ios'],
+            }
+        }
 
     return opts
 
