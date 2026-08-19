@@ -3,7 +3,7 @@ import time
 import asyncio
 import logging
 from pathlib import Path
-from typing import Optional, Callable, Dict, Any
+from typing import Optional, Callable, Dict, Any, Tuple
 
 from config import (
     BOT_TOKEN,
@@ -102,23 +102,25 @@ async def upload_media_mtproto(
     thumbnail_path: Optional[str] = None,
     is_audio: bool = False,
     progress_callback: Optional[Callable[[int, int], None]] = None,
-) -> bool:
+) -> Tuple[bool, Optional[str]]:
     """
     Uploads media files up to 2,000 MB (2 GB) directly to Telegram via MTProto.
-    Returns True on success.
+    Returns (success, error_message).
     """
+    if not IS_MTPROTO_ENABLED:
+        return False, "MTProto API credentials (TELEGRAM_API_ID & TELEGRAM_API_HASH) are missing in .env."
+
     if not is_mtproto_active():
-        # Try to start on-demand if not already started
         started = await start_mtproto()
         if not started:
-            return False
+            return False, "Failed to start MTProto client session."
 
     try:
         # Prepare progress throttle wrapper (updates Telegram message at most once per 4.0 seconds)
         last_update_time = 0
         last_percent = -1
 
-        async def _pyro_progress(current: int, total: int):
+        async def _pyro_progress(current: int, total: int, *args):
             nonlocal last_update_time, last_percent
             now = time.time()
             current_pct = int((current / total) * 100) if total > 0 else 0
@@ -186,20 +188,22 @@ async def upload_media_mtproto(
                     progress=_pyro_progress,
                 )
             except Exception as e_inner:
-                logger.warning(f"Retrying video upload without markdown parse_mode: {e_inner}")
-                await _CLIENT.send_video(
-                    chat_id=chat_id,
-                    video=file_path,
-                    caption=safe_caption,
-                    duration=int(duration_sec) if duration_sec else None,
-                    thumb=valid_thumb,
-                    supports_streaming=True,
-                    parse_mode=None,
-                    progress=_pyro_progress,
-                )
+                logger.warning(f"Video upload failed ({e_inner}). Retrying as generic document...")
+                try:
+                    await _CLIENT.send_document(
+                        chat_id=chat_id,
+                        document=file_path,
+                        caption=safe_caption,
+                        thumb=valid_thumb,
+                        parse_mode=None,
+                        progress=_pyro_progress,
+                    )
+                except Exception as e_doc:
+                    logger.error(f"Document upload fallback failed: {e_doc}")
+                    return False, str(e_doc)
 
-        return True
+        return True, None
 
     except Exception as e:
         logger.error(f"MTProto upload failed for {file_path}: {e}", exc_info=True)
-        return False
+        return False, str(e)

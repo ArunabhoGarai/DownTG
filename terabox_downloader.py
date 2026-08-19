@@ -273,6 +273,7 @@ async def download_terabox_media(
             'skip_unavailable_fragments': True,
             'keep_fragments': False,
             'buffersize': 1024 * 1024 * 8,
+            'postprocessor_args': ['-movflags', '+faststart'],
             'http_headers': {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
                 'Referer': 'https://www.terabox.com/',
