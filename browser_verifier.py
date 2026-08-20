@@ -180,10 +180,15 @@ async def create_captcha_session(
 
         logger.info(f"CDP WebSocket connected successfully for page {page_id}")
 
-        # Build DevTools live inspector URL
-        ws_path = f"{public_host_port}/devtools/page/{page_id}"
+        # Build Browserless Live UI and DevTools URLs
+        token_param = f"?token={BROWSERLESS_TOKEN}" if BROWSERLESS_TOKEN else ""
         token_query = f"&token={BROWSERLESS_TOKEN}" if BROWSERLESS_TOKEN else ""
-        inspector_url = f"{public_base}/devtools/inspector.html?ws={ws_path}{token_query}"
+        ws_path = f"{public_host_port}/devtools/page/{page_id}"
+        
+        # Primary live interactive screencast URL (compatible with all mobile and desktop browsers)
+        inspector_url = f"{public_base}/live{token_param}" if BROWSERLESS_TOKEN else f"{public_base}/live"
+        live_dashboard_url = f"{public_base}/{token_param}" if BROWSERLESS_TOKEN else f"{public_base}/"
+        devtools_url = f"{public_base}/devtools/inspector.html?ws={ws_path}{token_query}"
 
         # 1. Enable domains
         await ws.send_json({"id": 1, "method": "Network.enable", "params": {}})
@@ -214,6 +219,8 @@ async def create_captcha_session(
             "ws": ws,
             "ws_session": ws_session,
             "inspector_url": inspector_url,
+            "live_dashboard_url": live_dashboard_url,
+            "devtools_url": devtools_url,
             "public_base": public_base,
             "target_url": target_url,
             "created_at": time.time(),
