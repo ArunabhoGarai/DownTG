@@ -117,25 +117,32 @@ async def _resolve_via_hostinger(url: str) -> Tuple[bool, Dict[str, Any], Option
 
 async def _resolve_via_gateway(url: str) -> Tuple[bool, Dict[str, Any], Optional[str]]:
     """
-    Fallback Resolver: terabox-gateway architecture (saahiyo/terabox-gateway).
-    Supports custom gateway instances or public gateway endpoints.
+    Primary Resolver: Cookie & terabox-gateway architecture (saahiyo/terabox-gateway).
+    Supports direct cookie-based authenticated endpoints, custom gateways, and public gateway endpoints.
     """
     surl = extract_surl(url)
     custom_gateway = os.getenv("TERABOX_GATEWAY_URL", "").strip()
+    cookie = get_terabox_cookie()
 
     # Candidate endpoints to query
     endpoints = []
+
+    # 1. Direct authenticated official endpoints (if cookie is active)
+    if surl and cookie:
+        endpoints.append(f"https://www.1024terabox.com/share/list?app_id=250528&shorturl={surl}&root=1")
+        endpoints.append(f"https://www.terabox.app/share/list?app_id=250528&shorturl={surl}&root=1")
+
+    # 2. Custom gateway instance from .env
     if custom_gateway:
         endpoints.append(f"{custom_gateway.rstrip('/')}/api?url={urllib.parse.quote(url, safe='')}")
         if surl:
             endpoints.append(f"{custom_gateway.rstrip('/')}/?mode=resolve&surl={surl}&raw=1")
 
-    # Public gateway fallback endpoints
+    # 3. Public gateway fallback endpoints
     encoded_url = urllib.parse.quote(url, safe="")
     endpoints.append(f"https://terabox-dl.qtcloud.workers.dev/api/get-info?url={encoded_url}")
     endpoints.append(f"https://terabox-videodownloader.online/api/info?url={encoded_url}")
 
-    cookie = get_terabox_cookie()
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         'Accept': 'application/json, text/plain, */*',
@@ -170,7 +177,7 @@ async def _resolve_via_gateway(url: str) -> Tuple[bool, Dict[str, Any], Optional
                                 "original_url": url,
                                 "duration": None,
                                 "formats": [],
-                                "engine": "gateway",
+                                "engine": "cookie_gateway",
                             }, None
 
                     # Handle dictionary response
@@ -204,38 +211,42 @@ async def _resolve_via_gateway(url: str) -> Tuple[bool, Dict[str, Any], Optional
                                 "original_url": url,
                                 "duration": None,
                                 "formats": [],
-                                "engine": "gateway",
+                                "engine": "cookie_gateway",
                             }, None
         except Exception as e:
             logger.debug(f"Gateway endpoint {ep} failed: {e}")
             continue
 
-    return False, {}, "Both Hostinger resolver and fallback Gateway could not resolve this link."
+    return False, {}, "Could not resolve link via primary Cookie/Gateway architecture."
 
 
-async def extract_terabox_info(url: str, max_retries: int = 2) -> Tuple[bool, Dict[str, Any], Optional[str]]:
+async def extract_terabox_info(url: str, max_retries: int = 3) -> Tuple[bool, Dict[str, Any], Optional[str]]:
     """
     Fetches video metadata and CDN play URL.
-    1. Attempts primary Hostinger resolver.
-    2. If Hostinger fails or is busy, automatically falls back to terabox-gateway architecture.
+    1. Primary Engine: Cookie-based Gateway architecture (saahiyo/terabox-gateway).
+    2. Fallback / Backup Engine: Hostinger resolver API.
     """
-    # 1. Primary Engine (Hostinger)
+    # 1. Primary Engine (Cookie & Gateway Architecture)
+    gw_success, gw_info, gw_err = await _resolve_via_gateway(url)
+    if gw_success and gw_info:
+        logger.info("TeraBox link resolved successfully via primary Cookie/Gateway engine.")
+        return True, gw_info, None
+
+    logger.info(f"Primary Cookie/Gateway resolver unavailable ({gw_err}). Engaging Hostinger backup resolver...")
+
+    # 2. Backup Engine (Hostinger API)
+    err = None
     for attempt in range(1, max_retries + 1):
         success, info, err = await _resolve_via_hostinger(url)
         if success and info:
+            logger.info("TeraBox link resolved successfully via backup Hostinger engine.")
             return True, info, None
         if "try again" in str(err).lower() and attempt < max_retries:
-            await asyncio.sleep(2)
+            await asyncio.sleep(2.5)
             continue
         break
 
-    # 2. Fallback Engine (terabox-gateway)
-    logger.info(f"Hostinger resolver unavailable ({err}). Engaging terabox-gateway fallback...")
-    gw_success, gw_info, gw_err = await _resolve_via_gateway(url)
-    if gw_success and gw_info:
-        return True, gw_info, None
-
-    return False, {}, f"TeraBox Resolution Failed: {err or gw_err}"
+    return False, {}, f"TeraBox Resolution Failed: Primary Cookie/Gateway ({gw_err}) | Backup Hostinger ({err})"
 
 
 async def download_terabox_media(
