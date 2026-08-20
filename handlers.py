@@ -890,9 +890,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles quality selection button clicks and deletes the panel when finished."""
+    """Handles quality selection button clicks, cancellation, and captcha solver responses."""
     query = update.callback_query
-    await query.answer()
+    data = query.data or ""
+    parts = data.split(":")
+    action = parts[0]
+
+    # ── 1. CAPTCHA Solved Confirmation (Always Allowed for the recipient) ──
+    if action == "captcha_solved":
+        page_id = parts[1] if len(parts) > 1 else ""
+        logger.info(f"[Callback] captcha_solved received from user {query.from_user.id} for session {page_id}")
+        from browser_verifier import signal_captcha_solved
+        signal_captcha_solved(page_id)
+        try:
+            await query.answer("✅ Verification recorded! Extracting session & resuming download...", show_alert=True)
+        except Exception:
+            pass
+        try:
+            await query.edit_message_text(
+                "🧩 **TeraBox Human Verification**\n\n"
+                "✅ **Verification Recorded!**\n"
+                "⏳ The bot is now capturing cookies and resuming your download...",
+                parse_mode=constants.ParseMode.MARKDOWN
+            )
+        except Exception:
+            pass
+        return
 
     chat = update.effective_chat
     user_id = query.from_user.id
@@ -902,9 +925,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer(UNAUTHORIZED_DM_MESSAGE, show_alert=True)
         return
 
-    data = query.data or ""
-    parts = data.split(":")
-    action = parts[0]
+    await query.answer()
 
     if action == "stop":
         task_id = parts[1] if len(parts) > 1 else ""
@@ -933,22 +954,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.message.delete()
         except Exception:
             await edit_query_message(query, "❌ Cancelled.")
-        return
-
-    if action == "captcha_solved":
-        page_id = parts[1] if len(parts) > 1 else ""
-        from browser_verifier import signal_captcha_solved
-        signal_captcha_solved(page_id)
-        await query.answer("✅ Verification recorded! Extracting session & resuming download...", show_alert=True)
-        try:
-            await query.edit_message_text(
-                "🧩 **TeraBox Human Verification**\n\n"
-                "✅ **Verification Recorded!**\n"
-                "⏳ The bot is now capturing cookies and resuming your download...",
-                parse_mode=constants.ParseMode.MARKDOWN
-            )
-        except Exception:
-            pass
         return
 
     if action in {"formats", "back"}:

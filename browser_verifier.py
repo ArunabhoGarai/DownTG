@@ -186,9 +186,89 @@ async def _cdp_oneshot(ws_url: str, commands: List[Dict], timeout: float = 12.0)
     return results
 
 
-# ---------------------------------------------------------------------------
-# 1. Browserbase Session Engine
-# ---------------------------------------------------------------------------
+async def _navigate_and_inject_browserbase(
+    connect_url: str,
+    target_url: str,
+    initial_cookie_raw: Optional[str],
+) -> bool:
+    """Connects to Browserbase CDP WebSocket, injects cookies, navigates, and verifies page rendering."""
+    try:
+        connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async with session.ws_connect(
+                connect_url,
+                timeout=aiohttp.ClientTimeout(total=45),
+                heartbeat=15.0,
+            ) as ws:
+                logger.info("[Browserbase CDP] WebSocket connected. Enabling domains...")
+                # 1. Enable domains
+                await ws.send_json({"id": 1, "method": "Network.enable", "params": {}})
+                await ws.send_json({"id": 2, "method": "Page.enable", "params": {}})
+                await ws.send_json({"id": 3, "method": "Runtime.enable", "params": {}})
+                await asyncio.sleep(1.0)
+
+                # 2. Inject initial cookies
+                if initial_cookie_raw:
+                    cdp_cookies = _parse_raw_cookies_for_cdp(initial_cookie_raw)
+                    if cdp_cookies:
+                        await ws.send_json({
+                            "id": 4,
+                            "method": "Network.setCookies",
+                            "params": {"cookies": cdp_cookies},
+                        })
+                        logger.info(f"[Browserbase CDP] Injected {len(cdp_cookies)} existing cookies")
+                        await asyncio.sleep(0.5)
+
+                # 3. Navigate to target URL
+                logger.info(f"[Browserbase CDP] Triggering Page.navigate to {target_url}...")
+                await ws.send_json({
+                    "id": 5,
+                    "method": "Page.navigate",
+                    "params": {"url": target_url},
+                })
+
+                # 4. Wait for page load and events
+                loaded = False
+                for _ in range(16):
+                    try:
+                        msg = await asyncio.wait_for(ws.receive(), timeout=0.5)
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            data = json.loads(msg.data)
+                            method = data.get("method", "")
+                            if method in ("Page.loadEventFired", "Page.domContentEventFired", "Page.frameNavigated"):
+                                logger.info(f"[Browserbase CDP] Navigation event: {method}")
+                                loaded = True
+                    except asyncio.TimeoutError:
+                        pass
+                    except Exception:
+                        break
+
+                # 5. Check location.href via Runtime.evaluate
+                await ws.send_json({
+                    "id": 6,
+                    "method": "Runtime.evaluate",
+                    "params": {"expression": "window.location.href"},
+                })
+                for _ in range(6):
+                    try:
+                        msg = await asyncio.wait_for(ws.receive(), timeout=1.0)
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            data = json.loads(msg.data)
+                            if data.get("id") == 6:
+                                cur_url = data.get("result", {}).get("result", {}).get("value", "")
+                                logger.info(f"[Browserbase CDP] Current page location: {cur_url}")
+                                break
+                    except Exception:
+                        break
+
+                # Keep connection alive for 3 more seconds to ensure full rendering in Browserbase
+                await asyncio.sleep(3.0)
+                logger.info("[Browserbase CDP] Navigation & initial render phase complete.")
+                return True
+    except Exception as e:
+        logger.error(f"[Browserbase CDP] Navigation error: {e}", exc_info=True)
+        return False
+
 
 async def _create_browserbase_session(
     target_url: str,
@@ -202,13 +282,16 @@ async def _create_browserbase_session(
     }
     create_body: Dict[str, Any] = {
         "keepAlive": True,
+        "browserSettings": {
+            "solveCaptchas": True,
+        },
     }
     if BROWSERBASE_PROJECT_ID:
         create_body["projectId"] = BROWSERBASE_PROJECT_ID
 
     try:
         connector = aiohttp.TCPConnector(ssl=False)
-        async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=20)) as session:
+        async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=25)) as session:
             # 1. Create Session
             async with session.post(
                 "https://api.browserbase.com/v1/sessions",
@@ -245,17 +328,9 @@ async def _create_browserbase_session(
             except Exception as dbg_err:
                 logger.warning(f"[Browserbase] Debug URL fetch warning: {dbg_err}")
 
-            # 3. Setup Session via CDP (Inject Cookies + Navigate)
-            setup_cmds = [{"id": 1, "method": "Network.enable", "params": {}}]
-            if initial_cookie_raw:
-                cdp_cookies = _parse_raw_cookies_for_cdp(initial_cookie_raw)
-                if cdp_cookies:
-                    setup_cmds.append({"id": 2, "method": "Network.setCookies", "params": {"cookies": cdp_cookies}})
-                    logger.info(f"[Browserbase] Injecting {len(cdp_cookies)} initial cookies")
-            setup_cmds.append({"id": 3, "method": "Page.navigate", "params": {"url": target_url}})
-
-            logger.info(f"[Browserbase] Navigating to {target_url}...")
-            await _cdp_oneshot(connect_url, setup_cmds, timeout=15.0)
+            # 3. Setup Session via CDP (Inject Cookies + Navigate and wait for render)
+            logger.info(f"[Browserbase] Setting up cookies and navigating to {target_url}...")
+            await _navigate_and_inject_browserbase(connect_url, target_url, initial_cookie_raw)
 
             logger.info(f"[Browserbase] ✅ Interactive Live URL Ready: {inspector_url}")
 
