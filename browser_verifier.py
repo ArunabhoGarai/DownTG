@@ -185,9 +185,8 @@ async def create_captcha_session(
         token_query = f"&token={BROWSERLESS_TOKEN}" if BROWSERLESS_TOKEN else ""
         ws_path = f"{public_host_port}/devtools/page/{page_id}"
         
-        # Primary live interactive screencast URL (compatible with all mobile and desktop browsers)
-        inspector_url = f"{public_base}/live{token_param}" if BROWSERLESS_TOKEN else f"{public_base}/live"
-        live_dashboard_url = f"{public_base}/{token_param}" if BROWSERLESS_TOKEN else f"{public_base}/"
+        # Primary live interactive debugger UI in Browserless v2 (must have trailing slash /debugger/)
+        inspector_url = f"{public_base}/debugger/{token_param}" if BROWSERLESS_TOKEN else f"{public_base}/debugger/"
         devtools_url = f"{public_base}/devtools/inspector.html?ws={ws_path}{token_query}"
 
         # 1. Enable domains
