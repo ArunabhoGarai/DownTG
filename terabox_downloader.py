@@ -56,6 +56,26 @@ def extract_surl(url: str) -> Optional[str]:
         return None
 
 
+def format_cookie_header(raw_cookie: Optional[str]) -> Optional[str]:
+    """Parses raw Netscape or key=value cookies into a clean single-line HTTP Cookie header string."""
+    if not raw_cookie:
+        return None
+    cookies = []
+    for line in raw_cookie.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 7:
+            cookies.append(f"{parts[5]}={parts[6]}")
+        elif "=" in line:
+            cookies.append(line.rstrip(";"))
+    if not cookies:
+        clean = raw_cookie.strip().replace("\n", "").replace("\r", "")
+        return clean if "=" in clean else f"ndus={clean}"
+    return "; ".join(cookies)
+
+
 def get_terabox_cookie() -> Optional[str]:
     """Loads optional TeraBox ndus cookie from cooky/terabox/cookies.txt or .env."""
     cookie_file = BASE_DIR / "cooky" / "terabox" / "cookies.txt"
@@ -71,7 +91,7 @@ def get_terabox_cookie() -> Optional[str]:
 
 
 async def _resolve_via_hostinger(url: str) -> Tuple[bool, Dict[str, Any], Optional[str]]:
-    """Primary Resolver: Hostinger API."""
+    """Backup Resolver: Hostinger API."""
     encoded_url = urllib.parse.quote(url, safe="")
     target_api = f"{HOSTINGER_API_ENDPOINT}{encoded_url}"
 
@@ -122,15 +142,18 @@ async def _resolve_via_gateway(url: str) -> Tuple[bool, Dict[str, Any], Optional
     """
     surl = extract_surl(url)
     custom_gateway = os.getenv("TERABOX_GATEWAY_URL", "").strip()
-    cookie = get_terabox_cookie()
+    raw_cookie = get_terabox_cookie()
+    cookie_header = format_cookie_header(raw_cookie)
 
     # Candidate endpoints to query
     endpoints = []
 
     # 1. Direct authenticated official endpoints (if cookie is active)
-    if surl and cookie:
+    if surl and cookie_header:
         endpoints.append(f"https://www.1024terabox.com/share/list?app_id=250528&shorturl={surl}&root=1")
         endpoints.append(f"https://www.terabox.app/share/list?app_id=250528&shorturl={surl}&root=1")
+        endpoints.append(f"https://www.1024terabox.com/api/shorturlinfo?shorturl={surl}&root=1")
+        endpoints.append(f"https://teraboxapp.com/api/shorturlinfo?shorturl={surl}&root=1")
 
     # 2. Custom gateway instance from .env
     if custom_gateway:
@@ -147,8 +170,8 @@ async def _resolve_via_gateway(url: str) -> Tuple[bool, Dict[str, Any], Optional
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         'Accept': 'application/json, text/plain, */*',
     }
-    if cookie:
-        headers['Cookie'] = cookie if "ndus=" in cookie else f"ndus={cookie}"
+    if cookie_header:
+        headers['Cookie'] = cookie_header
 
     connector = aiohttp.TCPConnector(ssl=False)
     client_timeout = aiohttp.ClientTimeout(total=30, connect=10)
@@ -220,11 +243,23 @@ async def _resolve_via_gateway(url: str) -> Tuple[bool, Dict[str, Any], Optional
     return False, {}, "Could not resolve link via primary Cookie/Gateway architecture."
 
 
-async def extract_terabox_info(url: str, max_retries: int = 3) -> Tuple[bool, Dict[str, Any], Optional[str]]:
+from browser_verifier import (
+    is_browserless_configured,
+    solve_terabox_captcha_interactive,
+)
+
+
+async def extract_terabox_info(
+    url: str,
+    max_retries: int = 3,
+    notify_admin_callback: Optional[Callable[[str, str], None]] = None,
+    progress_updater: Optional[Callable[[str], None]] = None,
+) -> Tuple[bool, Dict[str, Any], Optional[str]]:
     """
     Fetches video metadata and CDN play URL.
-    1. Primary Engine: Cookie-based Gateway architecture (saahiyo/terabox-gateway).
+    1. Primary Engine: Cookie-based Gateway architecture.
     2. Fallback / Backup Engine: Hostinger resolver API.
+    3. Interactive HITL Remote Browser Solver: If CAPTCHA is required and Browserless is configured.
     """
     # 1. Primary Engine (Cookie & Gateway Architecture)
     gw_success, gw_info, gw_err = await _resolve_via_gateway(url)
@@ -246,6 +281,22 @@ async def extract_terabox_info(url: str, max_retries: int = 3) -> Tuple[bool, Di
             continue
         break
 
+    # 3. Interactive HITL Remote Browser Solver (if Browserless Docker is running)
+    if is_browserless_configured() and notify_admin_callback:
+        logger.info("Engaging Interactive Remote Browser CAPTCHA solver...")
+        raw_cookie = get_terabox_cookie()
+        solved, new_cookie, captcha_err = await solve_terabox_captcha_interactive(
+            target_url=url,
+            initial_cookie=raw_cookie,
+            notify_admin_callback=notify_admin_callback,
+            progress_updater=progress_updater,
+        )
+        if solved:
+            logger.info("CAPTCHA resolved! Re-attempting primary resolution with new session...")
+            retry_success, retry_info, retry_err = await _resolve_via_gateway(url)
+            if retry_success and retry_info:
+                return True, retry_info, None
+
     return False, {}, f"TeraBox Resolution Failed: Primary Cookie/Gateway ({gw_err}) | Backup Hostinger ({err})"
 
 
@@ -253,14 +304,20 @@ async def download_terabox_media(
     url: str,
     quality: str = "best",
     format_selector: Optional[str] = None,
-    progress_hook: Optional[Callable[[Dict[str, Any]], None]] = None
+    progress_hook: Optional[Callable[[Dict[str, Any]], None]] = None,
+    notify_admin_callback: Optional[Callable[[str, str], None]] = None,
+    progress_updater: Optional[Callable[[str], None]] = None,
 ) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]], Optional[str]]:
     """
     Downloads TeraBox stream (m3u8 or mp4) obtained from the resolver API.
     Returns (success, file_path, info_dict, error_message).
     """
     # 1. Resolve CDN play URL
-    success, info, err = await extract_terabox_info(url)
+    success, info, err = await extract_terabox_info(
+        url,
+        notify_admin_callback=notify_admin_callback,
+        progress_updater=progress_updater,
+    )
     if not success or not info or "play_url" not in info:
         return False, None, None, err or "Could not retrieve TeraBox stream URL."
 

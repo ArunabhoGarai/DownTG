@@ -196,14 +196,48 @@ async def route_extract_info(url: str) -> Tuple[bool, Dict[str, Any], Optional[s
         return await extract_generic_info(url)
 
 
+async def notify_admin_of_captcha(bot, inspector_url: str, target_url: str):
+    """Sends a private DM with the interactive CAPTCHA link to the bot admin."""
+    if not ADMIN_USER_ID:
+        return
+    admin_ids = [aid.strip() for aid in str(ADMIN_USER_ID).split(",") if aid.strip()]
+    for aid in admin_ids:
+        try:
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🧩 Open Live Captcha Solver", url=inspector_url)]
+            ])
+            await bot.send_message(
+                chat_id=int(aid),
+                text=(
+                    "🧩 **TeraBox Human Verification Required!**\n"
+                    "A download encountered a slider captcha.\n\n"
+                    f"🔗 **Target URL:** `{target_url[:80]}`\n\n"
+                    "👉 Tap the button below to slide the puzzle on the remote browser.\n"
+                    "⏱️ *Session will wait for 3 minutes.*"
+                ),
+                reply_markup=keyboard,
+                parse_mode=constants.ParseMode.MARKDOWN,
+            )
+        except Exception as e:
+            logger.error(f"Failed to send captcha notification to admin {aid}: {e}")
+
+
 async def route_download_media(
     url: str,
     quality: str = "best",
-    format_selector: Optional[str] = None
+    format_selector: Optional[str] = None,
+    notify_admin_callback: Optional[Callable[[str, str], None]] = None,
+    progress_updater: Optional[Callable[[str], None]] = None,
 ) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]], Optional[str]]:
     """Routes media download to the dedicated platform downloader."""
     if is_terabox_url(url):
-        return await download_terabox_media(url, quality=quality, format_selector=format_selector)
+        return await download_terabox_media(
+            url,
+            quality=quality,
+            format_selector=format_selector,
+            notify_admin_callback=notify_admin_callback,
+            progress_updater=progress_updater,
+        )
     elif is_youtube_url(url):
         return await download_media(url, quality=quality, format_selector=format_selector)
     elif is_instagram_url(url):
@@ -741,7 +775,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
         async with get_semaphore():
-            success, downloaded_file, dl_info, error_msg = await route_download_media(url, quality="480")
+            success, downloaded_file, dl_info, error_msg = await route_download_media(
+                url,
+                quality="480",
+                notify_admin_callback=lambda insp, tgt: notify_admin_of_captcha(context.bot, insp, tgt),
+                progress_updater=lambda txt: edit_status_msg_safe(status_msg, txt),
+            )
 
             if success and downloaded_file and os.path.exists(downloaded_file):
                 file_size = os.path.getsize(downloaded_file)
@@ -969,6 +1008,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 url,
                 quality=quality,
                 format_selector=format_selector,
+                notify_admin_callback=lambda insp, tgt: notify_admin_of_captcha(context.bot, insp, tgt),
+                progress_updater=lambda txt: edit_query_message(query, txt),
             )
 
             if not success or not downloaded_file or not os.path.exists(downloaded_file):
