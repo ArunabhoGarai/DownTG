@@ -2,14 +2,14 @@
 Interactive Remote Browser CAPTCHA Solver
 ==========================================
 Launches a real Chromium process on the server with --remote-debugging-port,
-navigates to the TeraBox URL, and sends the admin a DevTools frontend link
-where they can interact with the page (slide the captcha, etc).
+navigates to the TeraBox URL, injects cookies, then CLOSES the Python CDP
+WebSocket so the admin has EXCLUSIVE access via the DevTools browser link.
 
-Once the captcha is solved, cookies are extracted via CDP and saved to disk.
+Cookie extraction is done via HTTP polling (GET /json/... + Network.getCookies
+through a fresh short-lived WebSocket) rather than holding a persistent
+connection — this prevents the "WebSocket disconnected" error in DevTools.
 
-This approach uses Chrome's NATIVE DevTools frontend (served by Chrome itself),
-so there are zero external dependencies — no Browserless license, no Docker,
-no enterprise features needed. Just Chromium installed on the server.
+No Browserless enterprise license needed. Just Chromium on the server.
 """
 
 import os
@@ -18,7 +18,7 @@ import time
 import asyncio
 import logging
 import shutil
-import signal
+import urllib.parse
 from typing import Dict, Any, Optional, Tuple, Callable, List
 from pathlib import Path
 
@@ -39,17 +39,13 @@ logger = logging.getLogger(__name__)
 # Chrome / Chromium binary detection
 # ---------------------------------------------------------------------------
 _CHROME_CANDIDATES = [
-    # Linux (typical apt installs)
     "/usr/bin/chromium-browser",
     "/usr/bin/chromium",
     "/usr/bin/google-chrome-stable",
     "/usr/bin/google-chrome",
-    # Snap
     "/snap/bin/chromium",
-    # macOS
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     "/Applications/Chromium.app/Contents/MacOS/Chromium",
-    # Windows
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
     r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
 ]
@@ -57,14 +53,12 @@ _CHROME_CANDIDATES = [
 
 def _find_chrome_binary() -> Optional[str]:
     """Locate a usable Chrome / Chromium binary on this system."""
-    # Honour explicit override
     explicit = os.getenv("CHROME_BIN", "").strip()
     if explicit and (os.path.isfile(explicit) or shutil.which(explicit)):
         return explicit
     for candidate in _CHROME_CANDIDATES:
         if os.path.isfile(candidate):
             return candidate
-    # Last resort: PATH lookup
     for name in ("chromium-browser", "chromium", "google-chrome-stable", "google-chrome", "chrome"):
         found = shutil.which(name)
         if found:
@@ -72,19 +66,32 @@ def _find_chrome_binary() -> Optional[str]:
     return None
 
 
+def _extract_host(raw: Optional[str]) -> str:
+    """Return pure IP/hostname from a URL or bare IP (strips scheme, port, path)."""
+    if not raw:
+        return "127.0.0.1"
+    raw = raw.strip()
+    if not raw.startswith(("http://", "https://")):
+        raw = f"http://{raw}"
+    try:
+        return urllib.parse.urlparse(raw).hostname or "127.0.0.1"
+    except Exception:
+        return "127.0.0.1"
+
+
 def is_browserless_configured() -> bool:
-    """Returns True if we can run the remote CAPTCHA solver (either via Browserless Docker or local Chrome)."""
+    """Returns True if we can run the remote CAPTCHA solver."""
     if BROWSERLESS_URL:
         return True
     return bool(_find_chrome_binary())
 
 
 # ---------------------------------------------------------------------------
-# Cookie helpers (unchanged)
+# Cookie helpers
 # ---------------------------------------------------------------------------
 
 def _parse_raw_cookies_for_cdp(raw_cookie: Optional[str]) -> List[Dict[str, Any]]:
-    """Converts raw Netscape or key=value cookies into CDP Network.setCookies parameter list."""
+    """Converts raw Netscape or key=value cookies into CDP Network.setCookies list."""
     if not raw_cookie:
         return []
     cdp_cookies = []
@@ -100,13 +107,7 @@ def _parse_raw_cookies_for_cdp(raw_cookie: Optional[str]) -> List[Dict[str, Any]
             expires = int(float(parts[4])) if parts[4].replace(".", "", 1).isdigit() else None
             name = parts[5]
             value = parts[6]
-            cookie_dict = {
-                "name": name,
-                "value": value,
-                "domain": domain,
-                "path": path,
-                "secure": secure,
-            }
+            cookie_dict = {"name": name, "value": value, "domain": domain, "path": path, "secure": secure}
             if expires and expires > 0:
                 cookie_dict["expires"] = expires
             cdp_cookies.append(cookie_dict)
@@ -122,12 +123,8 @@ def _parse_raw_cookies_for_cdp(raw_cookie: Optional[str]) -> List[Dict[str, Any]
 
 
 def _cookies_to_netscape(cookies: List[Dict[str, Any]]) -> str:
-    """Formats CDP cookies into standard Netscape cookies.txt format."""
-    lines = [
-        "# Netscape HTTP Cookie File",
-        "# Generated automatically after CAPTCHA verification",
-        "",
-    ]
+    """Formats CDP cookies into Netscape cookies.txt format."""
+    lines = ["# Netscape HTTP Cookie File", "# Generated automatically after CAPTCHA verification", ""]
     for c in cookies:
         domain = c.get("domain", ".terabox.app")
         include_sub = "TRUE" if domain.startswith(".") else "FALSE"
@@ -142,124 +139,129 @@ def _cookies_to_netscape(cookies: List[Dict[str, Any]]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Session creation — two modes:
-#   Mode A: Browserless Docker (ws://host:3000/chromium?token=...)
-#   Mode B: Local Chrome with --remote-debugging-port (no Docker needed)
+# Low-level helper: brief CDP session to set cookies and navigate, then close
 # ---------------------------------------------------------------------------
 
-async def _connect_via_browserless(target_url: str, initial_cookie_raw: Optional[str]) -> Tuple[bool, Optional[Dict], Optional[str]]:
-    """Mode A: Connect to a running Browserless v2 Docker container."""
-    import urllib.parse
+async def _cdp_setup_and_release(ws_url: str, target_url: str, initial_cookie_raw: Optional[str]) -> bool:
+    """
+    Opens a SHORT-LIVED CDP WebSocket to:
+      1. Enable Network/Page domains
+      2. Inject existing cookies
+      3. Navigate to target_url
+      4. Then IMMEDIATELY closes the connection
 
-    token_param = f"?token={BROWSERLESS_TOKEN}" if BROWSERLESS_TOKEN else ""
-    parsed_bl = urllib.parse.urlparse(BROWSERLESS_URL)
-    local_ws_host = parsed_bl.netloc or "127.0.0.1:3000"
-
-    public_base = (BROWSERLESS_PUBLIC_URL or BROWSERLESS_URL).strip().rstrip("/")
-    if not public_base.startswith(("http://", "https://")):
-        public_base = f"http://{public_base}"
-
-    ws_session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False))
-    ws = None
-
-    # Try direct WebSocket connection (Browserless v2 style)
-    candidate_endpoints = [
-        f"ws://{local_ws_host}/chromium{token_param}",
-        f"ws://{local_ws_host}{token_param}",
-    ]
-    for ep in candidate_endpoints:
-        try:
-            logger.info(f"[Browserless] Attempting WebSocket connection to: {ep}")
-            ws = await ws_session.ws_connect(ep, timeout=15)
-            logger.info(f"[Browserless] Connected to {ep}")
-            break
-        except Exception as ws_err:
-            logger.debug(f"[Browserless] Endpoint {ep} failed: {ws_err}")
-
-    if not ws:
-        await ws_session.close()
-        return False, None, "Could not connect to Browserless Docker via WebSocket."
-
-    # Enable CDP domains
-    await ws.send_json({"id": 1, "method": "Network.enable", "params": {}})
-    await ws.send_json({"id": 2, "method": "Page.enable", "params": {}})
-    await ws.send_json({"id": 3, "method": "Runtime.enable", "params": {}})
-
-    # Drain responses for the enable commands
-    for _ in range(6):
-        try:
-            await asyncio.wait_for(ws.receive(), timeout=2.0)
-        except Exception:
-            break
-
-    # Inject cookies
-    if initial_cookie_raw:
-        cdp_cookies = _parse_raw_cookies_for_cdp(initial_cookie_raw)
-        if cdp_cookies:
-            await ws.send_json({
-                "id": 4,
-                "method": "Network.setCookies",
-                "params": {"cookies": cdp_cookies},
-            })
-            logger.info(f"[Browserless] Injected {len(cdp_cookies)} cookies into CDP session")
-            try:
-                await asyncio.wait_for(ws.receive(), timeout=2.0)
-            except Exception:
-                pass
-
-    # Navigate to target
-    await ws.send_json({
-        "id": 5,
-        "method": "Page.navigate",
-        "params": {"url": target_url},
-    })
-    logger.info(f"[Browserless] Navigated to {target_url}")
-
-    # For Browserless Docker, the interactive link is the docs page (best available in free tier)
-    inspector_url = f"{public_base}/docs{token_param}"
-
-    return True, {
-        "mode": "browserless",
-        "ws": ws,
-        "ws_session": ws_session,
-        "inspector_url": inspector_url,
-        "public_base": public_base,
-        "target_url": target_url,
-        "chrome_proc": None,
-        "created_at": time.time(),
-    }, None
-
-
-def _extract_host(raw_url_or_ip: Optional[str]) -> str:
-    """Extracts only the pure IP or hostname without port, scheme, or path."""
-    if not raw_url_or_ip:
-        return "127.0.0.1"
-    raw = raw_url_or_ip.strip()
-    if not raw.startswith(("http://", "https://")):
-        raw = f"http://{raw}"
+    After this call, Chrome has no active CDP client, so the DevTools browser
+    link can connect exclusively without "WebSocket disconnected".
+    """
     try:
-        import urllib.parse
-        parsed = urllib.parse.urlparse(raw)
-        return parsed.hostname or "127.0.0.1"
+        connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async with session.ws_connect(ws_url, timeout=aiohttp.ClientTimeout(total=10)) as ws:
+                # Enable Network domain
+                await ws.send_json({"id": 1, "method": "Network.enable", "params": {}})
+                await ws.send_json({"id": 2, "method": "Page.enable", "params": {}})
+
+                # Drain enable responses
+                for _ in range(4):
+                    try:
+                        await asyncio.wait_for(ws.receive(), timeout=1.5)
+                    except Exception:
+                        break
+
+                # Inject cookies
+                if initial_cookie_raw:
+                    cdp_cookies = _parse_raw_cookies_for_cdp(initial_cookie_raw)
+                    if cdp_cookies:
+                        await ws.send_json({
+                            "id": 3,
+                            "method": "Network.setCookies",
+                            "params": {"cookies": cdp_cookies},
+                        })
+                        logger.info(f"[CDP Setup] Injected {len(cdp_cookies)} cookies")
+                        try:
+                            await asyncio.wait_for(ws.receive(), timeout=1.5)
+                        except Exception:
+                            pass
+
+                # Navigate
+                await ws.send_json({
+                    "id": 4,
+                    "method": "Page.navigate",
+                    "params": {"url": target_url},
+                })
+                logger.info(f"[CDP Setup] Navigated to {target_url}")
+
+                # Give it a moment to start loading, then close
+                await asyncio.sleep(1.5)
+                # WebSocket closed on context manager exit
+        logger.info("[CDP Setup] CDP connection released — DevTools link is now exclusively available")
+        return True
+    except Exception as e:
+        logger.error(f"[CDP Setup] Failed during setup: {e}", exc_info=True)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Low-level helper: brief CDP poll to extract current cookies
+# ---------------------------------------------------------------------------
+
+async def _cdp_poll_cookies(ws_url: str) -> Optional[List[Dict[str, Any]]]:
+    """
+    Opens a SHORT-LIVED CDP WebSocket, requests Network.getCookies, returns
+    the cookie list, then immediately closes. This doesn't interfere with an
+    open DevTools session if timed carefully (Chrome serialises CDP clients).
+    """
+    try:
+        connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async with session.ws_connect(ws_url, timeout=aiohttp.ClientTimeout(total=8)) as ws:
+                await ws.send_json({
+                    "id": 1,
+                    "method": "Network.getCookies",
+                    "params": {"urls": [
+                        "https://www.1024terabox.com",
+                        "https://www.terabox.app",
+                        "https://terabox.com",
+                        "https://1024tera.com",
+                    ]},
+                })
+                # Read responses until we find our getCookies result
+                for _ in range(10):
+                    try:
+                        msg = await asyncio.wait_for(ws.receive(), timeout=2.0)
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            data = json.loads(msg.data)
+                            if data.get("id") == 1 and "result" in data:
+                                return data["result"].get("cookies", [])
+                    except Exception:
+                        break
     except Exception:
-        return "127.0.0.1"
+        pass
+    return None
 
 
-async def _connect_via_local_chrome(target_url: str, initial_cookie_raw: Optional[str]) -> Tuple[bool, Optional[Dict], Optional[str]]:
-    """Mode B: Launch a local Chromium with --remote-debugging-port.
-    
-    Chrome's built-in DevTools frontend is served natively by Chrome at
-    http://HOST:DEBUG_PORT — this works perfectly from any browser.
+# ---------------------------------------------------------------------------
+# Chrome session creation
+# ---------------------------------------------------------------------------
+
+async def create_captcha_session(
+    target_url: str,
+    initial_cookie_raw: Optional[str] = None,
+) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Launches Chrome with --remote-debugging-port, injects cookies, navigates,
+    then RELEASES the CDP connection so the user can use DevTools exclusively.
+
+    Returns a session_obj containing metadata (no live WebSocket).
     """
     chrome_bin = _find_chrome_binary()
     if not chrome_bin:
-        return False, None, "No Chrome/Chromium binary found on this system."
+        return False, None, "No Chrome/Chromium binary found. Install: sudo apt install -y chromium-browser"
 
     debug_port = int(os.getenv("CHROME_DEBUG_PORT", "9222"))
-    
-    # Extract clean host (pure IP or domain without port or scheme)
-    raw_public = BROWSERLESS_PUBLIC_URL or os.getenv("SERVER_PUBLIC_IP", "")
-    public_host_clean = _extract_host(raw_public)
+    public_host = _extract_host(BROWSERLESS_PUBLIC_URL or os.getenv("SERVER_PUBLIC_IP", ""))
+    local_base = f"http://127.0.0.1:{debug_port}"
+    public_base = f"http://{public_host}:{debug_port}"
 
     user_data_dir = str(BASE_DIR / ".chrome_captcha_profile")
 
@@ -277,7 +279,7 @@ async def _connect_via_local_chrome(target_url: str, initial_cookie_raw: Optiona
         "--disable-dev-shm-usage",
         "--no-sandbox",
         "--window-size=1280,900",
-        target_url,
+        "about:blank",  # Start blank; we navigate via CDP after setup
     ]
 
     logger.info(f"[Chrome] Launching: {chrome_bin} on port {debug_port}")
@@ -291,155 +293,79 @@ async def _connect_via_local_chrome(target_url: str, initial_cookie_raw: Optiona
     except Exception as e:
         return False, None, f"Failed to launch Chrome: {e}"
 
-    # Wait for Chrome to start and the debug port to become available
+    # Wait for debug port to become available
+    page_id = None
     ws_url = None
-    for attempt in range(15):
+    frontend_url = None
+
+    for attempt in range(20):
         await asyncio.sleep(1)
         try:
             connector = aiohttp.TCPConnector(ssl=False)
             async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=3)) as http_s:
-                async with http_s.get(f"http://127.0.0.1:{debug_port}/json/list") as resp:
+                async with http_s.get(f"{local_base}/json/list") as resp:
                     if resp.status == 200:
                         tabs = await resp.json(content_type=None)
                         if tabs:
-                            # Filter for regular page tab rather than extension/background worker
-                            target_tab = None
-                            for tab in tabs:
-                                if tab.get("type") == "page":
-                                    target_tab = tab
-                                    break
-                            if not target_tab:
-                                target_tab = tabs[0]
-
-                            raw_ws = target_tab.get("webSocketDebuggerUrl", "")
+                            # Pick the first page-type tab
+                            target_tab = next((t for t in tabs if t.get("type") == "page"), tabs[0])
                             page_id = target_tab.get("id", "")
+                            raw_ws = target_tab.get("webSocketDebuggerUrl", "")
                             frontend_url = target_tab.get("devtoolsFrontendUrl", "")
                             if raw_ws:
-                                ws_url = raw_ws
+                                # Always connect locally (127.0.0.1) regardless of what Chrome reports
+                                parsed_ws = urllib.parse.urlparse(raw_ws)
+                                ws_url = f"ws://127.0.0.1:{debug_port}{parsed_ws.path}"
                                 logger.info(f"[Chrome] Debug port ready. Tab ID: {page_id}")
                                 break
         except Exception:
             pass
 
-    if not ws_url:
-        # Kill Chrome if we can't connect
+    if not ws_url or not page_id:
         try:
             chrome_proc.terminate()
         except Exception:
             pass
         return False, None, f"Chrome launched but debug port {debug_port} never became available."
 
-    # Connect CDP WebSocket
-    ws_session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False))
-    try:
-        ws = await ws_session.ws_connect(ws_url, timeout=15)
-    except Exception as e:
-        try:
-            chrome_proc.terminate()
-        except Exception:
-            pass
-        await ws_session.close()
-        return False, None, f"Failed to connect CDP WebSocket: {e}"
+    # Set up cookies + navigation via CDP, then RELEASE the connection
+    setup_ok = await _cdp_setup_and_release(ws_url, target_url, initial_cookie_raw)
+    if not setup_ok:
+        logger.warning("[Chrome] CDP setup had issues but continuing anyway...")
 
-    # Enable domains
-    await ws.send_json({"id": 1, "method": "Network.enable", "params": {}})
-    await ws.send_json({"id": 2, "method": "Page.enable", "params": {}})
-    await ws.send_json({"id": 3, "method": "Runtime.enable", "params": {}})
-
-    # Drain responses
-    for _ in range(6):
-        try:
-            await asyncio.wait_for(ws.receive(), timeout=2.0)
-        except Exception:
-            break
-
-    # Inject cookies
-    if initial_cookie_raw:
-        cdp_cookies = _parse_raw_cookies_for_cdp(initial_cookie_raw)
-        if cdp_cookies:
-            await ws.send_json({
-                "id": 4,
-                "method": "Network.setCookies",
-                "params": {"cookies": cdp_cookies},
-            })
-            logger.info(f"[Chrome] Injected {len(cdp_cookies)} cookies")
-            try:
-                await asyncio.wait_for(ws.receive(), timeout=2.0)
-            except Exception:
-                pass
-
-    # Build the DevTools frontend URL cleanly (no double ports)
-    target_host_port = f"{public_host_clean}:{debug_port}"
-    if frontend_url and "chrome-devtools-frontend.appspot.com" in frontend_url:
-        # Hosted official DevTools inspector
-        inspector_url = frontend_url.replace(f"127.0.0.1:{debug_port}", target_host_port)
-    elif frontend_url and frontend_url.startswith("http"):
-        inspector_url = frontend_url.replace(f"127.0.0.1:{debug_port}", target_host_port)
-    elif frontend_url:
-        clean_rel = frontend_url.lstrip("/")
-        inspector_url = f"http://{target_host_port}/{clean_rel}".replace(f"127.0.0.1:{debug_port}", target_host_port)
+    # Build inspector URL using the devtoolsFrontendUrl from Chrome's JSON (most reliable)
+    if frontend_url:
+        # Replace 127.0.0.1 with the public IP in the ws= query param
+        inspector_url = frontend_url.replace(
+            f"127.0.0.1:{debug_port}",
+            f"{public_host}:{debug_port}"
+        )
+        # frontend_url from Chrome is a relative path like /devtools/inspector.html?ws=...
+        # or a full https://chrome-devtools-frontend.appspot.com/... URL
+        if inspector_url.startswith("/"):
+            inspector_url = f"http://{public_host}:{debug_port}{inspector_url}"
+        elif not inspector_url.startswith("http"):
+            inspector_url = f"http://{public_host}:{debug_port}/{inspector_url}"
     else:
         inspector_url = (
-            f"http://{target_host_port}/devtools/inspector.html"
-            f"?ws={target_host_port}/devtools/page/{page_id}"
+            f"http://{public_host}:{debug_port}/devtools/inspector.html"
+            f"?ws={public_host}:{debug_port}/devtools/page/{page_id}"
         )
-    logger.info(f"[Chrome] DevTools Inspector URL: {inspector_url}")
+
+    logger.info(f"[Chrome] Inspector URL: {inspector_url}")
+    logger.info(f"[Chrome] Local WS URL for polling: {ws_url}")
 
     return True, {
         "mode": "chrome",
-        "ws": ws,
-        "ws_session": ws_session,
         "chrome_proc": chrome_proc,
         "debug_port": debug_port,
         "page_id": page_id,
+        "ws_url": ws_url,           # local CDP URL (for polling only, never held open)
         "inspector_url": inspector_url,
+        "local_base": local_base,
         "target_url": target_url,
         "created_at": time.time(),
     }, None
-
-
-async def create_captcha_session(
-    target_url: str,
-    initial_cookie_raw: Optional[str] = None,
-) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
-    """
-    Creates an interactive browser session for CAPTCHA solving.
-    
-    Tries two modes in order:
-      1. Browserless Docker (if BROWSERLESS_URL is set)
-      2. Local Chrome/Chromium (if a binary is found on the system)
-    """
-    errors = []
-
-    # Mode A: Browserless Docker
-    if BROWSERLESS_URL:
-        logger.info("[Session] Trying Browserless Docker mode...")
-        try:
-            ok, session, err = await _connect_via_browserless(target_url, initial_cookie_raw)
-            if ok and session:
-                return True, session, None
-            if err:
-                errors.append(f"Browserless: {err}")
-        except Exception as e:
-            errors.append(f"Browserless exception: {e}")
-            logger.error(f"[Session] Browserless mode failed: {e}", exc_info=True)
-
-    # Mode B: Local Chrome
-    chrome_bin = _find_chrome_binary()
-    if chrome_bin:
-        logger.info(f"[Session] Trying local Chrome mode ({chrome_bin})...")
-        try:
-            ok, session, err = await _connect_via_local_chrome(target_url, initial_cookie_raw)
-            if ok and session:
-                return True, session, None
-            if err:
-                errors.append(f"Chrome: {err}")
-        except Exception as e:
-            errors.append(f"Chrome exception: {e}")
-            logger.error(f"[Session] Local Chrome mode failed: {e}", exc_info=True)
-
-    combined = " | ".join(errors) if errors else "No browser backend available."
-    return False, None, combined
 
 
 # ---------------------------------------------------------------------------
@@ -447,26 +373,10 @@ async def create_captcha_session(
 # ---------------------------------------------------------------------------
 
 async def close_captcha_session(session_obj: Dict[str, Any]) -> None:
-    """Safely closes the WebSocket, kills Chrome process if we started one."""
+    """Kills the Chrome process we started."""
     if not session_obj:
         return
-
-    ws = session_obj.get("ws")
-    ws_session = session_obj.get("ws_session")
     chrome_proc = session_obj.get("chrome_proc")
-
-    if ws and not ws.closed:
-        try:
-            await ws.close()
-        except Exception:
-            pass
-
-    if ws_session and not ws_session.closed:
-        try:
-            await ws_session.close()
-        except Exception:
-            pass
-
     if chrome_proc:
         try:
             chrome_proc.terminate()
@@ -480,7 +390,7 @@ async def close_captcha_session(session_obj: Dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# CAPTCHA solve monitor
+# CAPTCHA solve monitor — HTTP REST polling, no persistent WebSocket
 # ---------------------------------------------------------------------------
 
 async def wait_for_captcha_solved(
@@ -489,96 +399,94 @@ async def wait_for_captcha_solved(
     progress_callback: Optional[Callable[[str], None]] = None,
 ) -> Tuple[bool, Optional[str], Optional[str]]:
     """
-    Monitors the CDP WebSocket for verification completion, extracts the newly
-    issued session cookies, and saves them to cooky/terabox/cookies.txt.
+    Polls for CAPTCHA resolution WITHOUT holding a WebSocket connection open.
+
+    Strategy:
+      1. Every 5 seconds, call GET /json/list to verify Chrome is still alive.
+      2. Every 10 seconds, open a brief CDP WebSocket, call Network.getCookies,
+         then immediately close. If ndus cookie is present and verification
+         cookies (csrfToken) have changed, we consider it solved.
+      3. Watch for the page URL to no longer contain "verify".
     """
-    ws = session_obj.get("ws")
-    if not ws:
-        return False, None, "WebSocket is not connected."
+    ws_url = session_obj.get("ws_url")
+    local_base = session_obj.get("local_base", "http://127.0.0.1:9222")
+    page_id = session_obj.get("page_id")
+    debug_port = session_obj.get("debug_port", 9222)
 
     start_time = time.time()
-    last_poll_time = 0.0
-    last_progress_time = 0.0
-    req_id_counter = 100
-    solved = False
+    last_progress_notify = 0.0
+    last_cookie_poll = 0.0
+    last_url_check = 0.0
     new_cookies_text = None
+    solved = False
+
+    logger.info(f"[Monitor] Waiting up to {timeout_sec}s for CAPTCHA to be solved...")
 
     try:
         while time.time() - start_time < timeout_sec:
-            remaining = int(timeout_sec - (time.time() - start_time))
-
-            # Send progress updates every ~30s
             now = time.time()
-            if progress_callback and (now - last_progress_time >= 30):
-                last_progress_time = now
+            remaining = int(timeout_sec - (now - start_time))
+
+            # Progress update every 30s
+            if progress_callback and (now - last_progress_notify >= 30):
+                last_progress_notify = now
                 try:
                     await progress_callback(f"⏳ Waiting for CAPTCHA solution ({remaining}s remaining)...")
                 except Exception:
                     pass
 
-            # Poll cookies every 3 seconds
-            if now - last_poll_time >= 3.0:
-                last_poll_time = now
-                req_id_counter += 1
+            # Check Chrome is still alive via HTTP every 5s
+            if now - last_url_check >= 5:
+                last_url_check = now
                 try:
-                    await ws.send_json({
-                        "id": req_id_counter,
-                        "method": "Network.getCookies",
-                        "params": {"urls": [
-                            "https://www.1024terabox.com",
-                            "https://www.terabox.app",
-                            "https://terabox.com",
-                            "https://1024tera.com",
-                        ]},
-                    })
+                    connector = aiohttp.TCPConnector(ssl=False)
+                    async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=3)) as http_s:
+                        async with http_s.get(f"{local_base}/json/list") as resp:
+                            if resp.status == 200:
+                                tabs = await resp.json(content_type=None)
+                                if tabs:
+                                    target_tab = next((t for t in tabs if t.get("id") == page_id), tabs[0])
+                                    page_url = target_tab.get("url", "")
+                                    logger.debug(f"[Monitor] Current page URL: {page_url[:100]}")
+
+                                    # If page navigated away from verify/captcha, likely solved
+                                    if page_url and not any(kw in page_url.lower() for kw in ["verify", "captcha", "safe/"]):
+                                        if "terabox" in page_url.lower() or "1024tera" in page_url.lower():
+                                            logger.info(f"[Monitor] Page navigated to non-verify URL: {page_url[:100]}")
+                                            # Trigger a cookie poll immediately
+                                            last_cookie_poll = 0
                 except Exception as e:
-                    logger.error(f"[Monitor] Failed to send getCookies: {e}")
-                    break
+                    logger.debug(f"[Monitor] HTTP check error: {e}")
 
-            # Read incoming CDP messages
-            try:
-                msg = await asyncio.wait_for(ws.receive(), timeout=2.0)
-                if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
-                    logger.warning(f"[Monitor] WebSocket closed/error: {msg.type}")
-                    break
+            # Cookie poll every 10s (brief CDP connection)
+            if now - last_cookie_poll >= 10:
+                last_cookie_poll = now
+                local_ws = ws_url
+                if local_ws:
+                    try:
+                        cookies = await _cdp_poll_cookies(local_ws)
+                        if cookies:
+                            cookie_map = {c.get("name"): c.get("value", "") for c in cookies}
+                            ndus = cookie_map.get("ndus", "")
+                            csrf = cookie_map.get("csrfToken", "")
+                            logger.info(f"[Monitor] Cookie poll: ndus={'yes' if ndus else 'no'} ({len(ndus)} chars), csrfToken={'yes' if csrf else 'no'}")
 
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    data = json.loads(msg.data)
-
-                    # Check Network.getCookies response
-                    if "result" in data and "cookies" in data.get("result", {}):
-                        cookies_list = data["result"]["cookies"]
-                        cookie_names = {c.get("name"): c.get("value") for c in cookies_list}
-
-                        if "ndus" in cookie_names and len(cookie_names.get("ndus", "")) > 10:
-                            new_cookies_text = _cookies_to_netscape(cookies_list)
-
-                    # Check for successful API responses (captcha solved → page loads real data)
-                    if data.get("method") == "Network.responseReceived":
-                        params = data.get("params", {})
-                        resp_obj = params.get("response", {})
-                        resp_url = resp_obj.get("url", "")
-
-                        if ("share/list" in resp_url or "api/shorturlinfo" in resp_url) and resp_obj.get("status") == 200:
-                            logger.info(f"[Monitor] Detected successful API response: {resp_url[:100]}")
-                            solved = True
-
-                    # Detect navigation away from verification page
-                    if data.get("method") == "Page.frameNavigated":
-                        nav_url = data.get("params", {}).get("frame", {}).get("url", "")
-                        if nav_url and not any(kw in nav_url.lower() for kw in ["verify", "captcha", "safe/"]):
-                            if new_cookies_text:
-                                logger.info(f"[Monitor] Page navigated away from captcha to: {nav_url[:100]}")
-                                solved = True
-
-            except asyncio.TimeoutError:
-                pass
+                            if ndus and len(ndus) > 10:
+                                # We have a valid session cookie
+                                new_cookies_text = _cookies_to_netscape(cookies)
+                                # Check if this is a fresh verified session
+                                if csrf and len(csrf) > 5:
+                                    logger.info("[Monitor] Valid session cookies detected (ndus + csrfToken present)!")
+                                    solved = True
+                    except Exception as e:
+                        logger.debug(f"[Monitor] Cookie poll error: {e}")
 
             if solved and new_cookies_text:
                 break
 
+            await asyncio.sleep(3)
+
         if solved and new_cookies_text:
-            # Save cookies
             cookie_target = BASE_DIR / "cooky" / "terabox" / "cookies.txt"
             cookie_target.parent.mkdir(parents=True, exist_ok=True)
             with open(cookie_target, "w", encoding="utf-8") as f:
@@ -586,13 +494,10 @@ async def wait_for_captcha_solved(
             logger.info(f"[Monitor] CAPTCHA solved! Saved updated cookies to {cookie_target}")
             return True, new_cookies_text, None
 
-        if not solved:
-            return False, None, f"CAPTCHA verification timed out after {timeout_sec} seconds."
-
-        return False, None, "Solved but no cookies captured."
+        return False, None, f"CAPTCHA verification timed out after {timeout_sec}s."
 
     except Exception as e:
-        logger.error(f"[Monitor] Error while waiting for CAPTCHA solution: {e}", exc_info=True)
+        logger.error(f"[Monitor] Unexpected error: {e}", exc_info=True)
         return False, None, str(e)
 
     finally:
@@ -610,14 +515,14 @@ async def solve_terabox_captcha_interactive(
     progress_updater: Optional[Callable[[str], None]] = None,
 ) -> Tuple[bool, Optional[str], Optional[str]]:
     """
-    Complete high-level workflow:
-    1. Launches browser session (Browserless Docker or local Chrome).
-    2. Sends interactive DevTools link to admin.
-    3. Waits for admin to solve the slider.
-    4. Extracts fresh cookies and saves them.
+    Complete workflow:
+    1. Launch Chrome, inject cookies, navigate, RELEASE CDP connection.
+    2. Send interactive DevTools link to admin (they get exclusive access).
+    3. Poll periodically for cookie changes.
+    4. Save fresh cookies and return.
     """
     if not is_browserless_configured():
-        return False, None, "No browser backend configured (set BROWSERLESS_URL or install Chrome/Chromium)."
+        return False, None, "No browser backend (install chromium-browser or set BROWSERLESS_URL)."
 
     logger.info(f"[Solver] Starting interactive CAPTCHA solver for {target_url[:80]}...")
 
@@ -627,8 +532,7 @@ async def solve_terabox_captcha_interactive(
         return False, None, err or "Could not create browser session."
 
     inspector_url = session_obj["inspector_url"]
-    mode = session_obj.get("mode", "unknown")
-    logger.info(f"[Solver] Session created (mode={mode}). Inspector URL: {inspector_url}")
+    logger.info(f"[Solver] Session ready. Inspector URL: {inspector_url}")
 
     # Notify admin via Telegram
     if notify_admin_callback:
@@ -638,7 +542,7 @@ async def solve_terabox_captcha_interactive(
         except Exception as e:
             logger.warning(f"[Solver] Failed to notify admin: {e}")
 
-    # Update chat with the link
+    # Update chat message
     if progress_updater:
         try:
             await progress_updater(
