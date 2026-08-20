@@ -190,8 +190,8 @@ async def _navigate_and_inject_browserbase(
     connect_url: str,
     target_url: str,
     initial_cookie_raw: Optional[str],
-) -> bool:
-    """Connects to Browserbase CDP WebSocket, injects cookies, navigates, and verifies page rendering."""
+) -> Tuple[bool, Optional[str]]:
+    """Connects to Browserbase Browser CDP WebSocket, attaches to page target, injects cookies, and navigates."""
     try:
         connector = aiohttp.TCPConnector(ssl=False)
         async with aiohttp.ClientSession(connector=connector) as session:
@@ -200,74 +200,138 @@ async def _navigate_and_inject_browserbase(
                 timeout=aiohttp.ClientTimeout(total=45),
                 heartbeat=15.0,
             ) as ws:
-                logger.info("[Browserbase CDP] WebSocket connected. Enabling domains...")
-                # 1. Enable domains
-                await ws.send_json({"id": 1, "method": "Network.enable", "params": {}})
-                await ws.send_json({"id": 2, "method": "Page.enable", "params": {}})
-                await ws.send_json({"id": 3, "method": "Runtime.enable", "params": {}})
-                await asyncio.sleep(1.0)
+                logger.info("[Browserbase CDP] Connected to browser WebSocket. Discovering targets...")
+                
+                # 1. Discover existing page target
+                await ws.send_json({"id": 1, "method": "Target.getTargets", "params": {}})
+                target_id = None
+                for _ in range(10):
+                    try:
+                        msg = await asyncio.wait_for(ws.receive(), timeout=2.0)
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            data = json.loads(msg.data)
+                            if data.get("id") == 1:
+                                target_infos = data.get("result", {}).get("targetInfos", [])
+                                for ti in target_infos:
+                                    if ti.get("type") == "page":
+                                        target_id = ti.get("targetId")
+                                        break
+                                if target_id:
+                                    break
+                    except Exception:
+                        break
 
-                # 2. Inject initial cookies
+                # 2. If no target found, create a new target page
+                if not target_id:
+                    logger.info("[Browserbase CDP] Creating new target page...")
+                    await ws.send_json({"id": 2, "method": "Target.createTarget", "params": {"url": "about:blank"}})
+                    for _ in range(10):
+                        try:
+                            msg = await asyncio.wait_for(ws.receive(), timeout=2.0)
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                data = json.loads(msg.data)
+                                if data.get("id") == 2:
+                                    target_id = data.get("result", {}).get("targetId")
+                                    if target_id:
+                                        break
+                        except Exception:
+                            break
+
+                if not target_id:
+                    logger.error("[Browserbase CDP] Could not obtain page targetId.")
+                    return False, None
+
+                logger.info(f"[Browserbase CDP] Attaching to page targetId: {target_id}...")
+                # 3. Attach to page target to obtain sessionId
+                await ws.send_json({"id": 3, "method": "Target.attachToTarget", "params": {"targetId": target_id, "flatten": True}})
+                cdp_session_id = None
+                for _ in range(10):
+                    try:
+                        msg = await asyncio.wait_for(ws.receive(), timeout=2.0)
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            data = json.loads(msg.data)
+                            if data.get("id") == 3:
+                                cdp_session_id = data.get("result", {}).get("sessionId")
+                                if cdp_session_id:
+                                    break
+                    except Exception:
+                        break
+
+                if not cdp_session_id:
+                    logger.error("[Browserbase CDP] Could not attach to page target.")
+                    return False, None
+
+                logger.info(f"[Browserbase CDP] Attached successfully! cdp_session_id: {cdp_session_id}")
+
+                # 4. Enable domains on the attached page session
+                await ws.send_json({"id": 4, "sessionId": cdp_session_id, "method": "Network.enable", "params": {}})
+                await ws.send_json({"id": 5, "sessionId": cdp_session_id, "method": "Page.enable", "params": {}})
+                await ws.send_json({"id": 6, "sessionId": cdp_session_id, "method": "Runtime.enable", "params": {}})
+                await asyncio.sleep(0.5)
+
+                # 5. Inject cookies into the page session
                 if initial_cookie_raw:
                     cdp_cookies = _parse_raw_cookies_for_cdp(initial_cookie_raw)
                     if cdp_cookies:
                         await ws.send_json({
-                            "id": 4,
+                            "id": 7,
+                            "sessionId": cdp_session_id,
                             "method": "Network.setCookies",
                             "params": {"cookies": cdp_cookies},
                         })
-                        logger.info(f"[Browserbase CDP] Injected {len(cdp_cookies)} existing cookies")
+                        logger.info(f"[Browserbase CDP] Injected {len(cdp_cookies)} cookies into page session")
                         await asyncio.sleep(0.5)
 
-                # 3. Navigate to target URL
-                logger.info(f"[Browserbase CDP] Triggering Page.navigate to {target_url}...")
+                # 6. Navigate to target URL
+                logger.info(f"[Browserbase CDP] Navigating page to {target_url}...")
                 await ws.send_json({
-                    "id": 5,
+                    "id": 8,
+                    "sessionId": cdp_session_id,
                     "method": "Page.navigate",
                     "params": {"url": target_url},
                 })
 
-                # 4. Wait for page load and events
-                loaded = False
-                for _ in range(16):
+                # 7. Wait for page load and events
+                for _ in range(20):
                     try:
                         msg = await asyncio.wait_for(ws.receive(), timeout=0.5)
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             data = json.loads(msg.data)
                             method = data.get("method", "")
-                            if method in ("Page.loadEventFired", "Page.domContentEventFired", "Page.frameNavigated"):
-                                logger.info(f"[Browserbase CDP] Navigation event: {method}")
-                                loaded = True
+                            if method in ("Page.loadEventFired", "Page.domContentEventFired"):
+                                logger.info(f"[Browserbase CDP] Page loaded: {method}")
+                                break
                     except asyncio.TimeoutError:
                         pass
                     except Exception:
                         break
 
-                # 5. Check location.href via Runtime.evaluate
+                # 8. Check current location.href
                 await ws.send_json({
-                    "id": 6,
+                    "id": 9,
+                    "sessionId": cdp_session_id,
                     "method": "Runtime.evaluate",
                     "params": {"expression": "window.location.href"},
                 })
-                for _ in range(6):
+                for _ in range(8):
                     try:
                         msg = await asyncio.wait_for(ws.receive(), timeout=1.0)
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             data = json.loads(msg.data)
-                            if data.get("id") == 6:
+                            if data.get("id") == 9:
                                 cur_url = data.get("result", {}).get("result", {}).get("value", "")
-                                logger.info(f"[Browserbase CDP] Current page location: {cur_url}")
+                                logger.info(f"[Browserbase CDP] Page verified at: {cur_url}")
                                 break
                     except Exception:
                         break
 
-                # Keep connection alive for 3 more seconds to ensure full rendering in Browserbase
+                # Keep connection alive for 3s to allow initial render
                 await asyncio.sleep(3.0)
-                logger.info("[Browserbase CDP] Navigation & initial render phase complete.")
-                return True
+                logger.info("[Browserbase CDP] Navigation phase finished cleanly.")
+                return True, cdp_session_id
     except Exception as e:
         logger.error(f"[Browserbase CDP] Navigation error: {e}", exc_info=True)
-        return False
+        return False, None
 
 
 async def _create_browserbase_session(
@@ -330,7 +394,9 @@ async def _create_browserbase_session(
 
             # 3. Setup Session via CDP (Inject Cookies + Navigate and wait for render)
             logger.info(f"[Browserbase] Setting up cookies and navigating to {target_url}...")
-            await _navigate_and_inject_browserbase(connect_url, target_url, initial_cookie_raw)
+            ok_nav, cdp_sess_id = await _navigate_and_inject_browserbase(connect_url, target_url, initial_cookie_raw)
+            if not ok_nav:
+                logger.warning("[Browserbase] Navigation had issues, continuing with live URL...")
 
             logger.info(f"[Browserbase] ✅ Interactive Live URL Ready: {inspector_url}")
 
@@ -340,6 +406,7 @@ async def _create_browserbase_session(
                 "connect_url": connect_url,
                 "inspector_url": inspector_url,
                 "page_id": session_id,
+                "cdp_session_id": cdp_sess_id,
                 "target_url": target_url,
                 "created_at": time.time(),
             }, None
@@ -567,23 +634,88 @@ async def wait_for_captcha_solved(
         logger.info(f"[Monitor] Extracting authenticated session cookies via CDP ({mode})...")
         await asyncio.sleep(1.5)
 
-        cookie_results = await _cdp_oneshot(ws_url, [
-            {"id": 1, "method": "Network.enable", "params": {}},
-            {"id": 2, "method": "Network.getCookies", "params": {"urls": [
-                "https://www.1024terabox.com",
-                "https://www.terabox.app",
-                "https://terabox.com",
-                "https://1024tera.com",
-            ]}},
-        ], timeout=10.0)
-
         cookies = []
-        for r in cookie_results:
-            if r.get("id") == 2:
-                cookies = r.get("result", {}).get("cookies", [])
-                break
+        try:
+            connector = aiohttp.TCPConnector(ssl=False)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                async with session.ws_connect(ws_url, timeout=aiohttp.ClientTimeout(total=20)) as ws:
+                    # 1. Browser-level Storage.getCookies
+                    await ws.send_json({"id": 100, "method": "Storage.getCookies", "params": {}})
+                    for _ in range(8):
+                        try:
+                            msg = await asyncio.wait_for(ws.receive(), timeout=1.5)
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                data = json.loads(msg.data)
+                                if data.get("id") == 100 and "result" in data:
+                                    cookies = data["result"].get("cookies", [])
+                                    if cookies:
+                                        logger.info(f"[Monitor] Extracted {len(cookies)} cookies via Storage.getCookies")
+                                        break
+                        except Exception:
+                            break
 
-        logger.info(f"[Monitor] Extracted {len(cookies)} cookies from browser session")
+                    # 2. If needed, attach to target and get Network.getCookies
+                    if not cookies:
+                        await ws.send_json({"id": 101, "method": "Target.getTargets", "params": {}})
+                        target_id = None
+                        for _ in range(8):
+                            try:
+                                msg = await asyncio.wait_for(ws.receive(), timeout=1.5)
+                                if msg.type == aiohttp.WSMsgType.TEXT:
+                                    data = json.loads(msg.data)
+                                    if data.get("id") == 101:
+                                        for ti in data.get("result", {}).get("targetInfos", []):
+                                            if ti.get("type") == "page":
+                                                target_id = ti.get("targetId")
+                                                break
+                                        if target_id:
+                                            break
+                            except Exception:
+                                break
+
+                        if target_id:
+                            await ws.send_json({"id": 102, "method": "Target.attachToTarget", "params": {"targetId": target_id, "flatten": True}})
+                            sess_id = None
+                            for _ in range(8):
+                                try:
+                                    msg = await asyncio.wait_for(ws.receive(), timeout=1.5)
+                                    if msg.type == aiohttp.WSMsgType.TEXT:
+                                        data = json.loads(msg.data)
+                                        if data.get("id") == 102:
+                                            sess_id = data.get("result", {}).get("sessionId")
+                                            if sess_id:
+                                                break
+                                except Exception:
+                                    break
+
+                            if sess_id:
+                                await ws.send_json({
+                                    "id": 103,
+                                    "sessionId": sess_id,
+                                    "method": "Network.getCookies",
+                                    "params": {"urls": [
+                                        "https://www.1024terabox.com",
+                                        "https://www.terabox.app",
+                                        "https://terabox.com",
+                                        "https://1024tera.com",
+                                    ]},
+                                })
+                                for _ in range(8):
+                                    try:
+                                        msg = await asyncio.wait_for(ws.receive(), timeout=1.5)
+                                        if msg.type == aiohttp.WSMsgType.TEXT:
+                                            data = json.loads(msg.data)
+                                            if data.get("id") == 103 and "result" in data:
+                                                cookies = data["result"].get("cookies", [])
+                                                if cookies:
+                                                    logger.info(f"[Monitor] Extracted {len(cookies)} cookies via Network.getCookies")
+                                                    break
+                                    except Exception:
+                                        break
+        except Exception as extract_err:
+            logger.error(f"[Monitor] Cookie extraction error: {extract_err}", exc_info=True)
+
+        logger.info(f"[Monitor] Extracted total {len(cookies)} cookies from browser session")
 
         if cookies:
             cookie_map = {c.get("name"): c.get("value", "") for c in cookies}
