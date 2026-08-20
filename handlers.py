@@ -211,25 +211,32 @@ async def notify_admin_of_captcha(bot, inspector_url: str, target_url: str):
         logger.warning("No ADMIN_USER_ID configured in .env; cannot send private CAPTCHA alert.")
         return
     admin_ids = [aid.strip() for aid in str(ADMIN_USER_ID).split(",") if aid.strip()]
+    # Extract page_id from inspector_url if possible
+    page_id = ""
+    if "/devtools/page/" in inspector_url:
+        page_id = inspector_url.split("/devtools/page/")[1].split("?")[0].split("&")[0]
+
     for aid in admin_ids:
         try:
             try:
                 keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🧩 Open Live Captcha Solver", url=inspector_url)]
+                    [InlineKeyboardButton("🧩 Open Live Captcha Solver", url=inspector_url)],
+                    [InlineKeyboardButton("✅ I Have Solved It", callback_data=f"captcha_solved:{page_id}")],
                 ])
                 await bot.send_message(
                     chat_id=int(aid),
                     text=(
-                        "🧩 **TeraBox Human Verification Required!**\n"
+                        "🧩 **TeraBox Human Verification Required!**\n\n"
                         "A download encountered a slider captcha.\n\n"
                         f"🔗 **Target URL:** `{target_url[:80]}`\n\n"
-                        f"👉 [Tap Here to Open Captcha Solver]({inspector_url})\n\n"
+                        f"👉 [1. Open Captcha Solver in Browser]({inspector_url})\n"
+                        "👉 **2. Solve the slider, then tap [✅ I Have Solved It] below!**\n\n"
                         "⏱️ *Session will wait for 3 minutes.*"
                     ),
                     reply_markup=keyboard,
                     parse_mode=constants.ParseMode.MARKDOWN,
                 )
-                logger.info(f"Successfully sent CAPTCHA notification with button to admin ID {aid}")
+                logger.info(f"Successfully sent CAPTCHA notification with buttons to admin ID {aid}")
             except Exception as btn_err:
                 logger.warning(f"Failed to send button captcha notification to admin {aid}: {btn_err}. Retrying with plain text URL...")
                 # Fallback to plain text message (guarantees delivery even if Telegram button URL parser rejects complex query strings)
@@ -926,6 +933,22 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.message.delete()
         except Exception:
             await edit_query_message(query, "❌ Cancelled.")
+        return
+
+    if action == "captcha_solved":
+        page_id = parts[1] if len(parts) > 1 else ""
+        from browser_verifier import signal_captcha_solved
+        signal_captcha_solved(page_id)
+        await query.answer("✅ Verification recorded! Extracting session & resuming download...", show_alert=True)
+        try:
+            await query.edit_message_text(
+                "🧩 **TeraBox Human Verification**\n\n"
+                "✅ **Verification Recorded!**\n"
+                "⏳ The bot is now capturing cookies and resuming your download...",
+                parse_mode=constants.ParseMode.MARKDOWN
+            )
+        except Exception:
+            pass
         return
 
     if action in {"formats", "back"}:

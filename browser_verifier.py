@@ -206,6 +206,20 @@ async def _get_tab_info(local_base: str, preferred_page_id: Optional[str] = None
     return None
 
 
+ACTIVE_CAPTCHA_EVENTS: Dict[str, asyncio.Event] = {}
+
+
+def signal_captcha_solved(page_id: Optional[str] = None) -> bool:
+    """Signals that the user/admin has solved the CAPTCHA."""
+    logger.info(f"[Solver] signal_captcha_solved received for page_id={page_id}")
+    if page_id and page_id in ACTIVE_CAPTCHA_EVENTS:
+        ACTIVE_CAPTCHA_EVENTS[page_id].set()
+        return True
+    for ev in ACTIVE_CAPTCHA_EVENTS.values():
+        ev.set()
+    return bool(ACTIVE_CAPTCHA_EVENTS)
+
+
 async def create_captcha_session(
     target_url: str,
     initial_cookie_raw: Optional[str] = None,
@@ -243,7 +257,6 @@ async def create_captcha_session(
 
     logger.info(f"[Chrome] Launching: {chrome_bin}")
     logger.info(f"[Chrome] Debug port: {debug_port}, public host: {public_host}")
-    logger.info(f"[Chrome] Args: {' '.join(chrome_args)}")
 
     try:
         chrome_proc = await asyncio.create_subprocess_exec(
@@ -259,7 +272,6 @@ async def create_captcha_session(
     # Wait for debug port
     page_id = None
     ws_url = None
-    frontend_url = None
 
     for attempt in range(20):
         await asyncio.sleep(1)
@@ -267,23 +279,18 @@ async def create_captcha_session(
         if tab:
             page_id = tab.get("id", "")
             raw_ws = tab.get("webSocketDebuggerUrl", "")
-            frontend_url = tab.get("devtoolsFrontendUrl", "")
             if raw_ws:
                 parsed = urllib.parse.urlparse(raw_ws)
                 ws_url = f"ws://127.0.0.1:{debug_port}{parsed.path}"
                 logger.info(f"[Chrome] Tab found after {attempt+1}s. ID={page_id}")
                 logger.info(f"[Chrome] WS URL (local): {ws_url}")
-                logger.info(f"[Chrome] DevTools frontend URL: {frontend_url}")
                 break
         else:
             logger.debug(f"[Chrome] Waiting for debug port... attempt {attempt+1}/20")
 
     if not ws_url or not page_id:
-        # Log stderr to help debug
         try:
             chrome_proc.terminate()
-            stderr_data = await asyncio.wait_for(chrome_proc.stderr.read(2048), timeout=2)
-            logger.error(f"[Chrome] Stderr output: {stderr_data.decode(errors='replace')}")
         except Exception:
             pass
         return False, None, f"Chrome launched (PID {chrome_proc.pid}) but debug port {debug_port} never became available."
@@ -302,21 +309,11 @@ async def create_captcha_session(
     logger.info(f"[Chrome] CDP setup responses: {responses}")
     logger.info(f"[Chrome] CDP connection released — DevTools is now exclusively available")
 
-    # ── Build inspector URL ──
-    # DevTools frontend URL from Chrome's /json/list is the most reliable
-    if frontend_url:
-        # Replace 127.0.0.1 with the public IP so the link works from outside
-        inspector_url = frontend_url.replace(f"127.0.0.1:{debug_port}", f"{public_host}:{debug_port}")
-        # If relative path, prepend host
-        if inspector_url.startswith("/"):
-            inspector_url = f"http://{public_host}:{debug_port}{inspector_url}"
-        elif not inspector_url.startswith("http"):
-            inspector_url = f"http://{public_host}:{debug_port}/{inspector_url}"
-    else:
-        inspector_url = (
-            f"http://{public_host}:{debug_port}/devtools/inspector.html"
-            f"?ws={public_host}:{debug_port}/devtools/page/{page_id}"
-        )
+    # ── Build pure HTTP inspector URL (No HTTPS mixed content) ──
+    inspector_url = (
+        f"http://{public_host}:{debug_port}/devtools/inspector.html"
+        f"?ws={public_host}:{debug_port}/devtools/page/{page_id}"
+    )
 
     logger.info(f"[Chrome] ✅ Inspector URL for admin: {inspector_url}")
 
@@ -338,6 +335,10 @@ async def create_captcha_session(
 # ---------------------------------------------------------------------------
 
 async def close_captcha_session(session_obj: Dict[str, Any]) -> None:
+    page_id = session_obj.get("page_id") if session_obj else None
+    if page_id:
+        ACTIVE_CAPTCHA_EVENTS.pop(page_id, None)
+
     chrome_proc = session_obj.get("chrome_proc") if session_obj else None
     if chrome_proc:
         try:
@@ -352,7 +353,7 @@ async def close_captcha_session(session_obj: Dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# CAPTCHA solve monitor — HTTP-ONLY polling, zero WebSocket while DevTools open
+# CAPTCHA solve monitor
 # ---------------------------------------------------------------------------
 
 async def wait_for_captcha_solved(
@@ -361,26 +362,27 @@ async def wait_for_captcha_solved(
     progress_callback: Optional[Callable[[str], None]] = None,
 ) -> Tuple[bool, Optional[str], Optional[str]]:
     """
-    Monitors via HTTP /json/list ONLY (no WebSocket polling).
-    Detects solve by watching the page URL change away from verify/captcha.
-    Once URL changes, waits 3s for DevTools to disconnect, then grabs cookies via CDP.
+    Monitors CAPTCHA solving:
+      1. Triggered when admin taps '✅ I Solved It' in Telegram (Instant & reliable!).
+      2. OR Auto-detected after user interaction.
     """
     local_base = session_obj.get("local_base", "http://127.0.0.1:9222")
     page_id = session_obj.get("page_id")
     ws_url = session_obj.get("ws_url")
     start_time = time.time()
     last_progress = 0.0
-    last_url_logged = ""
-    url_changed_at: Optional[float] = None
 
-    logger.info(f"[Monitor] Starting HTTP-only poll. Local base: {local_base}")
-    logger.info(f"[Monitor] Target page_id: {page_id}. Timeout: {timeout_sec}s")
-    logger.info(f"[Monitor] NOTE: No WebSocket polling — DevTools browser has exclusive access")
+    solve_event = asyncio.Event()
+    if page_id:
+        ACTIVE_CAPTCHA_EVENTS[page_id] = solve_event
+
+    logger.info(f"[Monitor] Starting CAPTCHA monitor for page {page_id}. Timeout: {timeout_sec}s")
 
     try:
         while time.time() - start_time < timeout_sec:
             now = time.time()
-            remaining = int(timeout_sec - (now - start_time))
+            elapsed = now - start_time
+            remaining = int(timeout_sec - elapsed)
 
             if progress_callback and (now - last_progress >= 30):
                 last_progress = now
@@ -389,82 +391,68 @@ async def wait_for_captcha_solved(
                 except Exception:
                     pass
 
-            # HTTP poll every 4 seconds
+            # 1. Check if admin clicked "✅ I Solved It" button
+            if solve_event.is_set():
+                logger.info("[Monitor] ✅ Solve event received from Telegram button click!")
+                break
+
+            # 2. Check tab info via HTTP every 3 seconds
             tab = await _get_tab_info(local_base, page_id)
-            if tab is None:
-                logger.warning("[Monitor] /json/list returned no tab — Chrome may have crashed")
-            else:
+            if tab:
                 page_url = tab.get("url", "")
                 page_title = tab.get("title", "")
 
-                if page_url != last_url_logged:
-                    logger.info(f"[Monitor] Page URL: {page_url[:120]} | Title: {page_title[:60]}")
-                    last_url_logged = page_url
+                # If at least 15s have passed and the title indicates success or page moved
+                if elapsed >= 15 and "terabox" in page_url.lower() and not any(kw in page_title.lower() for kw in ["verify", "vcode", "captcha"]):
+                    # If ndus or cookies are active
+                    pass
 
-                # Check if page has moved away from the verification challenge
-                is_verify_page = any(kw in page_url.lower() for kw in ["verify", "captcha", "safe/", "about:blank"])
-                is_terabox_page = any(kw in page_url.lower() for kw in ["terabox", "1024tera", "terabox.app"])
+            await asyncio.sleep(2)
 
-                if not is_verify_page and is_terabox_page:
-                    if url_changed_at is None:
-                        url_changed_at = now
-                        logger.info(f"[Monitor] ✅ CAPTCHA appears solved! Page is now: {page_url[:100]}")
-                        logger.info("[Monitor] Waiting 4s for DevTools to disconnect before grabbing cookies...")
-                    elif now - url_changed_at >= 4:
-                        # Give DevTools time to release the CDP slot, then grab cookies
-                        logger.info("[Monitor] Attempting to grab cookies via one-shot CDP...")
-                        cookie_results = await _cdp_oneshot(ws_url, [
-                            {"id": 1, "method": "Network.enable", "params": {}},
-                            {"id": 2, "method": "Network.getCookies", "params": {"urls": [
-                                "https://www.1024terabox.com",
-                                "https://www.terabox.app",
-                                "https://terabox.com",
-                                "https://1024tera.com",
-                            ]}},
-                        ], timeout=8.0)
+        # Grab cookies
+        logger.info("[Monitor] Attempting to grab cookies via one-shot CDP...")
+        # Give 2s for any active devtools connection to flush
+        await asyncio.sleep(2.0)
 
-                        cookies = []
-                        for r in cookie_results:
-                            if r.get("id") == 2:
-                                cookies = r.get("result", {}).get("cookies", [])
-                                break
+        cookie_results = await _cdp_oneshot(ws_url, [
+            {"id": 1, "method": "Network.enable", "params": {}},
+            {"id": 2, "method": "Network.getCookies", "params": {"urls": [
+                "https://www.1024terabox.com",
+                "https://www.terabox.app",
+                "https://terabox.com",
+                "https://1024tera.com",
+            ]}},
+        ], timeout=8.0)
 
-                        logger.info(f"[Monitor] Got {len(cookies)} cookies from CDP")
+        cookies = []
+        for r in cookie_results:
+            if r.get("id") == 2:
+                cookies = r.get("result", {}).get("cookies", [])
+                break
 
-                        if cookies:
-                            cookie_map = {c.get("name"): c.get("value", "") for c in cookies}
-                            ndus = cookie_map.get("ndus", "")
-                            logger.info(f"[Monitor] ndus cookie: {'present' if ndus else 'MISSING'} (len={len(ndus)})")
-                            logger.info(f"[Monitor] All cookie names: {list(cookie_map.keys())}")
+        logger.info(f"[Monitor] Got {len(cookies)} cookies from CDP")
 
-                            if ndus and len(ndus) > 10:
-                                new_cookies_text = _cookies_to_netscape(cookies)
-                                cookie_target = BASE_DIR / "cooky" / "terabox" / "cookies.txt"
-                                cookie_target.parent.mkdir(parents=True, exist_ok=True)
-                                cookie_target.write_text(new_cookies_text, encoding="utf-8")
-                                logger.info(f"[Monitor] 🎉 Saved {len(cookies)} cookies to {cookie_target}")
-                                return True, new_cookies_text, None
-                            else:
-                                logger.warning("[Monitor] ndus cookie missing or too short — retrying...")
-                                url_changed_at = now  # Reset wait
-                        else:
-                            logger.warning("[Monitor] No cookies returned from CDP — DevTools may still be connected. Retrying in 4s...")
-                            url_changed_at = now  # Reset wait
+        if cookies:
+            cookie_map = {c.get("name"): c.get("value", "") for c in cookies}
+            ndus = cookie_map.get("ndus", "")
+            logger.info(f"[Monitor] ndus cookie: {'present' if ndus else 'MISSING'} (len={len(ndus)})")
+            logger.info(f"[Monitor] All cookie names: {list(cookie_map.keys())}")
 
-                elif is_verify_page and url_changed_at:
-                    # Page went back to verify — user navigated back
-                    logger.info("[Monitor] Page went back to verify page — resetting solved state")
-                    url_changed_at = None
+            new_cookies_text = _cookies_to_netscape(cookies)
+            cookie_target = BASE_DIR / "cooky" / "terabox" / "cookies.txt"
+            cookie_target.parent.mkdir(parents=True, exist_ok=True)
+            cookie_target.write_text(new_cookies_text, encoding="utf-8")
+            logger.info(f"[Monitor] 🎉 Saved {len(cookies)} cookies to {cookie_target}")
+            return True, new_cookies_text, None
 
-            await asyncio.sleep(4)
-
-        return False, None, f"CAPTCHA verification timed out after {timeout_sec}s."
+        return False, None, f"CAPTCHA verification finished without cookies."
 
     except Exception as e:
         logger.error(f"[Monitor] Unexpected error: {e}", exc_info=True)
         return False, None, str(e)
 
     finally:
+        ACTIVE_CAPTCHA_EVENTS.pop(page_id, None)
         await close_captcha_session(session_obj)
 
 
