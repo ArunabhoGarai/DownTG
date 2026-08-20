@@ -1,17 +1,13 @@
 """
 Interactive Remote Browser CAPTCHA Solver
 ==========================================
+Supports:
+  1. Browserbase (PRIMARY, Cloud-hosted):
+     - Official cloud-hosted live interactive screencast with full touch & mouse support.
+     - No ports, no mixed content, works on any mobile & desktop browser.
+     - Requires BROWSERBASE_API_KEY in .env.
 
-Architecture (no WebSocket conflicts):
-  1. Launch Chrome with --remote-debugging-port
-  2. Use a SHORT-LIVED CDP WebSocket to inject cookies + navigate, then close it
-  3. After release, the DevTools browser link gets EXCLUSIVE CDP access
-  4. Monitor purely via HTTP REST (/json/list) — NEVER open another WebSocket
-     while the user has DevTools open (that would kick them out!)
-  5. When page URL changes away from verify/captcha, wait a few seconds,
-     then grab cookies via ONE final brief CDP call after user closes DevTools
-
-This ensures zero WebSocket conflicts and a stable DevTools experience.
+  2. Local Chromium with --remote-debugging-port (SECONDARY / Fallback).
 """
 
 import os
@@ -21,7 +17,6 @@ import asyncio
 import logging
 import shutil
 import urllib.parse
-import subprocess
 from typing import Dict, Any, Optional, Tuple, Callable, List
 from pathlib import Path
 
@@ -29,6 +24,8 @@ import aiohttp
 
 from config import (
     BASE_DIR,
+    BROWSERBASE_API_KEY,
+    BROWSERBASE_PROJECT_ID,
     BROWSERLESS_URL,
     BROWSERLESS_PUBLIC_URL,
     BROWSERLESS_TOKEN,
@@ -39,7 +36,24 @@ from config import (
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Chrome / Chromium binary detection
+# Global Session Event Registry (for instant Telegram button signals)
+# ---------------------------------------------------------------------------
+ACTIVE_CAPTCHA_EVENTS: Dict[str, asyncio.Event] = {}
+
+
+def signal_captcha_solved(page_id: Optional[str] = None) -> bool:
+    """Signals that the user/admin has solved the CAPTCHA."""
+    logger.info(f"[Solver] signal_captcha_solved received for session/page: {page_id}")
+    if page_id and page_id in ACTIVE_CAPTCHA_EVENTS:
+        ACTIVE_CAPTCHA_EVENTS[page_id].set()
+        return True
+    for ev in ACTIVE_CAPTCHA_EVENTS.values():
+        ev.set()
+    return bool(ACTIVE_CAPTCHA_EVENTS)
+
+
+# ---------------------------------------------------------------------------
+# Binary / Backend detection
 # ---------------------------------------------------------------------------
 _CHROME_CANDIDATES = [
     "/usr/bin/chromium-browser",
@@ -82,6 +96,9 @@ def _extract_host(raw: Optional[str]) -> str:
 
 
 def is_browserless_configured() -> bool:
+    """Returns True if either Browserbase or local Chrome is available."""
+    if BROWSERBASE_API_KEY:
+        return True
     if BROWSERLESS_URL:
         return True
     return bool(_find_chrome_binary())
@@ -132,15 +149,11 @@ def _cookies_to_netscape(cookies: List[Dict[str, Any]]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# One-shot CDP call (opens WS, does work, closes immediately)
+# One-shot CDP command execution over WebSocket
 # ---------------------------------------------------------------------------
 
-async def _cdp_oneshot(ws_url: str, commands: List[Dict], timeout: float = 10.0) -> List[Dict]:
-    """
-    Opens a CDP WebSocket, sends commands, collects responses, closes.
-    Returns list of response dicts (may be empty if timeout/error).
-    IMPORTANT: always closes the connection, never leaks it.
-    """
+async def _cdp_oneshot(ws_url: str, commands: List[Dict], timeout: float = 12.0) -> List[Dict]:
+    """Connects to CDP WebSocket, executes commands, collects responses, and closes cleanly."""
     results = []
     try:
         connector = aiohttp.TCPConnector(ssl=False)
@@ -153,7 +166,6 @@ async def _cdp_oneshot(ws_url: str, commands: List[Dict], timeout: float = 10.0)
                 id_set = {cmd["id"] for cmd in commands}
                 for cmd in commands:
                     await ws.send_json(cmd)
-                # Collect responses until all IDs answered or timeout
                 deadline = time.time() + timeout
                 while id_set and time.time() < deadline:
                     try:
@@ -169,23 +181,105 @@ async def _cdp_oneshot(ws_url: str, commands: List[Dict], timeout: float = 10.0)
                     except Exception as e:
                         logger.debug(f"[CDP oneshot] receive error: {e}")
                         break
-    except aiohttp.ClientConnectorError as e:
-        logger.error(f"[CDP oneshot] Connection refused to {ws_url}: {e}")
-    except aiohttp.WSServerHandshakeError as e:
-        logger.error(f"[CDP oneshot] WS handshake failed for {ws_url}: {e}")
-    except asyncio.TimeoutError:
-        logger.error(f"[CDP oneshot] Timed out connecting to {ws_url}")
     except Exception as e:
-        logger.error(f"[CDP oneshot] Unexpected error for {ws_url}: {e}", exc_info=True)
+        logger.error(f"[CDP oneshot] Error connecting to {ws_url[:60]}...: {e}")
     return results
 
 
 # ---------------------------------------------------------------------------
-# Chrome session creation
+# 1. Browserbase Session Engine
+# ---------------------------------------------------------------------------
+
+async def _create_browserbase_session(
+    target_url: str,
+    initial_cookie_raw: Optional[str] = None,
+) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
+    """Creates an interactive cloud browser session on Browserbase."""
+    logger.info("[Browserbase] Initializing cloud browser session...")
+    api_headers = {
+        "X-BB-API-Key": BROWSERBASE_API_KEY,
+        "Content-Type": "application/json",
+    }
+    create_body: Dict[str, Any] = {
+        "keepAlive": True,
+    }
+    if BROWSERBASE_PROJECT_ID:
+        create_body["projectId"] = BROWSERBASE_PROJECT_ID
+
+    try:
+        connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=20)) as session:
+            # 1. Create Session
+            async with session.post(
+                "https://api.browserbase.com/v1/sessions",
+                headers=api_headers,
+                json=create_body,
+            ) as resp:
+                if resp.status not in (200, 201):
+                    err_txt = await resp.text()
+                    logger.error(f"[Browserbase] Session creation failed (HTTP {resp.status}): {err_txt}")
+                    return False, None, f"Browserbase session create error: {err_txt}"
+                session_data = await resp.json(content_type=None)
+                session_id = session_data.get("id")
+                connect_url = session_data.get("connectUrl")
+
+            if not session_id or not connect_url:
+                return False, None, "Browserbase returned empty session ID or connectUrl."
+
+            logger.info(f"[Browserbase] Created session {session_id}. Fetching live debug URL...")
+
+            # 2. Get Live Debugger Fullscreen URL
+            inspector_url = f"https://www.browserbase.com/sessions/{session_id}"
+            try:
+                async with session.get(
+                    f"https://api.browserbase.com/v1/sessions/{session_id}/debug",
+                    headers=api_headers,
+                ) as dbg_resp:
+                    if dbg_resp.status == 200:
+                        dbg_data = await dbg_resp.json(content_type=None)
+                        inspector_url = (
+                            dbg_data.get("debuggerFullscreenUrl")
+                            or dbg_data.get("debuggerUrl")
+                            or inspector_url
+                        )
+            except Exception as dbg_err:
+                logger.warning(f"[Browserbase] Debug URL fetch warning: {dbg_err}")
+
+            # 3. Setup Session via CDP (Inject Cookies + Navigate)
+            setup_cmds = [{"id": 1, "method": "Network.enable", "params": {}}]
+            if initial_cookie_raw:
+                cdp_cookies = _parse_raw_cookies_for_cdp(initial_cookie_raw)
+                if cdp_cookies:
+                    setup_cmds.append({"id": 2, "method": "Network.setCookies", "params": {"cookies": cdp_cookies}})
+                    logger.info(f"[Browserbase] Injecting {len(cdp_cookies)} initial cookies")
+            setup_cmds.append({"id": 3, "method": "Page.navigate", "params": {"url": target_url}})
+
+            logger.info(f"[Browserbase] Navigating to {target_url}...")
+            await _cdp_oneshot(connect_url, setup_cmds, timeout=15.0)
+
+            logger.info(f"[Browserbase] ✅ Interactive Live URL Ready: {inspector_url}")
+
+            return True, {
+                "mode": "browserbase",
+                "session_id": session_id,
+                "connect_url": connect_url,
+                "inspector_url": inspector_url,
+                "page_id": session_id,
+                "target_url": target_url,
+                "created_at": time.time(),
+            }, None
+
+    except Exception as e:
+        logger.error(f"[Browserbase] Session creation failed: {e}", exc_info=True)
+        return False, None, f"Browserbase error: {e}"
+
+
+# ---------------------------------------------------------------------------
+# 2. Local Chromium Fallback Engine
 # ---------------------------------------------------------------------------
 
 async def _get_tab_info(local_base: str, preferred_page_id: Optional[str] = None) -> Optional[Dict]:
-    """HTTP-only: fetch /json/list and return the target page tab."""
+    """HTTP-only: fetch /json/list from local Chrome."""
     try:
         connector = aiohttp.TCPConnector(ssl=False)
         async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=4)) as http_s:
@@ -194,48 +288,28 @@ async def _get_tab_info(local_base: str, preferred_page_id: Optional[str] = None
                     tabs = await resp.json(content_type=None)
                     if not tabs:
                         return None
-                    # Prefer the tab we opened
                     if preferred_page_id:
                         for t in tabs:
                             if t.get("id") == preferred_page_id:
                                 return t
-                    # Fall back to first page-type tab
                     return next((t for t in tabs if t.get("type") == "page"), tabs[0])
-    except Exception as e:
-        logger.debug(f"[HTTP] /json/list error: {e}")
+    except Exception:
+        pass
     return None
 
 
-ACTIVE_CAPTCHA_EVENTS: Dict[str, asyncio.Event] = {}
-
-
-def signal_captcha_solved(page_id: Optional[str] = None) -> bool:
-    """Signals that the user/admin has solved the CAPTCHA."""
-    logger.info(f"[Solver] signal_captcha_solved received for page_id={page_id}")
-    if page_id and page_id in ACTIVE_CAPTCHA_EVENTS:
-        ACTIVE_CAPTCHA_EVENTS[page_id].set()
-        return True
-    for ev in ACTIVE_CAPTCHA_EVENTS.values():
-        ev.set()
-    return bool(ACTIVE_CAPTCHA_EVENTS)
-
-
-async def create_captcha_session(
+async def _create_local_chrome_session(
     target_url: str,
     initial_cookie_raw: Optional[str] = None,
 ) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
-    """
-    Launches Chrome, sets up via CDP (one-shot), then releases the connection.
-    Returns session metadata dict with NO live WebSocket.
-    """
+    """Launches local Chrome as a fallback."""
     chrome_bin = _find_chrome_binary()
     if not chrome_bin:
-        return False, None, "No Chrome/Chromium binary found. Run: sudo apt install -y chromium-browser"
+        return False, None, "No Chrome/Chromium binary found. Configure BROWSERBASE_API_KEY in .env!"
 
     debug_port = int(os.getenv("CHROME_DEBUG_PORT", "9222"))
     public_host = _extract_host(BROWSERLESS_PUBLIC_URL or os.getenv("SERVER_PUBLIC_IP", ""))
     local_base = f"http://127.0.0.1:{debug_port}"
-
     user_data_dir = str(BASE_DIR / ".chrome_captcha_profile")
 
     chrome_args = [
@@ -255,21 +329,15 @@ async def create_captcha_session(
         "about:blank",
     ]
 
-    logger.info(f"[Chrome] Launching: {chrome_bin}")
-    logger.info(f"[Chrome] Debug port: {debug_port}, public host: {public_host}")
-
     try:
         chrome_proc = await asyncio.create_subprocess_exec(
             *chrome_args,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
-        logger.info(f"[Chrome] Process PID: {chrome_proc.pid}")
     except Exception as e:
-        logger.error(f"[Chrome] Failed to launch: {e}", exc_info=True)
         return False, None, f"Failed to launch Chrome: {e}"
 
-    # Wait for debug port
     page_id = None
     ws_url = None
     frontend_url = None
@@ -284,46 +352,30 @@ async def create_captcha_session(
             if raw_ws:
                 parsed = urllib.parse.urlparse(raw_ws)
                 ws_url = f"ws://127.0.0.1:{debug_port}{parsed.path}"
-                logger.info(f"[Chrome] Tab found after {attempt+1}s. ID={page_id}")
-                logger.info(f"[Chrome] WS URL (local): {ws_url}")
-                logger.info(f"[Chrome] Frontend URL: {frontend_url}")
                 break
-        else:
-            logger.debug(f"[Chrome] Waiting for debug port... attempt {attempt+1}/20")
 
     if not ws_url or not page_id:
         try:
             chrome_proc.terminate()
         except Exception:
             pass
-        return False, None, f"Chrome launched (PID {chrome_proc.pid}) but debug port {debug_port} never became available."
+        return False, None, f"Local Chrome failed to bind to port {debug_port}."
 
-    # ── ONE-SHOT CDP SETUP: inject cookies + navigate, then release ──
     setup_cmds = [{"id": 1, "method": "Network.enable", "params": {}}]
     if initial_cookie_raw:
         cdp_cookies = _parse_raw_cookies_for_cdp(initial_cookie_raw)
         if cdp_cookies:
             setup_cmds.append({"id": 2, "method": "Network.setCookies", "params": {"cookies": cdp_cookies}})
-            logger.info(f"[Chrome] Will inject {len(cdp_cookies)} cookies")
     setup_cmds.append({"id": 3, "method": "Page.navigate", "params": {"url": target_url}})
 
-    logger.info(f"[Chrome] Running one-shot CDP setup (inject cookies + navigate)...")
-    responses = await _cdp_oneshot(ws_url, setup_cmds, timeout=12.0)
-    logger.info(f"[Chrome] CDP setup responses: {responses}")
-    logger.info(f"[Chrome] CDP connection released — DevTools is now exclusively available")
+    await _cdp_oneshot(ws_url, setup_cmds, timeout=12.0)
 
-    # ── Build Chrome DevTools Inspector URL ──
     if frontend_url:
         inspector_url = frontend_url.replace(f"127.0.0.1:{debug_port}", f"{public_host}:{debug_port}")
         if inspector_url.startswith("/"):
             inspector_url = f"http://{public_host}:{debug_port}{inspector_url}"
     else:
-        inspector_url = (
-            f"https://chrome-devtools-frontend.appspot.com/serve_rev/@4744b886309d987d292e43232776d2206cccb13d/inspector.html"
-            f"?ws={public_host}:{debug_port}/devtools/page/{page_id}"
-        )
-
-    logger.info(f"[Chrome] ✅ Inspector URL for admin: {inspector_url}")
+        inspector_url = f"http://{public_host}:{debug_port}/devtools/inspector.html?ws={public_host}:{debug_port}/devtools/page/{page_id}"
 
     return True, {
         "mode": "chrome",
@@ -339,25 +391,59 @@ async def create_captcha_session(
 
 
 # ---------------------------------------------------------------------------
-# Session teardown
+# High-Level Session Creator
 # ---------------------------------------------------------------------------
 
+async def create_captcha_session(
+    target_url: str,
+    initial_cookie_raw: Optional[str] = None,
+) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
+    """Creates a CAPTCHA session. Prioritizes Browserbase cloud, falls back to local Chrome."""
+    if BROWSERBASE_API_KEY:
+        ok, session, err = await _create_browserbase_session(target_url, initial_cookie_raw)
+        if ok and session:
+            return True, session, None
+        logger.warning(f"[Session] Browserbase session failed ({err}), trying local Chrome...")
+
+    return await _create_local_chrome_session(target_url, initial_cookie_raw)
+
+
 async def close_captcha_session(session_obj: Dict[str, Any]) -> None:
-    page_id = session_obj.get("page_id") if session_obj else None
+    """Closes the active CAPTCHA session."""
+    if not session_obj:
+        return
+    mode = session_obj.get("mode")
+    page_id = session_obj.get("page_id")
     if page_id:
         ACTIVE_CAPTCHA_EVENTS.pop(page_id, None)
 
-    chrome_proc = session_obj.get("chrome_proc") if session_obj else None
-    if chrome_proc:
-        try:
-            chrome_proc.terminate()
-            await asyncio.wait_for(chrome_proc.wait(), timeout=5)
-            logger.info("[Chrome] Process terminated.")
-        except Exception:
+    if mode == "browserbase":
+        session_id = session_obj.get("session_id")
+        if session_id and BROWSERBASE_API_KEY:
             try:
-                chrome_proc.kill()
+                connector = aiohttp.TCPConnector(ssl=False)
+                async with aiohttp.ClientSession(connector=connector) as http_s:
+                    await http_s.post(
+                        f"https://api.browserbase.com/v1/sessions/{session_id}",
+                        headers={"X-BB-API-Key": BROWSERBASE_API_KEY, "Content-Type": "application/json"},
+                        json={"status": "REQUEST_RELEASE"},
+                        timeout=aiohttp.ClientTimeout(total=5),
+                    )
+                logger.info(f"[Browserbase] Released session {session_id}")
             except Exception:
                 pass
+    elif mode == "chrome":
+        chrome_proc = session_obj.get("chrome_proc")
+        if chrome_proc:
+            try:
+                chrome_proc.terminate()
+                await asyncio.wait_for(chrome_proc.wait(), timeout=5)
+                logger.info("[Chrome] Process terminated.")
+            except Exception:
+                try:
+                    chrome_proc.kill()
+                except Exception:
+                    pass
 
 
 # ---------------------------------------------------------------------------
@@ -369,14 +455,10 @@ async def wait_for_captcha_solved(
     timeout_sec: int = CAPTCHA_TIMEOUT_SEC,
     progress_callback: Optional[Callable[[str], None]] = None,
 ) -> Tuple[bool, Optional[str], Optional[str]]:
-    """
-    Monitors CAPTCHA solving:
-      1. Triggered when admin taps '✅ I Solved It' in Telegram (Instant & reliable!).
-      2. OR Auto-detected after user interaction.
-    """
-    local_base = session_obj.get("local_base", "http://127.0.0.1:9222")
+    """Monitors CAPTCHA solving and extracts cookies upon resolution."""
+    mode = session_obj.get("mode", "browserbase")
     page_id = session_obj.get("page_id")
-    ws_url = session_obj.get("ws_url")
+    ws_url = session_obj.get("connect_url") if mode == "browserbase" else session_obj.get("ws_url")
     start_time = time.time()
     last_progress = 0.0
 
@@ -384,7 +466,7 @@ async def wait_for_captcha_solved(
     if page_id:
         ACTIVE_CAPTCHA_EVENTS[page_id] = solve_event
 
-    logger.info(f"[Monitor] Starting CAPTCHA monitor for page {page_id}. Timeout: {timeout_sec}s")
+    logger.info(f"[Monitor] Starting CAPTCHA monitor (mode={mode}, session_id={page_id}). Timeout: {timeout_sec}s")
 
     try:
         while time.time() - start_time < timeout_sec:
@@ -399,28 +481,16 @@ async def wait_for_captcha_solved(
                 except Exception:
                     pass
 
-            # 1. Check if admin clicked "✅ I Solved It" button
+            # Check if user clicked "✅ I Solved It" button in Telegram
             if solve_event.is_set():
-                logger.info("[Monitor] ✅ Solve event received from Telegram button click!")
+                logger.info("[Monitor] ✅ Telegram 'I Solved It' signal received!")
                 break
-
-            # 2. Check tab info via HTTP every 3 seconds
-            tab = await _get_tab_info(local_base, page_id)
-            if tab:
-                page_url = tab.get("url", "")
-                page_title = tab.get("title", "")
-
-                # If at least 15s have passed and the title indicates success or page moved
-                if elapsed >= 15 and "terabox" in page_url.lower() and not any(kw in page_title.lower() for kw in ["verify", "vcode", "captcha"]):
-                    # If ndus or cookies are active
-                    pass
 
             await asyncio.sleep(2)
 
         # Grab cookies
-        logger.info("[Monitor] Attempting to grab cookies via one-shot CDP...")
-        # Give 2s for any active devtools connection to flush
-        await asyncio.sleep(2.0)
+        logger.info(f"[Monitor] Extracting authenticated session cookies via CDP ({mode})...")
+        await asyncio.sleep(1.5)
 
         cookie_results = await _cdp_oneshot(ws_url, [
             {"id": 1, "method": "Network.enable", "params": {}},
@@ -430,7 +500,7 @@ async def wait_for_captcha_solved(
                 "https://terabox.com",
                 "https://1024tera.com",
             ]}},
-        ], timeout=8.0)
+        ], timeout=10.0)
 
         cookies = []
         for r in cookie_results:
@@ -438,25 +508,24 @@ async def wait_for_captcha_solved(
                 cookies = r.get("result", {}).get("cookies", [])
                 break
 
-        logger.info(f"[Monitor] Got {len(cookies)} cookies from CDP")
+        logger.info(f"[Monitor] Extracted {len(cookies)} cookies from browser session")
 
         if cookies:
             cookie_map = {c.get("name"): c.get("value", "") for c in cookies}
             ndus = cookie_map.get("ndus", "")
-            logger.info(f"[Monitor] ndus cookie: {'present' if ndus else 'MISSING'} (len={len(ndus)})")
-            logger.info(f"[Monitor] All cookie names: {list(cookie_map.keys())}")
+            logger.info(f"[Monitor] ndus: {'present' if ndus else 'missing'} (len={len(ndus)}), keys: {list(cookie_map.keys())}")
 
             new_cookies_text = _cookies_to_netscape(cookies)
             cookie_target = BASE_DIR / "cooky" / "terabox" / "cookies.txt"
             cookie_target.parent.mkdir(parents=True, exist_ok=True)
             cookie_target.write_text(new_cookies_text, encoding="utf-8")
-            logger.info(f"[Monitor] 🎉 Saved {len(cookies)} cookies to {cookie_target}")
+            logger.info(f"[Monitor] 🎉 Successfully saved {len(cookies)} cookies to {cookie_target}")
             return True, new_cookies_text, None
 
-        return False, None, f"CAPTCHA verification finished without cookies."
+        return False, None, "Verification finished without capturing session cookies."
 
     except Exception as e:
-        logger.error(f"[Monitor] Unexpected error: {e}", exc_info=True)
+        logger.error(f"[Monitor] Verification error: {e}", exc_info=True)
         return False, None, str(e)
 
     finally:
@@ -474,11 +543,11 @@ async def solve_terabox_captcha_interactive(
     notify_admin_callback: Optional[Callable[[str, str], None]] = None,
     progress_updater: Optional[Callable[[str], None]] = None,
 ) -> Tuple[bool, Optional[str], Optional[str]]:
-    """Full workflow: launch Chrome, send link to admin, wait for solve, save cookies."""
+    """Orchestrates interactive CAPTCHA solving with Browserbase / local Chrome."""
     if not is_browserless_configured():
-        return False, None, "No browser backend (install chromium-browser or set BROWSERLESS_URL)."
+        return False, None, "No solver backend configured (set BROWSERBASE_API_KEY in .env)."
 
-    logger.info(f"[Solver] ═══ Starting interactive CAPTCHA solver ═══")
+    logger.info(f"[Solver] ═══ Launching Interactive CAPTCHA Solver ═══")
     logger.info(f"[Solver] Target URL: {target_url}")
 
     success, session_obj, err = await create_captcha_session(target_url, initial_cookie)
@@ -487,7 +556,8 @@ async def solve_terabox_captcha_interactive(
         return False, None, err or "Could not create browser session."
 
     inspector_url = session_obj["inspector_url"]
-    logger.info(f"[Solver] Session ready. Sending inspector link to admin...")
+    mode = session_obj.get("mode", "browserbase")
+    logger.info(f"[Solver] Session active (engine: {mode}). Inspector link: {inspector_url}")
 
     if notify_admin_callback:
         try:

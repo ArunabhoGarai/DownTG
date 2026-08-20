@@ -40,10 +40,14 @@ QUALITIES = {
     "audio": "🎵 Audio Only (MP3)",
 }
 
-# Browserless Remote CAPTCHA Solver Configuration (Docker container)
-BROWSERLESS_URL = os.getenv("BROWSERLESS_URL", "http://127.0.0.1:3000").strip().rstrip("/")
+# Browserbase Cloud Solver Configuration (Cloud-hosted interactive live browser)
+BROWSERBASE_API_KEY = os.getenv("BROWSERBASE_API_KEY", "").strip()
+BROWSERBASE_PROJECT_ID = os.getenv("BROWSERBASE_PROJECT_ID", "").strip()
+
+# Local / Browserless Remote CAPTCHA Solver Configuration
+BROWSERLESS_URL = os.getenv("BROWSERLESS_URL", "").strip().rstrip("/")
 BROWSERLESS_PUBLIC_URL = os.getenv("BROWSERLESS_PUBLIC_URL", "").strip().rstrip("/")
 BROWSERLESS_TOKEN = os.getenv("BROWSERLESS_TOKEN", "").strip()
 _raw_captcha_timeout = os.getenv("CAPTCHA_TIMEOUT_SEC", "180").strip()
 CAPTCHA_TIMEOUT_SEC = int(_raw_captcha_timeout) if _raw_captcha_timeout.isdigit() else 180
-IS_BROWSERLESS_ENABLED = bool(os.getenv("BROWSERLESS_URL") or os.getenv("BROWSERLESS_PUBLIC_URL"))
+IS_BROWSERLESS_ENABLED = bool(BROWSERBASE_API_KEY or os.getenv("BROWSERLESS_URL") or os.getenv("SERVER_PUBLIC_IP"))
