@@ -182,10 +182,18 @@ def is_facebook_url(url: str) -> bool:
     return "facebook.com" in u or "fb.watch" in u or "fb.com" in u
 
 
-async def route_extract_info(url: str) -> Tuple[bool, Dict[str, Any], Optional[str]]:
+async def route_extract_info(
+    url: str,
+    notify_admin_callback: Optional[Callable[[str, str], None]] = None,
+    progress_updater: Optional[Callable[[str], None]] = None,
+) -> Tuple[bool, Dict[str, Any], Optional[str]]:
     """Routes metadata extraction to the dedicated platform downloader."""
     if is_terabox_url(url):
-        return await extract_terabox_info(url)
+        return await extract_terabox_info(
+            url,
+            notify_admin_callback=notify_admin_callback,
+            progress_updater=progress_updater,
+        )
     elif is_youtube_url(url):
         return await extract_media_info(url)
     elif is_instagram_url(url):
@@ -726,7 +734,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ACTIVE_TASKS[task_id] = asyncio.current_task()
 
         # Extract metadata without downloading (routed to dedicated engine)
-        success, info, error_msg = await route_extract_info(url)
+        success, info, error_msg = await route_extract_info(
+            url,
+            notify_admin_callback=lambda insp, tgt: notify_admin_of_captcha(context.bot, insp, tgt),
+            progress_updater=lambda txt: edit_status_msg_safe(status_msg, txt),
+        )
 
         if not success or not info:
             err = error_msg or "Unable to retrieve video information."
