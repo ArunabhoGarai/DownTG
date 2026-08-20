@@ -1,4 +1,5 @@
 import os
+import uuid
 import json
 import time
 import asyncio
@@ -97,53 +98,92 @@ async def create_captcha_session(
     token_param = f"?token={BROWSERLESS_TOKEN}" if BROWSERLESS_TOKEN else ""
     new_page_endpoint = f"{BROWSERLESS_URL}/json/new{token_param}"
 
+    public_base = (BROWSERLESS_PUBLIC_URL or BROWSERLESS_URL).strip().rstrip("/")
+    if not public_base.startswith(("http://", "https://")):
+        public_base = f"http://{public_base}"
+    parsed_public = urllib.parse.urlparse(public_base)
+    public_host_port = parsed_public.netloc or parsed_public.path or "127.0.0.1:3000"
+    parsed_bl = urllib.parse.urlparse(BROWSERLESS_URL)
+    local_ws_host = parsed_bl.netloc or "127.0.0.1:3000"
+
     try:
-        connector = aiohttp.TCPConnector(ssl=False)
-        client_timeout = aiohttp.ClientTimeout(total=20, connect=5)
-        async with aiohttp.ClientSession(connector=connector, timeout=client_timeout) as http_session:
-            async with http_session.put(new_page_endpoint) as resp:
-                if resp.status != 200:
-                    # Fallback to GET /json/new
-                    async with http_session.get(new_page_endpoint) as resp_get:
-                        if resp_get.status != 200:
-                            return False, None, f"Failed to create tab on Browserless (HTTP {resp_get.status})"
-                        tab_data = await resp_get.json(content_type=None)
-                else:
-                    tab_data = await resp.json(content_type=None)
+        page_id = None
+        ws_url = None
 
-        page_id = tab_data.get("id")
-        raw_ws_url = tab_data.get("webSocketDebuggerUrl")
-        if not page_id or not raw_ws_url:
-            err_msg = f"Invalid response from Browserless /json/new: {tab_data}"
-            logger.error(err_msg)
-            return False, None, err_msg
+        # 1. Attempt REST /json/new (Supported in v1 / classic Chrome)
+        try:
+            connector = aiohttp.TCPConnector(ssl=False)
+            client_timeout = aiohttp.ClientTimeout(total=5, connect=3)
+            async with aiohttp.ClientSession(connector=connector, timeout=client_timeout) as http_session:
+                async with http_session.put(new_page_endpoint) as resp:
+                    if resp.status == 200:
+                        tab_data = await resp.json(content_type=None)
+                        page_id = tab_data.get("id")
+                        raw_ws = tab_data.get("webSocketDebuggerUrl")
+                        if raw_ws:
+                            parsed_raw = urllib.parse.urlparse(raw_ws)
+                            ws_url = f"ws://{local_ws_host}{parsed_raw.path}"
+                            if BROWSERLESS_TOKEN:
+                                ws_url += f"?token={BROWSERLESS_TOKEN}"
+        except Exception as rest_e:
+            logger.debug(f"REST /json/new attempt failed: {rest_e}")
 
-        # Rewrite Docker internal container host in raw_ws_url to match BROWSERLESS_URL
-        parsed_bl = urllib.parse.urlparse(BROWSERLESS_URL)
-        parsed_raw_ws = urllib.parse.urlparse(raw_ws_url)
-        local_ws_host = parsed_bl.netloc or "127.0.0.1:3000"
-        ws_url = f"ws://{local_ws_host}{parsed_raw_ws.path}"
-        if BROWSERLESS_TOKEN:
-            ws_url += f"?token={BROWSERLESS_TOKEN}"
+        ws_session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False))
 
-        logger.info(f"Connecting to Browserless CDP WebSocket at: {ws_url}")
+        # 2. If REST /json/new is not supported (HTTP 404 in Browserless v2), connect via direct WebSocket
+        if not ws_url:
+            candidate_endpoints = [
+                f"ws://{local_ws_host}/chromium{token_param}",
+                f"ws://{local_ws_host}{token_param}",
+            ]
+            ws = None
+            for ep in candidate_endpoints:
+                try:
+                    logger.info(f"Attempting direct Browserless WebSocket connection to: {ep}")
+                    ws = await ws_session.ws_connect(ep, timeout=10)
+                    ws_url = ep
+                    break
+                except Exception as ws_err:
+                    logger.debug(f"Endpoint {ep} failed: {ws_err}")
 
-        # Build public Live Inspector link for the user
-        public_base = (BROWSERLESS_PUBLIC_URL or BROWSERLESS_URL).strip().rstrip("/")
-        if not public_base.startswith(("http://", "https://")):
-            public_base = f"http://{public_base}"
-        parsed_public = urllib.parse.urlparse(public_base)
-        public_host_port = parsed_public.netloc or parsed_public.path or "127.0.0.1:3000"
-        
-        # Build WebSocket target path for DevTools frontend
+            if not ws:
+                await ws_session.close()
+                return False, None, "Could not connect to Browserless via REST or WebSocket."
+
+            # Create target tab via CDP
+            await ws.send_json({
+                "id": 10,
+                "method": "Target.createTarget",
+                "params": {"url": "about:blank"}
+            })
+            
+            # Wait for Target.createTarget response to extract targetId
+            target_created = False
+            for _ in range(10):
+                try:
+                    resp_msg = await asyncio.wait_for(ws.receive(), timeout=2.0)
+                    if resp_msg.type == aiohttp.WSMsgType.TEXT:
+                        msg_json = json.loads(resp_msg.data)
+                        if msg_json.get("id") == 10 and "result" in msg_json:
+                            page_id = msg_json["result"].get("targetId")
+                            target_created = True
+                            break
+                except Exception:
+                    break
+
+            if not page_id:
+                # Fallback to random ID for session identification
+                page_id = uuid.uuid4().hex[:12]
+        else:
+            logger.info(f"Connecting to Browserless CDP WebSocket at: {ws_url}")
+            ws = await ws_session.ws_connect(ws_url, timeout=30)
+
+        logger.info(f"CDP WebSocket connected successfully for page {page_id}")
+
+        # Build DevTools live inspector URL
         ws_path = f"{public_host_port}/devtools/page/{page_id}"
         token_query = f"&token={BROWSERLESS_TOKEN}" if BROWSERLESS_TOKEN else ""
         inspector_url = f"{public_base}/devtools/inspector.html?ws={ws_path}{token_query}"
-
-        # Connect to CDP WebSocket to prepare the session
-        ws_session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False))
-        ws = await ws_session.ws_connect(ws_url, timeout=30)
-        logger.info(f"CDP WebSocket connected successfully for page {page_id}")
 
         # 1. Enable domains
         await ws.send_json({"id": 1, "method": "Network.enable", "params": {}})
@@ -174,6 +214,7 @@ async def create_captcha_session(
             "ws": ws,
             "ws_session": ws_session,
             "inspector_url": inspector_url,
+            "public_base": public_base,
             "target_url": target_url,
             "created_at": time.time(),
         }
