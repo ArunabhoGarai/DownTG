@@ -50,12 +50,19 @@ from mtproto_uploader import (
     is_mtproto_active,
     upload_media_mtproto,
 )
+from group_manager import (
+    is_group_allowed,
+    enable_group,
+    disable_group,
+    list_allowed_groups,
+)
 
 logger = logging.getLogger(__name__)
 
 # Concurrency semaphore (initialized lazily)
 _SEMAPHORE: asyncio.Semaphore = None
 ACTIVE_TASKS: Dict[str, asyncio.Task] = {}
+TASK_REQUESTERS: Dict[str, int] = {}
 
 
 def get_semaphore() -> asyncio.Semaphore:
@@ -247,6 +254,13 @@ def build_format_keyboard(cache_key: str, choices: List[Dict[str, str]]) -> Inli
     return InlineKeyboardMarkup(keyboard)
 
 
+def build_cancel_keyboard(task_id: str) -> InlineKeyboardMarkup:
+    """Builds an inline keyboard with a Cancel / Stop button for live operations."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏹️ Stop / Cancel", callback_data=f"stop:{task_id}")]
+    ])
+
+
 async def edit_query_message(
     query,
     text: str,
@@ -270,9 +284,20 @@ async def edit_query_message(
         logger.debug(f"Non-critical query message edit suppressed: {e}")
 
 
+UNAUTHORIZED_DM_MESSAGE = "Only Authorized People and Groups Can Use This Bot , Contact @dorachangg to get authorized"
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles the /start command."""
+    chat = update.effective_chat
     user = update.effective_user
+    user_id = user.id
+
+    # Restrict private DM access to the developer/admin
+    if chat.type == "private" and not is_admin(user_id):
+        await update.message.reply_text(UNAUTHORIZED_DM_MESSAGE)
+        return
+
     welcome_text = (
         f"👋 **Hello, {user.first_name}!**\n\n"
         "I am your **Universal Media Downloader Bot** 🚀\n\n"
@@ -294,19 +319,86 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles the /help command."""
-    help_text = (
-        "📖 **How to Download Media:**\n\n"
-        "1. Copy a video link from **YouTube**, **Instagram**, **Facebook**, **TikTok**, **Twitter/X**, **Reddit**, or any non-DRM site.\n"
-        "2. Paste and send the link here.\n"
-        "3. The bot will automatically download it in 480p (or show quality options if needed) and send the video directly to you!\n\n"
-        "⚠️ **Note on File Limits:**\n"
-        f"• Telegram standard bot limit is **{MAX_FILE_SIZE_MB}MB** per file.\n"
-        "• DRM-protected services (like Netflix, Prime, Disney+) cannot be downloaded."
+    """Admin-only comprehensive command guide in private DM."""
+    chat = update.effective_chat
+    user_id = update.effective_user.id
+
+    # Restrict private DM access to the developer/admin
+    if not is_admin(user_id):
+        if chat.type == "private":
+            await update.message.reply_text(UNAUTHORIZED_DM_MESSAGE)
+        else:
+            await update.message.reply_text("ℹ️ Use `/gchelp` to view group commands.", parse_mode=constants.ParseMode.MARKDOWN)
+        return
+
+    admin_help_text = (
+        "👑 **Developer & Admin Control Panel**\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🍪 **Cookie Management Commands:**\n"
+        "• `/cookiestatus` — Check status, lines, and sizes for YouTube, Instagram, Facebook, and TeraBox cookies.\n"
+        "• `/setcookie <platform> <cookie_text>` — Save raw cookie text directly in chat (e.g. `/setcookie terabox ndus=...`).\n"
+        "• `/clearcookie <platform>` — Delete cookies for `youtube`, `instagram`, `facebook`, `terabox`, or `generic`.\n"
+        "• *Tip:* Drag & drop any `cookies.txt` document with caption `youtube`, `instagram`, `facebook`, or `terabox` to update automatically!\n\n"
+        "👥 **Group Chat Management:**\n"
+        "• `/startgc` — Activate and authorize the bot inside the current group chat.\n"
+        "• `/stopgc` — Deactivate and revoke bot access in the current group chat.\n"
+        "• `/gchelp` — Show member command guide in group chat.\n\n"
+        "⚙️ **Maintenance & Server Controls:**\n"
+        "• `/refresh` (or `/killtasks` / `/reset`) — Kill all running download tasks, purge temporary files from `downloads/`, and reset concurrency slots.\n\n"
+        "📥 **Manual Download Commands:**\n"
+        "• `/dl <video_url>` (or `/download <url>`) — Manually trigger video download.\n\n"
+        "📊 **Current Configuration:**\n"
+        f"• Max Concurrent Downloads: `{MAX_CONCURRENT_DOWNLOADS}`\n"
+        f"• Max Upload Size: `{MAX_FILE_SIZE_MB} MB` (MTProto 2GB Active)\n"
     )
     await update.message.reply_text(
-        help_text,
-        parse_mode=constants.ParseMode.MARKDOWN
+        admin_help_text,
+        parse_mode=constants.ParseMode.MARKDOWN,
+        reply_to_message_id=update.message.message_id,
+    )
+
+
+async def gchelp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Member help guide usable in authorized groups or private chats."""
+    chat = update.effective_chat
+    user_id = update.effective_user.id
+    is_group = chat.type in ("group", "supergroup")
+
+    if is_group and not is_group_allowed(chat.id):
+        await update.message.reply_text(
+            "⛔ This bot is not activated in this group. Ask the admin to activate it with `/startgc`.",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_to_message_id=update.message.message_id,
+        )
+        return
+
+    if not is_group and not is_admin(user_id):
+        await update.message.reply_text(UNAUTHORIZED_DM_MESSAGE)
+        return
+
+    member_help = (
+        "🚀 **DownTG by Dorachan**\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"⚡ **Capacity:** Max `{MAX_CONCURRENT_DOWNLOADS}` Downloads can be processed at once.\n"
+        "💡 *If bot is stuck kindly contact @dorachangg to refresh.*\n\n"
+        "📥 **How to Download Videos:**\n"
+        "1. Simply paste or send any video link directly in this chat.\n"
+        "2. Or use the command: `/dl <video_url>`\n\n"
+        "🌐 **Supported Platforms:**\n"
+        "• 🔴 **YouTube**: Videos, Shorts & Audio (MP3)\n"
+        "• 📸 **Instagram**: Reels, Posts & Stories\n"
+        "• 🔵 **Facebook**: Videos & Reels\n"
+        "• 📦 **TeraBox**: Cloud videos & share links\n"
+        "• 🎵 **TikTok & 🐦 X (Twitter)**\n"
+        "• 🌐 **Reddit, Pinterest, Vimeo, Twitch & Direct MP4 links**\n\n"
+        "⏹️ **Process Control:**\n"
+        "• Tap the **[ ⏹️ Stop / Cancel ]** button on your download message at any time to abort.\n\n"
+        "⚡ *Powered by High-Speed 2GB MTProto Direct Uploads.*"
+    )
+    await update.message.reply_text(
+        member_help,
+        parse_mode=constants.ParseMode.MARKDOWN,
+        reply_to_message_id=update.message.message_id,
     )
 
 
@@ -354,7 +446,7 @@ async def send_media_to_chat(
                 except Exception:
                     pass
 
-        mtproto_success = await upload_media_mtproto(
+        mtproto_success, mtproto_err = await upload_media_mtproto(
             chat_id=chat_id,
             file_path=file_path,
             title=title,
@@ -367,8 +459,9 @@ async def send_media_to_chat(
         if mtproto_success:
             return
         elif file_size > 50 * 1024 * 1024:
-            logger.error(f"MTProto upload failed for large file ({format_bytes(file_size)}). Cannot fallback to 50MB HTTP Bot API.")
-            raise RuntimeError(f"MTProto upload failed for {format_bytes(file_size)} file.")
+            err_msg = mtproto_err or "MTProto client error"
+            logger.error(f"MTProto upload failed for {format_bytes(file_size)} file: {err_msg}")
+            raise RuntimeError(f"MTProto upload failed: {err_msg}")
 
     # 2. Standard HTTP Bot API upload (for files <= 50MB)
     if is_audio:
@@ -463,16 +556,36 @@ async def show_quality_panel(
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Detects URLs, attempts 480p default download, and falls back to quality panel on failure."""
-    if not update.message or not update.message.text:
+    """Detects URLs, checks group authorization, attempts 480p default download, and falls back to quality panel on failure."""
+    if not update.message:
         return
 
-    text = update.message.text.strip()
+    raw_text = update.message.text or update.message.caption or ""
+    text = raw_text.strip()
+    if not text:
+        return
+
+    chat = update.effective_chat
+    user_id = update.effective_user.id
+    is_group = chat.type in ("group", "supergroup")
+
+    # If message is in private chat (DM), restrict strictly to the admin
+    if not is_group and not is_admin(user_id):
+        await update.message.reply_text(UNAUTHORIZED_DM_MESSAGE)
+        return
+
+    # If message is in a group chat, ensure the group has been authorized via /startgc
+    if is_group and not is_group_allowed(chat.id):
+        return
+
+    # Strictly check if message contains a web URL (http:// or https://)
     match = URL_REGEX.search(text)
     if not match:
-        await update.message.reply_text(
-            "❌ No valid link detected. Please send a valid YouTube, Facebook, or Instagram video link."
-        )
+        # Silently ignore non-link messages in groups to prevent conversation spam
+        if not is_group:
+            await update.message.reply_text(
+                "❌ No valid link detected. Please send a valid YouTube, Facebook, Instagram, or TeraBox video link."
+            )
         return
 
     url = match.group(0)
@@ -487,67 +600,72 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    task_id = f"{user_id}_{int(time.time() * 1000)}"
+    TASK_REQUESTERS[task_id] = user_id
+
     status_msg = await update.message.reply_text(
         f"🔍 **Analyzing link...**\n`{url}`",
+        reply_markup=build_cancel_keyboard(task_id),
         parse_mode=constants.ParseMode.MARKDOWN,
         reply_to_message_id=update.message.message_id,
     )
 
-    # Extract metadata without downloading (routed to dedicated engine)
-    success, info, error_msg = await route_extract_info(url)
-
-    if not success or not info:
-        err = error_msg or "Unable to retrieve video information."
-        if "Private video" in err or "login" in err.lower():
-            err_text = "🔒 This video is private or requires login."
-        elif "not found" in err.lower():
-            err_text = "❌ Video not found or has been deleted."
-        else:
-            err_text = f"❌ Failed to fetch video:\n`{err[:150]}`"
-
-        await status_msg.edit_text(err_text, parse_mode=constants.ParseMode.MARKDOWN)
-        return
-
-    title = info.get("title", "Untitled Video")
-    duration = format_duration(info.get("duration"))
-    uploader = info.get("uploader", "Unknown Author")
-    thumbnail = info.get("thumbnail")
-    duration_sec = info.get("duration")
-    format_choices = build_format_choices(info)
-
-    # Store URL and info in cache for fallback panel
-    cache_key = generate_cache_key(user_id)
-    URL_CACHE[cache_key] = {
-        "url": url,
-        "title": title,
-        "duration": duration,
-        "uploader": uploader,
-        "duration_sec": duration_sec,
-        "thumbnail": thumbnail,
-        "format_choices": format_choices,
-    }
-
-    # Clean old cache entries (keep last 50)
-    if len(URL_CACHE) > 50:
-        for k in list(URL_CACHE.keys())[:-50]:
-            URL_CACHE.pop(k, None)
-
-    # 1. Attempt 480p auto-download by default
-    try:
-        await status_msg.edit_text(
-            f"⏳ **Downloading (480p default)...**\n📌 *{title}*",
-            parse_mode=constants.ParseMode.MARKDOWN,
-        )
-    except Exception:
-        pass
-
     downloaded_file = None
     default_succeeded = False
     fail_reason = None
-    task_id = f"{user_id}_{time.time()}"
 
     try:
         ACTIVE_TASKS[task_id] = asyncio.current_task()
+
+        # Extract metadata without downloading (routed to dedicated engine)
+        success, info, error_msg = await route_extract_info(url)
+
+        if not success or not info:
+            err = error_msg or "Unable to retrieve video information."
+            if "Private video" in err or "login" in err.lower():
+                err_text = "🔒 This video is private or requires login."
+            elif "not found" in err.lower():
+                err_text = "❌ Video not found or has been deleted."
+            else:
+                err_text = f"❌ Failed to fetch video:\n`{err[:150]}`"
+
+            await status_msg.edit_text(err_text, parse_mode=constants.ParseMode.MARKDOWN)
+            return
+
+        title = info.get("title", "Untitled Video")
+        duration = format_duration(info.get("duration"))
+        uploader = info.get("uploader", "Unknown Author")
+        thumbnail = info.get("thumbnail")
+        duration_sec = info.get("duration")
+        format_choices = build_format_choices(info)
+
+        # Store URL and info in cache for fallback panel
+        cache_key = generate_cache_key(user_id)
+        URL_CACHE[cache_key] = {
+            "url": url,
+            "title": title,
+            "duration": duration,
+            "uploader": uploader,
+            "duration_sec": duration_sec,
+            "thumbnail": thumbnail,
+            "format_choices": format_choices,
+        }
+
+        # Clean old cache entries (keep last 50)
+        if len(URL_CACHE) > 50:
+            for k in list(URL_CACHE.keys())[:-50]:
+                URL_CACHE.pop(k, None)
+
+        # 1. Attempt 480p auto-download by default
+        try:
+            await status_msg.edit_text(
+                f"⏳ **Downloading (480p default)...**\n📌 *{title}*",
+                reply_markup=build_cancel_keyboard(task_id),
+                parse_mode=constants.ParseMode.MARKDOWN,
+            )
+        except Exception:
+            pass
+
         async with get_semaphore():
             success, downloaded_file, dl_info, error_msg = await route_download_media(url, quality="480")
 
@@ -589,11 +707,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     fail_reason = f"480p file is {format_bytes(file_size)}, exceeding Telegram's {MAX_FILE_SIZE_MB}MB limit"
             else:
                 fail_reason = error_msg or "480p stream could not be downloaded"
+
+    except asyncio.CancelledError:
+        logger.info(f"Task {task_id} was cancelled by user.")
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+        return
     except Exception as e:
         logger.error(f"Error during default 480p download: {e}", exc_info=True)
         fail_reason = str(e)[:100]
     finally:
         ACTIVE_TASKS.pop(task_id, None)
+        TASK_REQUESTERS.pop(task_id, None)
         if downloaded_file:
             remove_file_safely(downloaded_file)
 
@@ -617,9 +744,37 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
 
+    chat = update.effective_chat
+    user_id = query.from_user.id
+    is_group = chat.type in ("group", "supergroup") if chat else False
+
+    if not is_group and not is_admin(user_id):
+        await query.answer(UNAUTHORIZED_DM_MESSAGE, show_alert=True)
+        return
+
     data = query.data or ""
     parts = data.split(":")
     action = parts[0]
+
+    if action == "stop":
+        task_id = parts[1] if len(parts) > 1 else ""
+        requester_id = TASK_REQUESTERS.get(task_id)
+        user_id = query.from_user.id
+        if requester_id and user_id != requester_id and not is_admin(user_id):
+            await query.answer("⚠️ Only the user who sent this link (or admin) can stop it.", show_alert=True)
+            return
+
+        task = ACTIVE_TASKS.pop(task_id, None)
+        if task and not task.done():
+            task.cancel()
+
+        TASK_REQUESTERS.pop(task_id, None)
+        try:
+            await query.message.delete()
+        except Exception:
+            await edit_query_message(query, "🛑 **Process stopped by user.**")
+        await query.answer("Stopped.")
+        return
 
     if action == "cancel":
         cache_key = parts[1] if len(parts) > 1 else ""
@@ -815,10 +970,11 @@ from config import (
 
 
 def is_admin(user_id: int) -> bool:
-    """Check if the user is authorized to manage cookies."""
+    """Check if the user is authorized as an admin in .env (supports single or comma-separated IDs)."""
     if not ADMIN_USER_ID:
-        return True  # If not configured, allow bot owner
-    return str(user_id) == str(ADMIN_USER_ID)
+        return False
+    admin_ids = [aid.strip() for aid in str(ADMIN_USER_ID).split(",") if aid.strip()]
+    return str(user_id) in admin_ids
 
 
 def get_cookie_target_path(platform: str) -> Optional[Tuple[str, Path]]:
@@ -996,6 +1152,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin command to terminate all active download processes and reset temporary storage."""
+    global _SEMAPHORE
     user_id = update.effective_user.id
     if not is_admin(user_id):
         await update.message.reply_text("⛔ You are not authorized to use this command.")
@@ -1007,7 +1164,19 @@ async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             task.cancel()
             killed_count += 1
     ACTIVE_TASKS.clear()
+    TASK_REQUESTERS.clear()
     URL_CACHE.clear()
+
+    # Instantly recreate the concurrency semaphore so all slots are 100% free
+    _SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+
+    # Terminate any orphaned ffmpeg/downloader subprocesses on Linux
+    if os.name != "nt":
+        try:
+            import subprocess
+            subprocess.run(["pkill", "-9", "-f", "ffmpeg"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
 
     # Clean orphaned files in downloads folder
     from config import DOWNLOAD_DIR
@@ -1034,10 +1203,103 @@ async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def startgc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Activates bot in the current group chat. Restricted to bot developer/admin."""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text(
+            "⛔ Only the bot administrator can activate this bot in group chats.",
+            reply_to_message_id=update.message.message_id,
+        )
+        return
+
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await update.message.reply_text(
+            "ℹ️ Please run `/startgc` inside the group chat you want to activate.",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_to_message_id=update.message.message_id,
+        )
+        return
+
+    enable_group(chat.id, chat.title)
+    await update.message.reply_text(
+        f"✅ **Bot Activated for this Group!**\n\n"
+        f"📌 **Group:** `{chat.title}`\n"
+        f"🆔 **Chat ID:** `{chat.id}`\n\n"
+        f"🚀 All members can now send video links directly here to download (YouTube, Instagram, Facebook, TeraBox, TikTok, etc.)!",
+        parse_mode=constants.ParseMode.MARKDOWN,
+        reply_to_message_id=update.message.message_id,
+    )
+
+
+async def stopgc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Deactivates bot in the current group chat. Restricted to bot developer/admin."""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text(
+            "⛔ Only the bot administrator can deactivate this bot in group chats.",
+            reply_to_message_id=update.message.message_id,
+        )
+        return
+
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await update.message.reply_text(
+            "ℹ️ Please run `/stopgc` inside the group chat you want to deactivate.",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_to_message_id=update.message.message_id,
+        )
+        return
+
+    disable_group(chat.id)
+    await update.message.reply_text(
+        f"🛑 **Bot Deactivated for this Group.**\n"
+        f"No download requests will be processed in `{chat.title}` until re-enabled by the admin.",
+        parse_mode=constants.ParseMode.MARKDOWN,
+        reply_to_message_id=update.message.message_id,
+    )
+
+
+async def download_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles explicit /dl and /download commands."""
+    chat = update.effective_chat
+    user_id = update.effective_user.id
+    is_group = chat.type in ("group", "supergroup")
+
+    if not is_group and not is_admin(user_id):
+        await update.message.reply_text(UNAUTHORIZED_DM_MESSAGE)
+        return
+
+    if is_group and not is_group_allowed(chat.id):
+        await update.message.reply_text(
+            "⛔ This bot is not activated in this group. Contact the bot administrator to activate it with `/startgc`.",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_to_message_id=update.message.message_id,
+        )
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "📝 **Usage:** `/dl <video_url>`",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_to_message_id=update.message.message_id,
+        )
+        return
+
+    await handle_message(update, context)
+
+
 def register_handlers(application):
     """Register all bot command and message handlers."""
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("gchelp", gchelp_command))
+    application.add_handler(CommandHandler("startgc", startgc_command))
+    application.add_handler(CommandHandler("stopgc", stopgc_command))
+    application.add_handler(CommandHandler("dl", download_command))
+    application.add_handler(CommandHandler("download", download_command))
+    application.add_handler(CommandHandler("d", download_command))
     application.add_handler(CommandHandler("refresh", refresh_command))
     application.add_handler(CommandHandler("killtasks", refresh_command))
     application.add_handler(CommandHandler("reset", refresh_command))
@@ -1045,5 +1307,5 @@ def register_handlers(application):
     application.add_handler(CommandHandler("clearcookie", clearcookie_command))
     application.add_handler(CommandHandler("cookiestatus", cookiestatus_command))
     application.add_handler(CallbackQueryHandler(handle_callback_query))
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, handle_document))
+    application.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, handle_message))
