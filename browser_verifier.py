@@ -272,6 +272,7 @@ async def create_captcha_session(
     # Wait for debug port
     page_id = None
     ws_url = None
+    frontend_url = None
 
     for attempt in range(20):
         await asyncio.sleep(1)
@@ -279,11 +280,13 @@ async def create_captcha_session(
         if tab:
             page_id = tab.get("id", "")
             raw_ws = tab.get("webSocketDebuggerUrl", "")
+            frontend_url = tab.get("devtoolsFrontendUrl", "")
             if raw_ws:
                 parsed = urllib.parse.urlparse(raw_ws)
                 ws_url = f"ws://127.0.0.1:{debug_port}{parsed.path}"
                 logger.info(f"[Chrome] Tab found after {attempt+1}s. ID={page_id}")
                 logger.info(f"[Chrome] WS URL (local): {ws_url}")
+                logger.info(f"[Chrome] Frontend URL: {frontend_url}")
                 break
         else:
             logger.debug(f"[Chrome] Waiting for debug port... attempt {attempt+1}/20")
@@ -309,11 +312,16 @@ async def create_captcha_session(
     logger.info(f"[Chrome] CDP setup responses: {responses}")
     logger.info(f"[Chrome] CDP connection released — DevTools is now exclusively available")
 
-    # ── Build pure HTTP inspector URL (No HTTPS mixed content) ──
-    inspector_url = (
-        f"http://{public_host}:{debug_port}/devtools/inspector.html"
-        f"?ws={public_host}:{debug_port}/devtools/page/{page_id}"
-    )
+    # ── Build Chrome DevTools Inspector URL ──
+    if frontend_url:
+        inspector_url = frontend_url.replace(f"127.0.0.1:{debug_port}", f"{public_host}:{debug_port}")
+        if inspector_url.startswith("/"):
+            inspector_url = f"http://{public_host}:{debug_port}{inspector_url}"
+    else:
+        inspector_url = (
+            f"https://chrome-devtools-frontend.appspot.com/serve_rev/@4744b886309d987d292e43232776d2206cccb13d/inspector.html"
+            f"?ws={public_host}:{debug_port}/devtools/page/{page_id}"
+        )
 
     logger.info(f"[Chrome] ✅ Inspector URL for admin: {inspector_url}")
 
