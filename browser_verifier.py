@@ -112,14 +112,21 @@ async def create_captcha_session(
                     tab_data = await resp.json(content_type=None)
 
         page_id = tab_data.get("id")
-        ws_url = tab_data.get("webSocketDebuggerUrl")
-        if not page_id or not ws_url:
-            return False, None, "Invalid response from Browserless /json/new."
+        raw_ws_url = tab_data.get("webSocketDebuggerUrl")
+        if not page_id or not raw_ws_url:
+            err_msg = f"Invalid response from Browserless /json/new: {tab_data}"
+            logger.error(err_msg)
+            return False, None, err_msg
 
-        # Ensure internal ws_url has the token parameter if required by Browserless
-        if BROWSERLESS_TOKEN and "token=" not in ws_url:
-            delimiter = "&" if "?" in ws_url else "?"
-            ws_url = f"{ws_url}{delimiter}token={BROWSERLESS_TOKEN}"
+        # Rewrite Docker internal container host in raw_ws_url to match BROWSERLESS_URL
+        parsed_bl = urllib.parse.urlparse(BROWSERLESS_URL)
+        parsed_raw_ws = urllib.parse.urlparse(raw_ws_url)
+        local_ws_host = parsed_bl.netloc or "127.0.0.1:3000"
+        ws_url = f"ws://{local_ws_host}{parsed_raw_ws.path}"
+        if BROWSERLESS_TOKEN:
+            ws_url += f"?token={BROWSERLESS_TOKEN}"
+
+        logger.info(f"Connecting to Browserless CDP WebSocket at: {ws_url}")
 
         # Build public Live Inspector link for the user
         public_base = (BROWSERLESS_PUBLIC_URL or BROWSERLESS_URL).strip().rstrip("/")
@@ -136,6 +143,7 @@ async def create_captcha_session(
         # Connect to CDP WebSocket to prepare the session
         ws_session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False))
         ws = await ws_session.ws_connect(ws_url, timeout=30)
+        logger.info(f"CDP WebSocket connected successfully for page {page_id}")
 
         # 1. Enable domains
         await ws.send_json({"id": 1, "method": "Network.enable", "params": {}})
@@ -151,6 +159,7 @@ async def create_captcha_session(
                     "method": "Network.setCookies",
                     "params": {"cookies": cdp_cookies},
                 })
+                logger.info(f"Injected {len(cdp_cookies)} existing cookies into CDP session")
 
         # 3. Navigate to target URL
         await ws.send_json({
@@ -158,6 +167,7 @@ async def create_captcha_session(
             "method": "Page.navigate",
             "params": {"url": target_url},
         })
+        logger.info(f"Triggered navigation to {target_url} in Browserless tab")
 
         session_obj = {
             "page_id": page_id,
@@ -173,7 +183,7 @@ async def create_captcha_session(
 
     except Exception as e:
         logger.error(f"Error creating Browserless session: {e}", exc_info=True)
-        return False, None, str(e)
+        return False, None, f"Browserless session creation failed: {e}"
 
 
 async def close_captcha_session(session_obj: Dict[str, Any]) -> None:

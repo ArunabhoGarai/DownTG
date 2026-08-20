@@ -296,6 +296,15 @@ async def extract_terabox_info(
             retry_success, retry_info, retry_err = await _resolve_via_gateway(url)
             if retry_success and retry_info:
                 return True, retry_info, None
+            else:
+                logger.error(f"Re-resolution after CAPTCHA solve failed: {retry_err}")
+        else:
+            logger.error(f"Interactive CAPTCHA solver failed: {captcha_err}")
+    else:
+        logger.warning(
+            f"Browserless solver bypassed: is_browserless_configured={is_browserless_configured()}, "
+            f"has_notify_admin_callback={bool(notify_admin_callback)}"
+        )
 
     return False, {}, f"TeraBox Resolution Failed: Primary Cookie/Gateway ({gw_err}) | Backup Hostinger ({err})"
 
