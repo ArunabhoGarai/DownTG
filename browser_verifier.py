@@ -230,6 +230,21 @@ async def _connect_via_browserless(target_url: str, initial_cookie_raw: Optional
     }, None
 
 
+def _extract_host(raw_url_or_ip: Optional[str]) -> str:
+    """Extracts only the pure IP or hostname without port, scheme, or path."""
+    if not raw_url_or_ip:
+        return "127.0.0.1"
+    raw = raw_url_or_ip.strip()
+    if not raw.startswith(("http://", "https://")):
+        raw = f"http://{raw}"
+    try:
+        import urllib.parse
+        parsed = urllib.parse.urlparse(raw)
+        return parsed.hostname or "127.0.0.1"
+    except Exception:
+        return "127.0.0.1"
+
+
 async def _connect_via_local_chrome(target_url: str, initial_cookie_raw: Optional[str]) -> Tuple[bool, Optional[Dict], Optional[str]]:
     """Mode B: Launch a local Chromium with --remote-debugging-port.
     
@@ -241,16 +256,10 @@ async def _connect_via_local_chrome(target_url: str, initial_cookie_raw: Optiona
         return False, None, "No Chrome/Chromium binary found on this system."
 
     debug_port = int(os.getenv("CHROME_DEBUG_PORT", "9222"))
-    public_host = (BROWSERLESS_PUBLIC_URL or "").strip().rstrip("/")
-    if not public_host:
-        public_host = os.getenv("SERVER_PUBLIC_IP", "127.0.0.1").strip()
-    # Strip protocol if present for building URLs
-    if public_host.startswith(("http://", "https://")):
-        import urllib.parse
-        parsed = urllib.parse.urlparse(public_host)
-        public_host_clean = parsed.netloc or parsed.path
-    else:
-        public_host_clean = public_host
+    
+    # Extract clean host (pure IP or domain without port or scheme)
+    raw_public = BROWSERLESS_PUBLIC_URL or os.getenv("SERVER_PUBLIC_IP", "")
+    public_host_clean = _extract_host(raw_public)
 
     user_data_dir = str(BASE_DIR / ".chrome_captcha_profile")
 
@@ -258,6 +267,7 @@ async def _connect_via_local_chrome(target_url: str, initial_cookie_raw: Optiona
         chrome_bin,
         f"--remote-debugging-port={debug_port}",
         "--remote-debugging-address=0.0.0.0",
+        "--remote-allow-origins=*",
         f"--user-data-dir={user_data_dir}",
         "--no-first-run",
         "--no-default-browser-check",
@@ -292,9 +302,18 @@ async def _connect_via_local_chrome(target_url: str, initial_cookie_raw: Optiona
                     if resp.status == 200:
                         tabs = await resp.json(content_type=None)
                         if tabs:
-                            raw_ws = tabs[0].get("webSocketDebuggerUrl", "")
-                            page_id = tabs[0].get("id", "")
-                            # Rewrite 127.0.0.1 in ws URL to make sure we connect locally
+                            # Filter for regular page tab rather than extension/background worker
+                            target_tab = None
+                            for tab in tabs:
+                                if tab.get("type") == "page":
+                                    target_tab = tab
+                                    break
+                            if not target_tab:
+                                target_tab = tabs[0]
+
+                            raw_ws = target_tab.get("webSocketDebuggerUrl", "")
+                            page_id = target_tab.get("id", "")
+                            frontend_url = target_tab.get("devtoolsFrontendUrl", "")
                             if raw_ws:
                                 ws_url = raw_ws
                                 logger.info(f"[Chrome] Debug port ready. Tab ID: {page_id}")
@@ -349,12 +368,21 @@ async def _connect_via_local_chrome(target_url: str, initial_cookie_raw: Optiona
             except Exception:
                 pass
 
-    # Build the DevTools frontend URL — Chrome serves this natively!
-    # Format: http://PUBLIC_HOST:PORT/devtools/inspector.html?ws=PUBLIC_HOST:PORT/devtools/page/PAGE_ID
-    inspector_url = (
-        f"http://{public_host_clean}:{debug_port}/devtools/inspector.html"
-        f"?ws={public_host_clean}:{debug_port}/devtools/page/{page_id}"
-    )
+    # Build the DevTools frontend URL cleanly (no double ports)
+    target_host_port = f"{public_host_clean}:{debug_port}"
+    if frontend_url and "chrome-devtools-frontend.appspot.com" in frontend_url:
+        # Hosted official DevTools inspector
+        inspector_url = frontend_url.replace(f"127.0.0.1:{debug_port}", target_host_port)
+    elif frontend_url and frontend_url.startswith("http"):
+        inspector_url = frontend_url.replace(f"127.0.0.1:{debug_port}", target_host_port)
+    elif frontend_url:
+        clean_rel = frontend_url.lstrip("/")
+        inspector_url = f"http://{target_host_port}/{clean_rel}".replace(f"127.0.0.1:{debug_port}", target_host_port)
+    else:
+        inspector_url = (
+            f"http://{target_host_port}/devtools/inspector.html"
+            f"?ws={target_host_port}/devtools/page/{page_id}"
+        )
     logger.info(f"[Chrome] DevTools Inspector URL: {inspector_url}")
 
     return True, {

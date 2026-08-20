@@ -213,22 +213,37 @@ async def notify_admin_of_captcha(bot, inspector_url: str, target_url: str):
     admin_ids = [aid.strip() for aid in str(ADMIN_USER_ID).split(",") if aid.strip()]
     for aid in admin_ids:
         try:
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🧩 Open Live Captcha Solver", url=inspector_url)]
-            ])
-            await bot.send_message(
-                chat_id=int(aid),
-                text=(
-                    "🧩 **TeraBox Human Verification Required!**\n"
-                    "A download encountered a slider captcha.\n\n"
-                    f"🔗 **Target URL:** `{target_url[:80]}`\n\n"
-                    f"👉 [Tap Here to Open Captcha Solver]({inspector_url})\n\n"
-                    "⏱️ *Session will wait for 3 minutes.*"
-                ),
-                reply_markup=keyboard,
-                parse_mode=constants.ParseMode.MARKDOWN,
-            )
-            logger.info(f"Successfully sent CAPTCHA notification to admin ID {aid}")
+            try:
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🧩 Open Live Captcha Solver", url=inspector_url)]
+                ])
+                await bot.send_message(
+                    chat_id=int(aid),
+                    text=(
+                        "🧩 **TeraBox Human Verification Required!**\n"
+                        "A download encountered a slider captcha.\n\n"
+                        f"🔗 **Target URL:** `{target_url[:80]}`\n\n"
+                        f"👉 [Tap Here to Open Captcha Solver]({inspector_url})\n\n"
+                        "⏱️ *Session will wait for 3 minutes.*"
+                    ),
+                    reply_markup=keyboard,
+                    parse_mode=constants.ParseMode.MARKDOWN,
+                )
+                logger.info(f"Successfully sent CAPTCHA notification with button to admin ID {aid}")
+            except Exception as btn_err:
+                logger.warning(f"Failed to send button captcha notification to admin {aid}: {btn_err}. Retrying with plain text URL...")
+                # Fallback to plain text message (guarantees delivery even if Telegram button URL parser rejects complex query strings)
+                await bot.send_message(
+                    chat_id=int(aid),
+                    text=(
+                        "🧩 TeraBox Human Verification Required!\n"
+                        "A download encountered a slider captcha.\n\n"
+                        f"Target: {target_url[:80]}\n\n"
+                        f"Solver URL:\n{inspector_url}\n\n"
+                        "⏱️ Session will wait for 3 minutes."
+                    ),
+                )
+                logger.info(f"Successfully sent fallback plain-text CAPTCHA notification to admin ID {aid}")
         except Exception as e:
             logger.error(f"Failed to send captcha notification to admin {aid}: {e}")
 
