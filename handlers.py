@@ -206,7 +206,9 @@ async def route_extract_info(
 
 async def notify_admin_of_captcha(bot, inspector_url: str, target_url: str):
     """Sends a private DM with the interactive CAPTCHA link to the bot admin."""
+    logger.info(f"notify_admin_of_captcha triggered! Inspector URL: {inspector_url}")
     if not ADMIN_USER_ID:
+        logger.warning("No ADMIN_USER_ID configured in .env; cannot send private CAPTCHA alert.")
         return
     admin_ids = [aid.strip() for aid in str(ADMIN_USER_ID).split(",") if aid.strip()]
     for aid in admin_ids:
@@ -220,12 +222,13 @@ async def notify_admin_of_captcha(bot, inspector_url: str, target_url: str):
                     "🧩 **TeraBox Human Verification Required!**\n"
                     "A download encountered a slider captcha.\n\n"
                     f"🔗 **Target URL:** `{target_url[:80]}`\n\n"
-                    "👉 Tap the button below to slide the puzzle on the remote browser.\n"
+                    f"👉 [Tap Here to Open Captcha Solver]({inspector_url})\n\n"
                     "⏱️ *Session will wait for 3 minutes.*"
                 ),
                 reply_markup=keyboard,
                 parse_mode=constants.ParseMode.MARKDOWN,
             )
+            logger.info(f"Successfully sent CAPTCHA notification to admin ID {aid}")
         except Exception as e:
             logger.error(f"Failed to send captcha notification to admin {aid}: {e}")
 

@@ -116,10 +116,17 @@ async def create_captcha_session(
         if not page_id or not ws_url:
             return False, None, "Invalid response from Browserless /json/new."
 
+        # Ensure internal ws_url has the token parameter if required by Browserless
+        if BROWSERLESS_TOKEN and "token=" not in ws_url:
+            delimiter = "&" if "?" in ws_url else "?"
+            ws_url = f"{ws_url}{delimiter}token={BROWSERLESS_TOKEN}"
+
         # Build public Live Inspector link for the user
-        public_base = BROWSERLESS_PUBLIC_URL or BROWSERLESS_URL
+        public_base = (BROWSERLESS_PUBLIC_URL or BROWSERLESS_URL).strip().rstrip("/")
+        if not public_base.startswith(("http://", "https://")):
+            public_base = f"http://{public_base}"
         parsed_public = urllib.parse.urlparse(public_base)
-        public_host_port = parsed_public.netloc or "127.0.0.1:3000"
+        public_host_port = parsed_public.netloc or parsed_public.path or "127.0.0.1:3000"
         
         # Build WebSocket target path for DevTools frontend
         ws_path = f"{public_host_port}/devtools/page/{page_id}"
@@ -343,8 +350,8 @@ async def solve_terabox_captcha_interactive(
     if progress_updater:
         try:
             await progress_updater(
-                "🧩 **Human Verification Required!**\n"
-                "A live solve link was sent to the bot admin.\n\n"
+                "🧩 **Human Verification Required!**\n\n"
+                f"👉 [Click Here to Open Captcha Solver]({inspector_url})\n\n"
                 f"⏱️ Waiting for verification ({CAPTCHA_TIMEOUT_SEC}s)..."
             )
         except Exception:
