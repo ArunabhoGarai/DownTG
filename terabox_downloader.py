@@ -678,6 +678,26 @@ async def extract_terabox_info(
     return False, {}, full_error_report
 
 
+def _ensure_xvfb_running() -> str:
+    """Ensures Xvfb virtual display is active on Linux."""
+    if sys.platform != "linux":
+        return ":0"
+    display = ":99"
+    if os.path.exists("/tmp/.X11-unix/X99"):
+        return display
+    try:
+        logger.info(f"Starting Xvfb on {display} for headless GUI crawler...")
+        subprocess.Popen(
+            ["Xvfb", display, "-screen", "0", "1366x850x24", "-ac", "+extension", "GLX", "+render", "-noreset"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(1.2)
+    except Exception as e:
+        logger.warning(f"Could not auto-start Xvfb: {e}")
+    return display
+
+
 async def _download_via_node_crawler(
     url: str,
     output_dir: Path,
@@ -696,9 +716,11 @@ async def _download_via_node_crawler(
     if not crawler_script.exists():
         return False, None, None, f"Crawler script not found at: {crawler_script}"
 
+    # Ensure Xvfb is active on Linux
+    display = _ensure_xvfb_running()
+
     env = os.environ.copy()
-    if "DISPLAY" not in env:
-        env["DISPLAY"] = ":99"
+    env["DISPLAY"] = display
 
     cmd = [
         node_bin,
@@ -708,7 +730,7 @@ async def _download_via_node_crawler(
         download_id,
     ]
 
-    logger.info(f"[_download_via_node_crawler] Spawning crawler: {' '.join(cmd)}")
+    logger.info(f"[_download_via_node_crawler] Spawning crawler on {display}: {' '.join(cmd)}")
     if progress_updater:
         try:
             await progress_updater("🚀 Launching Stealth Browser Engine...")
@@ -767,16 +789,21 @@ async def _download_via_node_crawler(
                 if data.get("success"):
                     filepath = data.get("filepath")
                     if filepath and os.path.exists(filepath):
-                        info_dict = {
-                            "id": download_id,
-                            "title": data.get("title") or Path(filepath).name,
-                            "thumbnail": data.get("thumbnail"),
-                            "uploader": "TeraBox",
-                            "filesize": data.get("filesize"),
-                            "engine": "puppeteer_stealth_xvfb",
-                        }
-                        logger.info(f"[_download_via_node_crawler] 🎉 Success: {filepath} ({info_dict['title']})")
-                        return True, filepath, info_dict, None
+                        file_sz = os.path.getsize(filepath)
+                        # Sanity check: Ensure downloaded file is not an empty/corrupted stub
+                        if file_sz > 50 * 1024:
+                            info_dict = {
+                                "id": download_id,
+                                "title": data.get("title") or Path(filepath).name,
+                                "thumbnail": data.get("thumbnail"),
+                                "uploader": "TeraBox",
+                                "filesize": file_sz,
+                                "engine": "puppeteer_stealth_xvfb",
+                            }
+                            logger.info(f"[_download_via_node_crawler] 🎉 Success: {filepath} ({info_dict['title']})")
+                            return True, filepath, info_dict, None
+                        else:
+                            return False, None, None, f"Downloaded file is too small ({file_sz} bytes)."
             except Exception as parse_ex:
                 logger.error(f"Error parsing crawler output JSON: {parse_ex}")
 
@@ -805,14 +832,12 @@ async def download_terabox_media(
 ) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]], Optional[str]]:
     """
     Downloads TeraBox media directly to disk.
-    Priority 1: Node.js Puppeteer Stealth Xvfb Crawler (Direct file download).
-    Priority 2: Headless Stream URL Extractor + yt-dlp.
-    Priority 3: Gateway / Hostinger Backup.
+    Priority: Node.js Puppeteer Stealth Crawler in Xvfb GUI.
     Returns (success, file_path, info_dict, error_message).
     """
     download_id = uuid.uuid4().hex[:8]
 
-    # 1. Priority Engine: Node.js Puppeteer Stealth Crawler in Xvfb GUI
+    # Priority Engine: Node.js Puppeteer Stealth Crawler in Xvfb GUI
     crawler_success, crawler_file, crawler_info, crawler_err = await _download_via_node_crawler(
         url=url,
         output_dir=DOWNLOAD_DIR,
@@ -823,24 +848,8 @@ async def download_terabox_media(
         logger.info("TeraBox media downloaded successfully via Node.js Puppeteer Stealth Crawler!")
         return True, crawler_file, crawler_info, None
 
-    logger.warning(f"Node.js Crawler unavailable or failed ({crawler_err}). Falling back to stream URL extraction...")
-
-    # 2. Fallback: Resolve CDN play URL
-    success, info, err = await extract_terabox_info(
-        url,
-        notify_admin_callback=notify_admin_callback,
-        progress_updater=progress_updater,
-    )
-    if not success or not info or "play_url" not in info:
-        return False, None, None, err or crawler_err or "Could not download TeraBox media."
-
-    play_url = info["play_url"]
-    output_template = str(DOWNLOAD_DIR / f"tera_{download_id}_%(title).100B.%(ext)s")
-
-    raw_cookie = get_terabox_cookie()
-    cookie_header = format_cookie_header(raw_cookie)
-    surl = extract_surl(url)
-    referer_url = f"https://www.terabox.app/sharing/link?surl={surl}" if surl else url
+    logger.error(f"TeraBox Crawler failed: {crawler_err}")
+    return False, None, None, crawler_err or "Could not download TeraBox media."
 
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
