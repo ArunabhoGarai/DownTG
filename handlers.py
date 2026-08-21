@@ -767,16 +767,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not success or not info:
             err = error_msg or "Unable to retrieve video information."
-            if "TeraBox" in err or "Diagnostic" in err or "Gateway" in err:
-                err_text = err
-            elif "Private video" in err or "login" in err.lower():
-                err_text = "🔒 This video is private or requires login."
-            elif "not found" in err.lower():
-                err_text = "❌ Video not found or has been deleted."
-            else:
-                err_text = f"❌ **Failed to fetch video:**\n`{err}`"
-
-            await status_msg.edit_text(err_text, parse_mode=constants.ParseMode.MARKDOWN)
+            await edit_status_msg_safe(status_msg, err)
             return
 
         title = info.get("title", "Untitled Video")

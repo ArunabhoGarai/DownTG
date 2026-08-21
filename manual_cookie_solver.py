@@ -335,13 +335,13 @@ def main():
         time.sleep(2)
 
         # 6. Pre-inject cookies into Chrome if available
-        target_dashboard = "https://www.terabox.app/main?category=all"
+        target_dashboard = sys.argv[1] if len(sys.argv) > 1 else "https://www.terabox.app/main?category=all"
         if cdp_cookies:
             preinject_cookies_into_chrome(debug_port, cdp_cookies, target_dashboard)
         else:
             ws_url = get_active_ws_url(debug_port)
             if ws_url:
-                send_cdp_command(ws_url, "Page.navigate", {"url": "https://www.terabox.app/"})
+                send_cdp_command(ws_url, "Page.navigate", {"url": target_dashboard})
 
         # Detect public IP
         public_ip = os.getenv("SERVER_PUBLIC_IP", "")

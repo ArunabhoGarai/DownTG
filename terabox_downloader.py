@@ -193,130 +193,136 @@ async def _resolve_via_gateway(url: str) -> Tuple[bool, Dict[str, Any], Optional
     if cookie_header:
         headers['Cookie'] = cookie_header
 
-    connector = aiohttp.TCPConnector(ssl=False)
     client_timeout = aiohttp.ClientTimeout(total=30, connect=10)
 
-    for ep in endpoints:
-        try:
-            parsed_ep = urllib.parse.urlparse(ep)
-            ep_label = f"{parsed_ep.netloc}{parsed_ep.path}"
-            async with aiohttp.ClientSession(connector=connector, headers=headers, timeout=client_timeout) as session:
-                async with session.get(ep) as resp:
-                    resp_text = await resp.text()
-                    logger.info(f"[_resolve_via_gateway] {ep_label} -> HTTP {resp.status} | Body: {resp_text[:300]}")
+    try:
+        async with aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(ssl=False),
+            headers=headers,
+            timeout=client_timeout,
+        ) as session:
+            for ep in endpoints:
+                try:
+                    parsed_ep = urllib.parse.urlparse(ep)
+                    ep_label = f"{parsed_ep.netloc}{parsed_ep.path}"
+                    async with session.get(ep) as resp:
+                        resp_text = await resp.text()
+                        logger.info(f"[_resolve_via_gateway] {ep_label} -> HTTP {resp.status} | Body: {resp_text[:300]}")
 
-                    if resp.status != 200:
-                        diag_logs.append(f"{ep_label}: HTTP {resp.status}")
-                        continue
-
-                    try:
-                        data = json.loads(resp_text)
-                    except Exception:
-                        diag_logs.append(f"{ep_label}: invalid JSON ({resp_text[:80]})")
-                        continue
-
-                    if not data:
-                        diag_logs.append(f"{ep_label}: empty JSON")
-                        continue
-
-                    # Handle list of files format from terabox-gateway
-                    if isinstance(data, list) and len(data) > 0:
-                        first = data[0]
-                        dlink = first.get("download_link") or first.get("direct_link") or first.get("link")
-                        if dlink:
-                            logger.info(f"[_resolve_via_gateway] Success via gateway list: {dlink[:60]}")
-                            return True, {
-                                "id": uuid.uuid4().hex[:8],
-                                "title": first.get("filename") or "TeraBox_Video",
-                                "thumbnail": first.get("thumbnail") or ((first.get("thumbnails") or {}).get("850x580")),
-                                "uploader": "TeraBox Gateway",
-                                "play_url": dlink,
-                                "original_url": url,
-                                "duration": None,
-                                "formats": [],
-                                "engine": "cookie_gateway",
-                            }, None
-
-                    # Handle dictionary response
-                    if isinstance(data, dict):
-                        errno = data.get("errno")
-                        errmsg = data.get("errmsg") or data.get("msg") or data.get("message") or ""
-                        if errno not in (None, 0):
-                            logger.warning(f"[_resolve_via_gateway] {ep_label} returned errno: {errno} ({errmsg})")
-                            diag_logs.append(f"{ep_label}: errno={errno} ({errmsg or 'error'})")
+                        if resp.status != 200:
+                            diag_logs.append(f"• `{ep_label}`: `HTTP {resp.status}`")
                             continue
 
-                        # Format 1: direct link / dlink / stream_url / play_url
-                        play_url = (
-                            data.get("play_url")
-                            or data.get("download_link")
-                            or data.get("direct_link")
-                            or data.get("dlink")
-                            or data.get("stream_url")
-                            or data.get("fast_download_link")
-                        )
-                        title = data.get("title") or data.get("filename") or "TeraBox_Video"
-                        thumb = data.get("thumbnail") or data.get("thumb")
+                        try:
+                            data = json.loads(resp_text)
+                        except Exception:
+                            diag_logs.append(f"• `{ep_label}`: non-JSON `{resp_text[:80]}`")
+                            continue
 
-                        # Format 2: nested list from official /share/list
-                        if "list" in data and isinstance(data["list"], list) and len(data["list"]) > 0:
-                            item = data["list"][0]
-                            title = item.get("server_filename") or item.get("filename") or title
-                            thumb = (item.get("thumbs") or {}).get("url3") or item.get("thumbnail") or thumb
-                            play_url = play_url or item.get("dlink") or item.get("direct_link") or item.get("download_link")
+                        if not data:
+                            diag_logs.append(f"• `{ep_label}`: empty JSON")
+                            continue
 
-                            # If no dlink in share/list, attempt step-2 /share/download API call
-                            if not play_url and item.get("fs_id") and data.get("shareid") and data.get("uk"):
-                                try:
-                                    fs_id = item["fs_id"]
-                                    shareid = data["shareid"]
-                                    uk = data["uk"]
-                                    sign = data.get("sign", "")
-                                    timestamp = data.get("timestamp", int(time.time()))
-                                    jsToken = data.get("jsToken", "")
-                                    dl_ep = (
-                                        f"https://www.terabox.app/share/download?"
-                                        f"app_id=250528&web=1&channel=dubox&clienttype=0"
-                                        f"&jsToken={jsToken}&shareid={shareid}&uk={uk}&sign={sign}&timestamp={timestamp}"
-                                        f"&primaryid={shareid}&fid_list=[{fs_id}]"
-                                    )
-                                    logger.info(f"[_resolve_via_gateway] Attempting 2-step /share/download for fs_id={fs_id}")
-                                    async with session.get(dl_ep) as dl_resp:
-                                        dl_text = await dl_resp.text()
-                                        logger.info(f"[_resolve_via_gateway] Step-2 dl_ep -> HTTP {dl_resp.status} | Body: {dl_text[:300]}")
-                                        if dl_resp.status == 200:
-                                            dl_data = json.loads(dl_text)
-                                            if dl_data and dl_data.get("errno") == 0:
-                                                play_url = dl_data.get("dlink")
-                                                logger.info(f"[_resolve_via_gateway] Step-2 download succeeded: {bool(play_url)}")
-                                            else:
-                                                diag_logs.append(f"share/download: errno={dl_data.get('errno')} ({dl_data.get('errmsg', '')})")
-                                except Exception as dl_err:
-                                    logger.warning(f"[_resolve_via_gateway] Step-2 download error: {dl_err}")
-                                    diag_logs.append(f"share/download exception: {dl_err}")
+                        # Handle list of files format from terabox-gateway
+                        if isinstance(data, list) and len(data) > 0:
+                            first = data[0]
+                            dlink = first.get("download_link") or first.get("direct_link") or first.get("link")
+                            if dlink:
+                                logger.info(f"[_resolve_via_gateway] Success via gateway list: {dlink[:60]}")
+                                return True, {
+                                    "id": uuid.uuid4().hex[:8],
+                                    "title": first.get("filename") or "TeraBox_Video",
+                                    "thumbnail": first.get("thumbnail") or ((first.get("thumbnails") or {}).get("850x580")),
+                                    "uploader": "TeraBox Gateway",
+                                    "play_url": dlink,
+                                    "original_url": url,
+                                    "duration": None,
+                                    "formats": [],
+                                    "engine": "cookie_gateway",
+                                }, None
 
-                        if play_url:
-                            logger.info(f"[_resolve_via_gateway] Successfully extracted play_url: {play_url[:60]}...")
-                            return True, {
-                                "id": uuid.uuid4().hex[:8],
-                                "title": title,
-                                "thumbnail": thumb,
-                                "uploader": "TeraBox Gateway",
-                                "play_url": play_url,
-                                "original_url": url,
-                                "duration": None,
-                                "formats": [],
-                                "engine": "cookie_gateway",
-                            }, None
-                        else:
-                            diag_logs.append(f"{ep_label}: no play_url in response ({resp_text[:100]})")
-        except Exception as e:
-            logger.debug(f"Gateway endpoint {ep} failed: {e}")
-            diag_logs.append(f"{ep_label}: {e}")
-            continue
+                        # Handle dictionary response
+                        if isinstance(data, dict):
+                            errno = data.get("errno")
+                            errmsg = data.get("errmsg") or data.get("msg") or data.get("message") or ""
+                            if errno not in (None, 0):
+                                logger.warning(f"[_resolve_via_gateway] {ep_label} returned errno: {errno} ({errmsg})")
+                                diag_logs.append(f"• `{ep_label}`: `HTTP {resp.status}` | `errno={errno}` (`{errmsg or 'need verify'}`)")
+                                continue
 
-    summary = "\n• ".join(diag_logs[:4]) if diag_logs else "All endpoints returned empty or failed"
-    return False, {}, f"• {summary}"
+                            # Format 1: direct link / dlink / stream_url / play_url
+                            play_url = (
+                                data.get("play_url")
+                                or data.get("download_link")
+                                or data.get("direct_link")
+                                or data.get("dlink")
+                                or data.get("stream_url")
+                                or data.get("fast_download_link")
+                            )
+                            title = data.get("title") or data.get("filename") or "TeraBox_Video"
+                            thumb = data.get("thumbnail") or data.get("thumb")
+
+                            # Format 2: nested list from official /share/list
+                            if "list" in data and isinstance(data["list"], list) and len(data["list"]) > 0:
+                                item = data["list"][0]
+                                title = item.get("server_filename") or item.get("filename") or title
+                                thumb = (item.get("thumbs") or {}).get("url3") or item.get("thumbnail") or thumb
+                                play_url = play_url or item.get("dlink") or item.get("direct_link") or item.get("download_link")
+
+                                # If no dlink in share/list, attempt step-2 /share/download API call
+                                if not play_url and item.get("fs_id") and data.get("shareid") and data.get("uk"):
+                                    try:
+                                        fs_id = item["fs_id"]
+                                        shareid = data["shareid"]
+                                        uk = data["uk"]
+                                        sign = data.get("sign", "")
+                                        timestamp = data.get("timestamp", int(time.time()))
+                                        jsToken = data.get("jsToken", "")
+                                        dl_ep = (
+                                            f"https://www.terabox.app/share/download?"
+                                            f"app_id=250528&web=1&channel=dubox&clienttype=0"
+                                            f"&jsToken={jsToken}&shareid={shareid}&uk={uk}&sign={sign}&timestamp={timestamp}"
+                                            f"&primaryid={shareid}&fid_list=[{fs_id}]"
+                                        )
+                                        logger.info(f"[_resolve_via_gateway] Attempting 2-step /share/download for fs_id={fs_id}")
+                                        async with session.get(dl_ep) as dl_resp:
+                                            dl_text = await dl_resp.text()
+                                            logger.info(f"[_resolve_via_gateway] Step-2 dl_ep -> HTTP {dl_resp.status} | Body: {dl_text[:300]}")
+                                            if dl_resp.status == 200:
+                                                dl_data = json.loads(dl_text)
+                                                if dl_data and dl_data.get("errno") == 0:
+                                                    play_url = dl_data.get("dlink")
+                                                    logger.info(f"[_resolve_via_gateway] Step-2 download succeeded: {bool(play_url)}")
+                                                else:
+                                                    diag_logs.append(f"• `share/download`: `errno={dl_data.get('errno')}` (`{dl_data.get('errmsg', '')}`)")
+                                    except Exception as dl_err:
+                                        logger.warning(f"[_resolve_via_gateway] Step-2 download error: {dl_err}")
+                                        diag_logs.append(f"• `share/download`: `{dl_err}`")
+
+                            if play_url:
+                                logger.info(f"[_resolve_via_gateway] Successfully extracted play_url: {play_url[:60]}...")
+                                return True, {
+                                    "id": uuid.uuid4().hex[:8],
+                                    "title": title,
+                                    "thumbnail": thumb,
+                                    "uploader": "TeraBox Gateway",
+                                    "play_url": play_url,
+                                    "original_url": url,
+                                    "duration": None,
+                                    "formats": [],
+                                    "engine": "cookie_gateway",
+                                }, None
+                            else:
+                                diag_logs.append(f"• `{ep_label}`: no `play_url` in response (`{resp_text[:60]}`)")
+                except Exception as e:
+                    logger.debug(f"Gateway endpoint {ep} failed: {e}")
+                    diag_logs.append(f"• `{ep_label}`: `{e}`")
+                    continue
+    except Exception as session_err:
+        diag_logs.append(f"• Session error: `{session_err}`")
+
+    summary = "\n".join(diag_logs) if diag_logs else "All endpoints returned empty or failed"
+    return False, {}, summary
 
 
 from browser_verifier import (
