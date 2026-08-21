@@ -133,11 +133,19 @@ function logStatus(msg) {
     // 2. Configure native download directory via CDP
     const downloadDir = path.resolve(OUTPUT_DIR);
     const client = await page.target().createCDPSession();
-    await client.send('Browser.setDownloadBehavior', {
-        behavior: 'allowAndName',
-        downloadPath: downloadDir,
-        eventsEnabled: true,
-    });
+    try {
+        await client.send('Browser.setDownloadBehavior', {
+            behavior: 'allow',
+            downloadPath: downloadDir,
+            eventsEnabled: true,
+        });
+        await client.send('Page.setDownloadBehavior', {
+            behavior: 'allow',
+            downloadPath: downloadDir,
+        });
+    } catch (cdpErr) {
+        logStatus(`CDP DownloadBehavior warning: ${cdpErr.message}`);
+    }
 
     let downloadStarted = false;
     let suggestedFilename = null;
@@ -188,6 +196,11 @@ function logStatus(msg) {
             }
         });
     } catch (e) {}
+
+    // Save screenshot before clicking for debugging
+    try {
+        await page.screenshot({ path: path.join(downloadDir, 'crawler_before_click.png') });
+    } catch (ssErr) {}
 
     // 6. Find and Click the Download Button
     logStatus('Locating download button (.operate-row button.download-btn)...');
@@ -261,6 +274,27 @@ function logStatus(msg) {
         }, buttonHandle);
 
         logStatus('Download button clicked successfully.');
+
+        // Check if a modal popped up asking for confirmation or "Download in Browser"
+        await new Promise(r => setTimeout(r, 1200));
+        try {
+            await page.evaluate(() => {
+                const modalButtons = Array.from(document.querySelectorAll('.modal-btn, .dialog-btn, .btn, button, div, a'));
+                const confirmBtn = modalButtons.find(el => {
+                    const t = (el.innerText || '').trim().toLowerCase();
+                    return t.includes('normal download') || t.includes('download in browser') || t.includes('continue download') || t === 'confirm' || t === 'yes';
+                });
+                if (confirmBtn) {
+                    confirmBtn.click();
+                }
+            });
+        } catch (mErr) {}
+
+        // Save screenshot after clicking
+        try {
+            await page.screenshot({ path: path.join(downloadDir, 'crawler_after_click.png') });
+        } catch (ssErr) {}
+
     } else {
         logStatus('Warning: Download button not found by selector. Trying page fallback click...');
     }
