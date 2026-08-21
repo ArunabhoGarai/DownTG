@@ -2,13 +2,13 @@
 """
 Manual TeraBox CAPTCHA & Cookie Solver (Xvfb + noVNC Web Desktop)
 ==================================================================
-Runs on your Ubuntu EC2 server. Launches a full virtual desktop with Chrome,
+Runs on your Ubuntu EC2 server in root directory. Launches a full virtual desktop with Chrome,
 serves a web-accessible noVNC viewer in your browser, lets you log in / solve
 the CAPTCHA on your server's own IP address, and automatically exports the
 valid Netscape session cookies directly from Chromium memory to cooky/terabox/cookies.txt.
 
 Usage on EC2:
-    python3 scripts/manual_cookie_solver.py
+    python3 manual_cookie_solver.py
 """
 
 import os
@@ -22,8 +22,8 @@ from pathlib import Path
 
 import aiohttp
 
-# Add project root to sys.path
-BASE_DIR = Path(__file__).resolve().parent.parent
+# Root directory of DownTG
+BASE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE_DIR))
 
 COOKIE_OUTPUT_PATH = BASE_DIR / "cooky" / "terabox" / "cookies.txt"
@@ -68,31 +68,32 @@ async def extract_cdp_cookies(debug_port: int = 9222) -> list:
     """Extracts 100% decrypted, valid session cookies directly from running Chrome via CDP."""
     connector = aiohttp.TCPConnector(ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:
-        # Get tab list
         ws_url = None
-        try:
-            async with session.get(f"http://127.0.0.1:{debug_port}/json/list") as resp:
-                if resp.status == 200:
-                    tabs = await resp.json(content_type=None)
-                    for t in tabs:
-                        if t.get("type") == "page" and t.get("webSocketDebuggerUrl"):
-                            ws_url = t.get("webSocketDebuggerUrl")
+        for attempt in range(10):
+            try:
+                async with session.get(f"http://127.0.0.1:{debug_port}/json/list") as resp:
+                    if resp.status == 200:
+                        tabs = await resp.json(content_type=None)
+                        for t in tabs:
+                            if t.get("type") == "page" and t.get("webSocketDebuggerUrl"):
+                                ws_url = t.get("webSocketDebuggerUrl")
+                                break
+                        if not ws_url and tabs:
+                            ws_url = tabs[0].get("webSocketDebuggerUrl")
+                        if ws_url:
                             break
-                    if not ws_url and tabs:
-                        ws_url = tabs[0].get("webSocketDebuggerUrl")
-        except Exception as e:
-            print(f"⚠️  Could not connect to Chrome debug port HTTP: {e}")
-            return []
+            except Exception:
+                await asyncio.sleep(0.5)
 
         if not ws_url:
-            print("⚠️  No active page WebSocket found in Chrome.")
+            print("⚠️  No active page WebSocket found on debug port.")
             return []
 
         print(f"🔌 Connecting to Chrome DevTools WebSocket...")
         cookies = []
         try:
             async with session.ws_connect(ws_url, timeout=aiohttp.ClientTimeout(total=10)) as ws:
-                # 1. Storage.getCookies
+                # 1. Storage.getCookies (captures all cookies globally)
                 await ws.send_json({"id": 1, "method": "Storage.getCookies", "params": {}})
                 for _ in range(8):
                     try:
@@ -106,7 +107,7 @@ async def extract_cdp_cookies(debug_port: int = 9222) -> list:
                     except Exception:
                         break
 
-                # 2. Network.getCookies
+                # 2. Network.getCookies fallback
                 if not cookies:
                     await ws.send_json({"id": 2, "method": "Network.enable", "params": {}})
                     await ws.send_json({
@@ -131,7 +132,7 @@ async def extract_cdp_cookies(debug_port: int = 9222) -> list:
                         except Exception:
                             break
         except Exception as ws_err:
-            print(f"⚠️  WebSocket error: {ws_err}")
+            print(f"⚠️  WebSocket connection error: {ws_err}")
 
         return cookies
 
@@ -243,7 +244,7 @@ def main():
             print(f"🎉 Successfully saved cookies to: {COOKIE_OUTPUT_PATH}")
             print("✅ All set! You can restart tgbot.service now.")
         else:
-            print("❌ Could not capture cookies from Chrome memory. Please try again.")
+            print("❌ Could not capture cookies from Chrome memory. Please make sure Chrome is open and logged in.")
 
     except KeyboardInterrupt:
         print("\n🛑 Aborted by user.")
