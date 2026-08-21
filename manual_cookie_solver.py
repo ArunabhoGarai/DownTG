@@ -2,10 +2,8 @@
 """
 Manual TeraBox CAPTCHA & Cookie Solver (Xvfb + noVNC Web Desktop)
 ==================================================================
-Runs on your Ubuntu EC2 server in root directory. Launches a full virtual desktop with Chrome,
-serves a web-accessible noVNC viewer in your browser, lets you log in / solve
-the CAPTCHA on your server's own IP address, and automatically exports the
-valid Netscape session cookies directly from Chromium memory to cooky/terabox/cookies.txt.
+Runs on your Ubuntu EC2 server in root directory.
+Uses 100% Python Standard Library (ZERO pip dependencies required).
 
 Usage on EC2:
     python3 manual_cookie_solver.py
@@ -15,12 +13,14 @@ import os
 import sys
 import time
 import json
+import socket
+import struct
+import base64
 import shutil
-import asyncio
+import urllib.parse
+import urllib.request
 import subprocess
 from pathlib import Path
-
-import aiohttp
 
 # Root directory of DownTG
 BASE_DIR = Path(__file__).resolve().parent
@@ -64,77 +64,103 @@ def cookies_to_netscape(cookies: list) -> str:
     return "\n".join(lines)
 
 
-async def extract_cdp_cookies(debug_port: int = 9222) -> list:
-    """Extracts 100% decrypted, valid session cookies directly from running Chrome via CDP."""
-    connector = aiohttp.TCPConnector(ssl=False)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        ws_url = None
-        for attempt in range(10):
-            try:
-                async with session.get(f"http://127.0.0.1:{debug_port}/json/list") as resp:
-                    if resp.status == 200:
-                        tabs = await resp.json(content_type=None)
-                        for t in tabs:
-                            if t.get("type") == "page" and t.get("webSocketDebuggerUrl"):
-                                ws_url = t.get("webSocketDebuggerUrl")
-                                break
-                        if not ws_url and tabs:
-                            ws_url = tabs[0].get("webSocketDebuggerUrl")
-                        if ws_url:
+def fetch_cdp_cookies_stdlib(debug_port: int = 9222) -> list:
+    """Extracts 100% decrypted plaintext cookies from Chromium memory using ONLY Python standard library."""
+    # 1. Fetch tab WebSocket URL via HTTP
+    ws_url = None
+    for _ in range(12):
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{debug_port}/json/list")
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                if resp.status == 200:
+                    tabs = json.loads(resp.read().decode("utf-8"))
+                    for t in tabs:
+                        if t.get("type") == "page" and t.get("webSocketDebuggerUrl"):
+                            ws_url = t.get("webSocketDebuggerUrl")
                             break
-            except Exception:
-                await asyncio.sleep(0.5)
+                    if not ws_url and tabs:
+                        ws_url = tabs[0].get("webSocketDebuggerUrl")
+                    if ws_url:
+                        break
+        except Exception:
+            time.sleep(0.5)
 
-        if not ws_url:
-            print("⚠️  No active page WebSocket found on debug port.")
+    if not ws_url:
+        print("⚠️  No active page WebSocket found on debug port.")
+        return []
+
+    print(f"🔌 Connecting to Chrome DevTools WebSocket (standard library)...")
+    try:
+        parsed = urllib.parse.urlparse(ws_url)
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(5.0)
+        s.connect((parsed.hostname, parsed.port))
+
+        key = base64.b64encode(os.urandom(16)).decode("utf-8")
+        req = (
+            f"GET {parsed.path} HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{debug_port}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n"
+            f"Origin: http://127.0.0.1:{debug_port}\r\n\r\n"
+        )
+        s.sendall(req.encode("utf-8"))
+        handshake = s.recv(2048).decode("utf-8", errors="ignore")
+        if "101" not in handshake:
+            print("⚠️  WebSocket handshake failed.")
+            s.close()
             return []
 
-        print(f"🔌 Connecting to Chrome DevTools WebSocket...")
-        cookies = []
-        try:
-            async with session.ws_connect(ws_url, timeout=aiohttp.ClientTimeout(total=10)) as ws:
-                # 1. Storage.getCookies (captures all cookies globally)
-                await ws.send_json({"id": 1, "method": "Storage.getCookies", "params": {}})
-                for _ in range(8):
-                    try:
-                        msg = await asyncio.wait_for(ws.receive(), timeout=1.5)
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            data = json.loads(msg.data)
-                            if data.get("id") == 1 and "result" in data:
-                                cookies = data["result"].get("cookies", [])
-                                if cookies:
-                                    break
-                    except Exception:
-                        break
+        # Send Storage.getCookies command
+        cmd = json.dumps({"id": 1, "method": "Storage.getCookies", "params": {}}).encode("utf-8")
+        mask = os.urandom(4)
+        frame = bytearray([0x81, 0x80 | len(cmd)]) + mask + bytearray(b ^ mask[i % 4] for i, b in enumerate(cmd))
+        s.sendall(frame)
 
-                # 2. Network.getCookies fallback
-                if not cookies:
-                    await ws.send_json({"id": 2, "method": "Network.enable", "params": {}})
-                    await ws.send_json({
-                        "id": 3,
-                        "method": "Network.getCookies",
-                        "params": {"urls": [
-                            "https://www.1024terabox.com",
-                            "https://www.terabox.app",
-                            "https://terabox.com",
-                            "https://1024tera.com",
-                        ]},
-                    })
-                    for _ in range(8):
-                        try:
-                            msg = await asyncio.wait_for(ws.receive(), timeout=1.5)
-                            if msg.type == aiohttp.WSMsgType.TEXT:
-                                data = json.loads(msg.data)
-                                if data.get("id") == 3 and "result" in data:
-                                    cookies = data["result"].get("cookies", [])
-                                    if cookies:
-                                        break
-                        except Exception:
-                            break
-        except Exception as ws_err:
-            print(f"⚠️  WebSocket connection error: {ws_err}")
+        # Read response
+        raw = bytearray()
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            raw.extend(chunk)
+            if len(raw) > 4:
+                # Check payload size
+                payload_len = raw[1] & 0x7F
+                offset = 2
+                if payload_len == 126:
+                    if len(raw) < 4:
+                        continue
+                    payload_len = struct.unpack(">H", raw[2:4])[0]
+                    offset = 4
+                elif payload_len == 127:
+                    if len(raw) < 10:
+                        continue
+                    payload_len = struct.unpack(">Q", raw[2:10])[0]
+                    offset = 10
+                if len(raw) >= offset + payload_len:
+                    break
 
-        return cookies
+        s.close()
+
+        payload_len = raw[1] & 0x7F
+        offset = 2
+        if payload_len == 126:
+            payload_len = struct.unpack(">H", raw[2:4])[0]
+            offset = 4
+        elif payload_len == 127:
+            payload_len = struct.unpack(">Q", raw[2:10])[0]
+            offset = 10
+
+        body = raw[offset:offset + payload_len].decode("utf-8", errors="ignore")
+        res = json.loads(body)
+        return res.get("result", {}).get("cookies", [])
+
+    except Exception as e:
+        print(f"⚠️  Error fetching cookies via CDP socket: {e}")
+        return []
 
 
 def main():
@@ -207,7 +233,6 @@ def main():
         public_ip = os.getenv("SERVER_PUBLIC_IP", "")
         if not public_ip:
             try:
-                import urllib.request
                 public_ip = urllib.request.urlopen("https://api.ipify.org", timeout=3).read().decode('utf-8').strip()
             except Exception:
                 public_ip = "YOUR_EC2_PUBLIC_IP"
@@ -229,7 +254,7 @@ def main():
         input("👉 Press [ENTER] here once you have solved the captcha / logged in: ")
 
         print("\n⏳ Extracting live plaintext cookies directly from Chrome memory...")
-        cookies = asyncio.run(extract_cdp_cookies(debug_port))
+        cookies = fetch_cdp_cookies_stdlib(debug_port)
 
         if cookies:
             cookie_map = {c.get("name"): c.get("value", "") for c in cookies}
