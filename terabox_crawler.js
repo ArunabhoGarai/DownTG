@@ -309,6 +309,7 @@ function logStatus(msg) {
     let lastSize = -1;
     let sizeStallCount = 0;
 
+    let retriggered = false;
     while ((Date.now() - startTime) < (maxWaitSec * 1000)) {
         await new Promise(r => setTimeout(r, 1000));
         
@@ -318,6 +319,36 @@ function logStatus(msg) {
         // Find newly created files
         const newFiles = currentFiles.filter(f => !snapshotBefore.has(f));
         
+        // If download hasn't started after 7s, retry clicking all download buttons
+        if ((Date.now() - startTime) > 7000 && !retriggered && newFiles.length === 0) {
+            retriggered = true;
+            logStatus('Re-triggering click and checking modal buttons...');
+            try {
+                await page.evaluate(() => {
+                    const candidates = [
+                        '.operate-row button.download-btn',
+                        'button.download-btn',
+                        '.video-oprate-row button.download-btn',
+                        '.btn-download',
+                        'button[class*="download"]'
+                    ];
+                    for (const sel of candidates) {
+                        const b = document.querySelector(sel);
+                        if (b) {
+                            b.click();
+                            break;
+                        }
+                    }
+                    const modalButtons = Array.from(document.querySelectorAll('.modal-btn, .dialog-btn, .btn, button, div, a'));
+                    const confirmBtn = modalButtons.find(el => {
+                        const t = (el.innerText || '').trim().toLowerCase();
+                        return t.includes('normal download') || t.includes('download in browser') || t.includes('continue download') || t === 'confirm' || t === 'download';
+                    });
+                    if (confirmBtn) confirmBtn.click();
+                });
+            } catch (e) {}
+        }
+
         // Look for in-progress Chrome download (.crdownload)
         const crdownloadFile = newFiles.find(f => f.endsWith('.crdownload') || f.includes('.crdownload'));
         

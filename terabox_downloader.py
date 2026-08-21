@@ -678,23 +678,68 @@ async def extract_terabox_info(
     return False, {}, full_error_report
 
 
+def _is_process_running(name: str) -> bool:
+    try:
+        res = subprocess.run(["pgrep", "-f", name], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
 def _ensure_xvfb_running() -> str:
-    """Ensures Xvfb virtual display is active on Linux."""
+    """Ensures Xvfb and VNC display server is actively running on Linux."""
     if sys.platform != "linux":
         return ":0"
     display = ":99"
-    if os.path.exists("/tmp/.X11-unix/X99"):
-        return display
-    try:
-        logger.info(f"Starting Xvfb on {display} for headless GUI crawler...")
-        subprocess.Popen(
-            ["Xvfb", display, "-screen", "0", "1366x850x24", "-ac", "+extension", "GLX", "+render", "-noreset"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        time.sleep(1.2)
-    except Exception as e:
-        logger.warning(f"Could not auto-start Xvfb: {e}")
+
+    # 1. Check if Xvfb is running
+    xvfb_running = _is_process_running("Xvfb :99")
+    if not xvfb_running:
+        # Clean up stale locks
+        for lock_file in ["/tmp/.X11-unix/X99", "/tmp/.X99-lock"]:
+            if os.path.exists(lock_file):
+                try:
+                    os.remove(lock_file)
+                except Exception:
+                    pass
+
+        logger.info(f"Starting Xvfb virtual display on {display}...")
+        try:
+            subprocess.Popen(
+                ["Xvfb", display, "-screen", "0", "1366x850x24", "-ac", "+extension", "GLX", "+render", "-noreset"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            time.sleep(1.2)
+        except Exception as e:
+            logger.warning(f"Could not auto-start Xvfb: {e}")
+
+    # 2. Check if x11vnc is running on port 5900
+    if not _is_process_running("x11vnc"):
+        logger.info("Starting x11vnc on :99...")
+        try:
+            subprocess.Popen(
+                ["x11vnc", "-display", display, "-nopw", "-forever", "-shared", "-rfbport", "5900"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            time.sleep(0.5)
+        except Exception as e:
+            logger.debug(f"x11vnc start warning: {e}")
+
+    # 3. Check if websockify (noVNC web interface) is running on port 6080
+    if not _is_process_running("websockify"):
+        logger.info("Starting noVNC websockify on port 6080...")
+        try:
+            subprocess.Popen(
+                ["websockify", "--web", "/usr/share/novnc", "6080", "localhost:5900"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            time.sleep(0.5)
+        except Exception as e:
+            logger.debug(f"websockify start warning: {e}")
+
     return display
 
 
