@@ -61,13 +61,22 @@ from mtproto_uploader import (
 
 logger = logging.getLogger(__name__)
 
-# Group chat authorization storage
+def is_admin(user_id: int) -> bool:
+    """Checks if a user ID is the configured bot administrator."""
+    if not ADMIN_USER_ID:
+        return True
+    admin_ids = [aid.strip() for aid in str(ADMIN_USER_ID).split(",") if aid.strip()]
+    return str(user_id) in admin_ids
+
+
+# Authorization file storage
 DATA_DIR = BASE_DIR / "data"
 GROUPS_FILE = DATA_DIR / "allowed_groups.json"
+USERS_FILE = DATA_DIR / "allowed_users.json"
 
 
 def _ensure_data_file():
-    """Ensures data directory and allowed_groups.json exist."""
+    """Ensures data directory and json storage files exist."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if not GROUPS_FILE.exists():
         try:
@@ -75,6 +84,71 @@ def _ensure_data_file():
                 json.dump({}, f, indent=2)
         except Exception:
             pass
+    if not USERS_FILE.exists():
+        try:
+            with open(USERS_FILE, "w", encoding="utf-8") as f:
+                json.dump({}, f, indent=2)
+        except Exception:
+            pass
+
+
+def load_allowed_users() -> Dict[str, Dict[str, Any]]:
+    """Loads allowed DM users from disk."""
+    _ensure_data_file()
+    try:
+        if USERS_FILE.exists():
+            with open(USERS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        logger.error(f"Failed to read {USERS_FILE}: {e}")
+    return {}
+
+
+def save_allowed_users(users: Dict[str, Dict[str, Any]]) -> bool:
+    """Saves allowed DM users to disk."""
+    _ensure_data_file()
+    try:
+        with open(USERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(users, f, indent=2)
+        return True
+    except Exception as e:
+        logger.error(f"Failed to write {USERS_FILE}: {e}")
+        return False
+
+
+def is_user_allowed(user_id: int) -> bool:
+    """Checks if a user is authorized to use the bot in private DMs."""
+    if is_admin(user_id):
+        return True
+    users = load_allowed_users()
+    return str(user_id) in users
+
+
+def allow_user(user_id: int, note: str = "") -> bool:
+    """Authorizes a user to use the bot in private DMs."""
+    users = load_allowed_users()
+    users[str(user_id)] = {
+        "user_id": user_id,
+        "note": note or "Allowed Member",
+        "added_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    return save_allowed_users(users)
+
+
+def disallow_user(user_id: int) -> bool:
+    """Revokes a user's authorization to use the bot in private DMs."""
+    users = load_allowed_users()
+    key = str(user_id)
+    if key in users:
+        del users[key]
+        return save_allowed_users(users)
+    return True
+
+
+def list_allowed_users() -> List[Dict[str, Any]]:
+    """Returns list of allowed DM users."""
+    users = load_allowed_users()
+    return list(users.values())
 
 
 def load_allowed_groups() -> Dict[str, Dict[str, Any]]:
@@ -434,8 +508,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
 
-    # Restrict private DM access to the developer/admin
-    if chat.type == "private" and not is_admin(user_id):
+    # Restrict private DM access to authorized users and admin
+    if chat.type == "private" and not is_user_allowed(user_id):
         await update.message.reply_text(UNAUTHORIZED_DM_MESSAGE)
         return
 
@@ -460,13 +534,15 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin-only comprehensive command guide in private DM."""
+    """Admin-only comprehensive control panel or authorized user guide."""
     chat = update.effective_chat
     user_id = update.effective_user.id
+    is_group = chat.type in ("group", "supergroup")
 
-    # Restrict private DM access to the developer/admin
     if not is_admin(user_id):
-        if chat.type == "private":
+        if not is_group and is_user_allowed(user_id):
+            await gchelp_command(update, context)
+        elif not is_group:
             await update.message.reply_text(UNAUTHORIZED_DM_MESSAGE)
         else:
             await update.message.reply_text("ℹ️ Use `/gchelp` to view group commands.", parse_mode=constants.ParseMode.MARKDOWN)
@@ -475,6 +551,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     admin_help_text = (
         "👑 **Developer & Admin Control Panel**\n"
         "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "👤 **DM User Access Controls:**\n"
+        "• `/allow <user_id> [note]` — Authorize a user to download in private DMs.\n"
+        "• `/disallow <user_id>` (or `/revoke`) — Revoke a user's private DM access.\n"
+        "• `/allowedusers` (or `/listusers`) — View all authorized private DM users.\n\n"
         "🍪 **Cookie Management Commands:**\n"
         "• `/cookiestatus` — Check status, lines, and sizes for YouTube, Instagram, Facebook, and TeraBox cookies.\n"
         "• `/setcookie <platform> <cookie_text>` — Save raw cookie text directly in chat (e.g. `/setcookie terabox ndus=...`).\n"
@@ -513,7 +593,7 @@ async def gchelp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if not is_group and not is_admin(user_id):
+    if not is_group and not is_user_allowed(user_id):
         await update.message.reply_text(UNAUTHORIZED_DM_MESSAGE)
         return
 
@@ -710,8 +790,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     is_group = chat.type in ("group", "supergroup")
 
-    # If message is in private chat (DM), restrict strictly to the admin
-    if not is_group and not is_admin(user_id):
+    # If message is in private chat (DM), restrict to authorized users and admin
+    if not is_group and not is_user_allowed(user_id):
         await update.message.reply_text(UNAUTHORIZED_DM_MESSAGE)
         return
 
@@ -956,7 +1036,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     user_id = query.from_user.id
     is_group = chat.type in ("group", "supergroup") if chat else False
 
-    if not is_group and not is_admin(user_id):
+    if not is_group and not is_user_allowed(user_id):
         await query.answer(UNAUTHORIZED_DM_MESSAGE, show_alert=True)
         return
 
@@ -1477,13 +1557,108 @@ async def stopgc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def allow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Authorizes a user by Telegram ID to use the bot in private DMs. Usage: /allow <user_id> [note]"""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("⛔ Only the bot administrator can authorize users.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "📝 **Usage:** `/allow <telegram_user_id> [optional_name_or_note]`\n\n"
+            "💡 *Example:* `/allow 123456789 John`",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_to_message_id=update.message.message_id,
+        )
+        return
+
+    raw_target_id = context.args[0].strip()
+    if not raw_target_id.isdigit():
+        await update.message.reply_text("❌ Invalid Telegram User ID. It must be numbers only (e.g. `123456789`).")
+        return
+
+    target_id = int(raw_target_id)
+    note = " ".join(context.args[1:]).strip() if len(context.args) > 1 else ""
+
+    allow_user(target_id, note)
+    note_str = f" ({note})" if note else ""
+    await update.message.reply_text(
+        f"✅ **User Authorized for DMs!**\n\n"
+        f"• **Telegram ID:** `{target_id}`{note_str}\n"
+        f"• **Access:** Can now download videos directly in private messages.",
+        parse_mode=constants.ParseMode.MARKDOWN,
+        reply_to_message_id=update.message.message_id,
+    )
+
+
+async def disallow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Revokes a user's DM access by Telegram ID. Usage: /disallow <user_id>"""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("⛔ Only the bot administrator can revoke authorization.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "📝 **Usage:** `/disallow <telegram_user_id>`",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_to_message_id=update.message.message_id,
+        )
+        return
+
+    raw_target_id = context.args[0].strip()
+    if not raw_target_id.isdigit():
+        await update.message.reply_text("❌ Invalid Telegram User ID.")
+        return
+
+    target_id = int(raw_target_id)
+    disallow_user(target_id)
+    await update.message.reply_text(
+        f"🛑 **User Revoked from DMs!**\n\n"
+        f"• **Telegram ID:** `{target_id}`\n"
+        f"• **Access:** Private DM access has been deactivated.",
+        parse_mode=constants.ParseMode.MARKDOWN,
+        reply_to_message_id=update.message.message_id,
+    )
+
+
+async def listusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lists all authorized DM users."""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("⛔ Only the bot administrator can view authorized users.")
+        return
+
+    users = list_allowed_users()
+    if not users:
+        await update.message.reply_text(
+            "📋 **Authorized DM Users:** None\n\n"
+            "💡 *Use `/allow <user_id>` to authorize someone.*",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_to_message_id=update.message.message_id,
+        )
+        return
+
+    lines = [f"📋 **Authorized DM Users ({len(users)}):**\n"]
+    for u in users:
+        uid = u.get("user_id")
+        note = u.get("note", "")
+        added = u.get("added_at", "")
+        note_text = f" — *{note}*" if note else ""
+        date_text = f" `[{added}]`" if added else ""
+        lines.append(f"• `{uid}`{note_text}{date_text}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode=constants.ParseMode.MARKDOWN, reply_to_message_id=update.message.message_id)
+
+
 async def download_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles explicit /dl and /download commands."""
     chat = update.effective_chat
     user_id = update.effective_user.id
     is_group = chat.type in ("group", "supergroup")
 
-    if not is_group and not is_admin(user_id):
+    if not is_group and not is_user_allowed(user_id):
         await update.message.reply_text(UNAUTHORIZED_DM_MESSAGE)
         return
 
@@ -1513,6 +1688,12 @@ def register_handlers(application):
     application.add_handler(CommandHandler("gchelp", gchelp_command))
     application.add_handler(CommandHandler("startgc", startgc_command))
     application.add_handler(CommandHandler("stopgc", stopgc_command))
+    application.add_handler(CommandHandler("allow", allow_command))
+    application.add_handler(CommandHandler("disallow", disallow_command))
+    application.add_handler(CommandHandler("revoke", disallow_command))
+    application.add_handler(CommandHandler("allowedusers", listusers_command))
+    application.add_handler(CommandHandler("listusers", listusers_command))
+    application.add_handler(CommandHandler("allowed", listusers_command))
     application.add_handler(CommandHandler("dl", download_command))
     application.add_handler(CommandHandler("download", download_command))
     application.add_handler(CommandHandler("d", download_command))
