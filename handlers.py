@@ -1368,11 +1368,28 @@ async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Instantly recreate the concurrency semaphore so all slots are 100% free
     _SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
-    # Terminate any orphaned ffmpeg/downloader subprocesses on Linux
+    # Terminate all orphaned chrome, chromium, node crawlers, and ffmpeg processes
+    killed_processes = []
     if os.name != "nt":
         try:
-            import subprocess
-            subprocess.run(["pkill", "-9", "-f", "ffmpeg"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["pkill", "-9", "-f", "chrome|chromium|terabox_crawler|node|ffmpeg"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            killed_processes.append("Chrome/Chromium & Node Crawlers")
+        except Exception:
+            pass
+        # Clean up stale X11 locks
+        for lock in ["/tmp/.X11-unix/X99", "/tmp/.X99-lock"]:
+            if os.path.exists(lock):
+                try:
+                    os.remove(lock)
+                except Exception:
+                    pass
+        killed_processes.append("X11 Server Locks")
+    else:
+        try:
+            subprocess.run(["taskkill", "/F", "/IM", "chrome.exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["taskkill", "/F", "/IM", "node.exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["taskkill", "/F", "/IM", "ffmpeg.exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            killed_processes.append("Windows Chrome, Node & FFmpeg")
         except Exception:
             pass
 
@@ -1391,11 +1408,12 @@ async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     await update.message.reply_text(
-        f"🔄 **Server Reset & Refreshed!**\n\n"
-        f"• Terminated active tasks: `{killed_count}`\n"
-        f"• Cleaned temporary files: `{cleaned_files}`\n"
-        f"• Concurrency slots available: `{MAX_CONCURRENT_DOWNLOADS}/{MAX_CONCURRENT_DOWNLOADS}`\n"
-        f"• State: 🟢 **Ready for new downloads**",
+        f"🔄 **Server Hard Reset & Refreshed!**\n\n"
+        f"• **Cancelled Tasks:** `{killed_count}`\n"
+        f"• **Killed Processes:** `{', '.join(killed_processes)}`\n"
+        f"• **Cleaned Temp Files:** `{cleaned_files}`\n"
+        f"• **Concurrency Slots:** `{MAX_CONCURRENT_DOWNLOADS}/{MAX_CONCURRENT_DOWNLOADS}`\n"
+        f"• **State:** 🟢 **100% Ready for new downloads**",
         parse_mode=constants.ParseMode.MARKDOWN,
         reply_to_message_id=update.message.message_id,
     )
