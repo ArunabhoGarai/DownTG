@@ -1,7 +1,14 @@
 import os
+import sys
+import time
+import json
 import uuid
+import socket
+import shutil
+import tempfile
 import asyncio
 import logging
+import subprocess
 import urllib.parse
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, Callable
@@ -88,6 +95,286 @@ def get_terabox_cookie() -> Optional[str]:
         except Exception:
             pass
     return os.getenv("TERABOX_COOKIE") or os.getenv("COOKIE_JSON")
+
+
+def find_chrome_binary() -> Optional[str]:
+    """Locates Chromium/Chrome binary on the local system."""
+    candidates = [
+        "/usr/bin/chromium-browser",
+        "/usr/bin/chromium",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/google-chrome",
+        "/snap/bin/chromium",
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    ]
+    for c in candidates:
+        if os.path.isfile(c) or shutil.which(c):
+            return c
+    return None
+
+
+def parse_raw_cookies_for_cdp(raw_cookie: Optional[str]) -> list:
+    """Converts Netscape or key=value cookies into CDP Network.setCookies list."""
+    if not raw_cookie:
+        return []
+    cdp_cookies = []
+    for line in raw_cookie.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 7:
+            domain, path, secure_str = parts[0], parts[2], parts[3]
+            secure = secure_str.lower() == "true"
+            expires_raw = parts[4]
+            expires = int(float(expires_raw)) if expires_raw.replace(".", "", 1).isdigit() else None
+            name, value = parts[5], parts[6]
+            cookie_dict = {"name": name, "value": value, "domain": domain, "path": path, "secure": secure}
+            if expires and expires > 0:
+                cookie_dict["expires"] = expires
+            cdp_cookies.append(cookie_dict)
+        elif "=" in line:
+            kv = line.split("=", 1)
+            cdp_cookies.append({
+                "name": kv[0].strip(),
+                "value": kv[1].strip().rstrip(";"),
+                "domain": ".terabox.app",
+                "path": "/",
+            })
+    return cdp_cookies
+
+
+def _find_free_port() -> int:
+    """Returns a random available TCP port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('', 0))
+        return s.getsockname()[1]
+
+
+async def _resolve_via_headless_browser(
+    url: str,
+    timeout_sec: int = 15,
+) -> Tuple[bool, Dict[str, Any], Optional[str]]:
+    """
+    Primary Browser Engine: Uses real headless Chromium with saved cookies.
+    Bypasses dynamic token checks and 'need verify' restrictions by mimicking real browser behavior.
+    """
+    chrome_bin = find_chrome_binary()
+    if not chrome_bin:
+        return False, {}, "Chromium binary not found on system."
+
+    port = _find_free_port()
+    temp_dir = tempfile.mkdtemp(prefix="tb_headless_")
+
+    env = os.environ.copy()
+    if "DISPLAY" not in env:
+        env["DISPLAY"] = ":99"
+
+    chrome_args = [
+        chrome_bin,
+        f"--remote-debugging-port={port}",
+        "--remote-debugging-address=127.0.0.1",
+        "--remote-allow-origins=*",
+        f"--user-data-dir={temp_dir}",
+        "--headless=new",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-dev-shm-usage",
+        "--no-sandbox",
+        "about:blank",
+    ]
+
+    logger.info(f"[_resolve_via_headless_browser] Launching headless browser on port {port}...")
+    proc = subprocess.Popen(chrome_args, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    try:
+        await asyncio.sleep(1.2)
+        raw_cookie = get_terabox_cookie()
+        cdp_cookies = parse_raw_cookies_for_cdp(raw_cookie)
+
+        connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            ws_url = None
+            for _ in range(12):
+                try:
+                    async with session.get(f"http://127.0.0.1:{port}/json/list") as resp:
+                        if resp.status == 200:
+                            tabs = await resp.json(content_type=None)
+                            for t in tabs:
+                                if t.get("type") == "page" and t.get("webSocketDebuggerUrl"):
+                                    ws_url = t.get("webSocketDebuggerUrl")
+                                    break
+                            if ws_url:
+                                break
+                except Exception:
+                    await asyncio.sleep(0.3)
+
+            if not ws_url:
+                return False, {}, "Could not connect to headless Chrome DevTools."
+
+            async with session.ws_connect(ws_url, timeout=aiohttp.ClientTimeout(total=timeout_sec)) as ws:
+                await ws.send_json({"id": 1, "method": "Network.enable", "params": {}})
+                await ws.send_json({"id": 2, "method": "Page.enable", "params": {}})
+                await ws.send_json({"id": 3, "method": "Runtime.enable", "params": {}})
+                await ws.send_json({"id": 4, "method": "Browser.setDownloadBehavior", "params": {
+                    "behavior": "allowAndName",
+                    "downloadPath": temp_dir,
+                    "eventsEnabled": True,
+                }})
+                if cdp_cookies:
+                    await ws.send_json({"id": 5, "method": "Network.setCookies", "params": {"cookies": cdp_cookies}})
+                    logger.info(f"[_resolve_via_headless_browser] Injected {len(cdp_cookies)} cookies into headless browser")
+
+                logger.info(f"[_resolve_via_headless_browser] Navigating page to {url}...")
+                await ws.send_json({"id": 6, "method": "Page.navigate", "params": {"url": url}})
+
+                play_url = None
+                title = "TeraBox_Video"
+                thumbnail = None
+                start_t = time.time()
+
+                # Trigger button click asynchronously after 3.5s using exact DevTools selectors
+                async def _click_download_button():
+                    await asyncio.sleep(3.5)
+                    click_js = """(() => {
+                        const selectors = [
+                            '.operate-row button.download-btn',
+                            'button.download-btn',
+                            'button.download-btn > span',
+                            '.download-btn',
+                        ];
+                        let btn = null;
+                        for (const sel of selectors) {
+                            btn = document.querySelector(sel);
+                            if (btn) break;
+                        }
+                        if (!btn) {
+                            btn = Array.from(document.querySelectorAll('button, a, div, span')).find(el => {
+                                const t = (el.innerText || '').trim().toLowerCase();
+                                const c = (el.className || '');
+                                return t === 'download' || t === 'download video' || c.includes('download-btn');
+                            });
+                        }
+                        if (btn) {
+                            if (btn.scrollIntoView) btn.scrollIntoView({ block: 'center', inline: 'center' });
+                            btn.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+                            btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                            btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                            btn.click();
+                            return { success: true, text: btn.innerText, tag: btn.tagName, class: btn.className };
+                        }
+                        return { success: false, reason: 'Button not found' };
+                    })()"""
+                    await ws.send_json({"id": 50, "method": "Runtime.evaluate", "params": {"expression": click_js, "returnByValue": True}})
+
+                asyncio.create_task(_click_download_button())
+
+                while time.time() - start_t < timeout_sec:
+                    try:
+                        msg = await asyncio.wait_for(ws.receive(), timeout=0.8)
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            data = json.loads(msg.data)
+                            method = data.get("method", "")
+
+                            if method == "Network.requestWillBeSent":
+                                req_url = data.get("params", {}).get("request", {}).get("url", "")
+                                if "ddata.terabox.app" in req_url or "-ddata." in req_url:
+                                    play_url = req_url
+                                    logger.info(f"[_resolve_via_headless_browser] Intercepted final CDN kul-ddata URL: {play_url[:80]}...")
+                                    break
+                                elif "d.terabox" in req_url or "d3.terabox" in req_url or "/file/" in req_url:
+                                    play_url = req_url
+                                    logger.info(f"[_resolve_via_headless_browser] Intercepted gateway download URL: {play_url[:80]}...")
+                                elif "/share/streaming?" in req_url and ("fid=" in req_url or "sign=" in req_url):
+                                    if not play_url:
+                                        play_url = req_url
+                                    logger.info(f"[_resolve_via_headless_browser] Intercepted streaming request: {req_url[:80]}...")
+
+                            elif method == "Browser.downloadWillBegin":
+                                dl_url = data.get("params", {}).get("url", "")
+                                guid = data.get("params", {}).get("guid")
+                                if guid:
+                                    try:
+                                        await ws.send_json({"id": 99, "method": "Browser.cancelDownload", "params": {"guid": guid}})
+                                    except Exception:
+                                        pass
+                                if dl_url:
+                                    play_url = dl_url
+                                    logger.info(f"[_resolve_via_headless_browser] Browser download event URL: {play_url[:80]}...")
+                                    if "ddata" in dl_url or "-ddata." in dl_url:
+                                        break
+
+                            elif method == "Network.responseReceived":
+                                resp = data.get("params", {}).get("response", {})
+                                resp_url = resp.get("url", "")
+                                headers = resp.get("headers", {})
+                                location = headers.get("location") or headers.get("Location")
+                                if location and ("ddata" in location or "-ddata." in location):
+                                    play_url = location
+                                    logger.info(f"[_resolve_via_headless_browser] 🚀 Captured 302 Location redirect -> {play_url[:80]}...")
+                                    break
+                                elif "ddata.terabox.app" in resp_url or "-ddata." in resp_url:
+                                    play_url = resp_url
+                                    logger.info(f"[_resolve_via_headless_browser] Intercepted kul-ddata response: {play_url[:80]}...")
+                                    break
+                    except asyncio.TimeoutError:
+                        pass
+
+                # Extract page metadata via DOM
+                eval_meta = """(() => {
+                    return {
+                        title: document.title.replace(' - Share Files Online & Send Larges Files with TeraBox', '').trim(),
+                        thumb: (document.querySelector('video') || {}).poster || null
+                    };
+                })()"""
+                await ws.send_json({"id": 60, "method": "Runtime.evaluate", "params": {"expression": eval_meta, "returnByValue": True}})
+                for _ in range(3):
+                    try:
+                        m = await asyncio.wait_for(ws.receive(), timeout=1.0)
+                        if m.type == aiohttp.WSMsgType.TEXT:
+                            d = json.loads(m.data)
+                            if d.get("id") == 60:
+                                val = d.get("result", {}).get("result", {}).get("value", {})
+                                if val.get("title"):
+                                    title = val["title"]
+                                thumbnail = val.get("thumb")
+                                break
+                    except Exception:
+                        break
+
+                if play_url:
+                    logger.info(f"[_resolve_via_headless_browser] 🎉 Headless browser resolution SUCCESS: '{title}'")
+                    return True, {
+                        "id": "tb_" + str(int(time.time())),
+                        "title": title,
+                        "thumbnail": thumbnail,
+                        "uploader": "TeraBox",
+                        "play_url": play_url,
+                        "original_url": url,
+                        "duration": None,
+                        "formats": [],
+                        "engine": "headless_browser",
+                    }, None
+
+                return False, {}, "Headless browser could not intercept video stream URL."
+
+    except Exception as e:
+        logger.error(f"[_resolve_via_headless_browser] Error: {e}", exc_info=True)
+        return False, {}, f"Headless browser error: {e}"
+    finally:
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 async def _resolve_via_hostinger(url: str) -> Tuple[bool, Dict[str, Any], Optional[str]]:
@@ -339,11 +626,26 @@ async def extract_terabox_info(
 ) -> Tuple[bool, Dict[str, Any], Optional[str]]:
     """
     Fetches video metadata and CDN play URL.
-    1. Primary Engine: Cookie-based Gateway architecture.
-    2. Fallback / Backup Engine: Hostinger resolver API.
-    3. Interactive HITL Remote Browser Solver: If CAPTCHA is required and Browserless is configured.
+    1. Priority Engine: Local Headless Chromium Crawler with user cookies.
+    2. Secondary Engine: Cookie & Gateway REST architecture.
+    3. Backup Engine: Hostinger resolver API.
+    4. Interactive HITL Remote Browser Solver: If CAPTCHA is required.
     """
-    # 1. Primary Engine (Cookie & Gateway Architecture)
+    if progress_updater:
+        try:
+            await progress_updater("🌐 Connecting to TeraBox via browser engine...")
+        except Exception:
+            pass
+
+    # 1. Primary Engine (Local Headless Chromium Engine)
+    hl_success, hl_info, hl_err = await _resolve_via_headless_browser(url, timeout_sec=15)
+    if hl_success and hl_info:
+        logger.info("TeraBox link resolved successfully via headless browser engine.")
+        return True, hl_info, None
+
+    logger.info(f"Headless browser resolver unavailable ({hl_err}). Trying Gateway REST engine...")
+
+    # 2. Secondary Engine (Cookie & Gateway Architecture)
     gw_success, gw_info, gw_err = await _resolve_via_gateway(url)
     if gw_success and gw_info:
         logger.info("TeraBox link resolved successfully via primary Cookie/Gateway engine.")
@@ -351,7 +653,7 @@ async def extract_terabox_info(
 
     logger.info(f"Primary Cookie/Gateway resolver unavailable ({gw_err}). Engaging Hostinger backup resolver...")
 
-    # 2. Backup Engine (Hostinger API)
+    # 3. Backup Engine (Hostinger API)
     err = None
     for attempt in range(1, max_retries + 1):
         success, info, err = await _resolve_via_hostinger(url)
@@ -361,46 +663,136 @@ async def extract_terabox_info(
         if "try again" in str(err).lower() and attempt < max_retries:
             await asyncio.sleep(2.5)
             continue
-        break
-
-    # 3. Interactive HITL Remote Browser Solver (if Browserless Docker is running)
-    if is_browserless_configured() and notify_admin_callback:
-        logger.info("Engaging Interactive Remote Browser CAPTCHA solver...")
-        raw_cookie = get_terabox_cookie()
-        solved, new_cookie, captcha_err = await solve_terabox_captcha_interactive(
-            target_url=url,
-            initial_cookie=raw_cookie,
-            notify_admin_callback=notify_admin_callback,
-            progress_updater=progress_updater,
-        )
-        if solved:
-            logger.info("CAPTCHA resolved! Re-attempting primary resolution with new session...")
-            # Retry 1: Cookie Gateway
-            retry_success, retry_info, retry_err = await _resolve_via_gateway(url)
-            if retry_success and retry_info:
-                return True, retry_info, None
-            logger.warning(f"Re-resolution via Gateway failed ({retry_err}). Re-attempting Hostinger backup...")
-
-            # Retry 2: Hostinger backup
-            h_success, h_info, h_err = await _resolve_via_hostinger(url)
-            if h_success and h_info:
-                return True, h_info, None
-            logger.error(f"Re-resolution via Hostinger after CAPTCHA solve also failed: {h_err}")
-        else:
-            logger.error(f"Interactive CAPTCHA solver failed: {captcha_err}")
-
     raw_cookie = get_terabox_cookie()
     cookie_status = f"✅ Present ({len(raw_cookie)} chars)" if raw_cookie else "⚠️ None (cooky/terabox/cookies.txt missing)"
 
     full_error_report = (
         f"❌ **TeraBox Resolution Failed**\n\n"
         f"🔐 **Cookie Status:** {cookie_status}\n\n"
-        f"🌐 **Primary Gateway Responses:**\n{gw_err}\n\n"
+        f"🌐 **Headless Browser Engine:**\n• {hl_err}\n\n"
+        f"📡 **Gateway Responses:**\n{gw_err}\n\n"
         f"🔄 **Backup Hostinger API:**\n• {err}"
     )
 
     logger.error(f"[extract_terabox_info] Complete failure report:\n{full_error_report}")
     return False, {}, full_error_report
+
+
+async def _download_via_node_crawler(
+    url: str,
+    output_dir: Path,
+    download_id: str,
+    progress_updater: Optional[Callable[[str], None]] = None,
+) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Priority Downloader Engine: Spawns Node.js Puppeteer Stealth Crawler in Xvfb GUI.
+    Downloads the file directly to output_dir and emits real-time progress.
+    """
+    node_bin = shutil.which("node")
+    if not node_bin:
+        return False, None, None, "Node.js is not installed on the system."
+
+    crawler_script = BASE_DIR / "terabox_crawler.js"
+    if not crawler_script.exists():
+        return False, None, None, f"Crawler script not found at: {crawler_script}"
+
+    env = os.environ.copy()
+    if "DISPLAY" not in env:
+        env["DISPLAY"] = ":99"
+
+    cmd = [
+        node_bin,
+        str(crawler_script),
+        url,
+        str(output_dir),
+        download_id,
+    ]
+
+    logger.info(f"[_download_via_node_crawler] Spawning crawler: {' '.join(cmd)}")
+    if progress_updater:
+        try:
+            await progress_updater("🚀 Launching Stealth Browser Engine...")
+        except Exception:
+            pass
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+
+        last_json_line = None
+        last_progress_time = 0
+
+        while True:
+            line_bytes = await proc.stdout.readline()
+            if not line_bytes:
+                break
+            line = line_bytes.decode("utf-8", errors="ignore").strip()
+            if not line:
+                continue
+
+            logger.info(f"[Crawler Output] {line}")
+
+            now = time.time()
+            if line.startswith("[STATUS]"):
+                status_text = line.replace("[STATUS]", "").strip()
+                if progress_updater and (now - last_progress_time > 2.0):
+                    last_progress_time = now
+                    try:
+                        await progress_updater(f"🌐 {status_text}")
+                    except Exception:
+                        pass
+
+            elif line.startswith("[PROGRESS]"):
+                prog_text = line.replace("[PROGRESS]", "").strip()
+                if progress_updater and (now - last_progress_time > 2.0):
+                    last_progress_time = now
+                    try:
+                        await progress_updater(f"📥 {prog_text}")
+                    except Exception:
+                        pass
+
+            elif line.startswith("{") and line.endswith("}"):
+                last_json_line = line
+
+        stderr_bytes = await proc.stderr.read()
+        return_code = await proc.wait()
+
+        if return_code == 0 and last_json_line:
+            try:
+                data = json.loads(last_json_line)
+                if data.get("success"):
+                    filepath = data.get("filepath")
+                    if filepath and os.path.exists(filepath):
+                        info_dict = {
+                            "id": download_id,
+                            "title": data.get("title") or Path(filepath).name,
+                            "thumbnail": data.get("thumbnail"),
+                            "uploader": "TeraBox",
+                            "filesize": data.get("filesize"),
+                            "engine": "puppeteer_stealth_xvfb",
+                        }
+                        logger.info(f"[_download_via_node_crawler] 🎉 Success: {filepath} ({info_dict['title']})")
+                        return True, filepath, info_dict, None
+            except Exception as parse_ex:
+                logger.error(f"Error parsing crawler output JSON: {parse_ex}")
+
+        err_msg = stderr_bytes.decode("utf-8", errors="ignore").strip()
+        if last_json_line:
+            try:
+                err_data = json.loads(last_json_line)
+                if err_data.get("error"):
+                    err_msg = err_data["error"]
+            except Exception:
+                pass
+        return False, None, None, err_msg or "Crawler download failed or timed out."
+
+    except Exception as e:
+        logger.error(f"[_download_via_node_crawler] Exception: {e}", exc_info=True)
+        return False, None, None, str(e)
 
 
 async def download_terabox_media(
@@ -412,21 +804,51 @@ async def download_terabox_media(
     progress_updater: Optional[Callable[[str], None]] = None,
 ) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]], Optional[str]]:
     """
-    Downloads TeraBox stream (m3u8 or mp4) obtained from the resolver API.
+    Downloads TeraBox media directly to disk.
+    Priority 1: Node.js Puppeteer Stealth Xvfb Crawler (Direct file download).
+    Priority 2: Headless Stream URL Extractor + yt-dlp.
+    Priority 3: Gateway / Hostinger Backup.
     Returns (success, file_path, info_dict, error_message).
     """
-    # 1. Resolve CDN play URL
+    download_id = uuid.uuid4().hex[:8]
+
+    # 1. Priority Engine: Node.js Puppeteer Stealth Crawler in Xvfb GUI
+    crawler_success, crawler_file, crawler_info, crawler_err = await _download_via_node_crawler(
+        url=url,
+        output_dir=DOWNLOAD_DIR,
+        download_id=download_id,
+        progress_updater=progress_updater,
+    )
+    if crawler_success and crawler_file:
+        logger.info("TeraBox media downloaded successfully via Node.js Puppeteer Stealth Crawler!")
+        return True, crawler_file, crawler_info, None
+
+    logger.warning(f"Node.js Crawler unavailable or failed ({crawler_err}). Falling back to stream URL extraction...")
+
+    # 2. Fallback: Resolve CDN play URL
     success, info, err = await extract_terabox_info(
         url,
         notify_admin_callback=notify_admin_callback,
         progress_updater=progress_updater,
     )
     if not success or not info or "play_url" not in info:
-        return False, None, None, err or "Could not retrieve TeraBox stream URL."
+        return False, None, None, err or crawler_err or "Could not download TeraBox media."
 
     play_url = info["play_url"]
-    download_id = uuid.uuid4().hex[:8]
     output_template = str(DOWNLOAD_DIR / f"tera_{download_id}_%(title).100B.%(ext)s")
+
+    raw_cookie = get_terabox_cookie()
+    cookie_header = format_cookie_header(raw_cookie)
+    surl = extract_surl(url)
+    referer_url = f"https://www.terabox.app/sharing/link?surl={surl}" if surl else url
+
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Referer': referer_url,
+        'Origin': 'https://www.terabox.app',
+    }
+    if cookie_header:
+        headers['Cookie'] = cookie_header
 
     def _download():
         opts = {
@@ -445,10 +867,7 @@ async def download_terabox_media(
             'keep_fragments': False,
             'buffersize': 1024 * 1024 * 8,
             'postprocessor_args': ['-movflags', '+faststart'],
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                'Referer': 'https://www.terabox.com/',
-            },
+            'http_headers': headers,
         }
 
         if progress_hook:

@@ -758,6 +758,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         ACTIVE_TASKS[task_id] = asyncio.current_task()
 
+        # For TeraBox links: Run unified Crawler download directly
+        if is_terabox_url(url):
+            async with get_semaphore():
+                success, downloaded_file, dl_info, error_msg = await route_download_media(
+                    url,
+                    quality="best",
+                    progress_updater=lambda txt: edit_status_msg_safe(status_msg, txt),
+                )
+                if success and downloaded_file and os.path.exists(downloaded_file):
+                    file_size = os.path.getsize(downloaded_file)
+                    try:
+                        await status_msg.edit_text(
+                            f"📤 **Uploading {format_bytes(file_size)} to Telegram...**",
+                            parse_mode=constants.ParseMode.MARKDOWN,
+                        )
+                    except Exception:
+                        pass
+
+                    tb_title = dl_info.get("title") if dl_info else Path(downloaded_file).name
+                    await send_media_to_chat(
+                        bot=context.bot,
+                        chat_id=update.effective_chat.id,
+                        file_path=downloaded_file,
+                        title=tb_title,
+                        uploader=dl_info.get("uploader", "TeraBox") if dl_info else "TeraBox",
+                        duration_sec=None,
+                        url=url,
+                        quality="best",
+                        info=dl_info,
+                        progress_status_updater=lambda txt: edit_status_msg_safe(status_msg, txt),
+                    )
+                    try:
+                        await status_msg.delete()
+                    except Exception:
+                        pass
+                    return
+                else:
+                    err = error_msg or "TeraBox download failed."
+                    logger.error(f"[handle_message] TeraBox failed: {err}")
+                    await edit_status_msg_safe(status_msg, f"❌ **TeraBox Download Failed**\n\n```\n{err}\n```")
+                    return
+
         # Extract metadata without downloading (routed to dedicated engine)
         success, info, error_msg = await route_extract_info(
             url,
