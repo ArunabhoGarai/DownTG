@@ -105,20 +105,27 @@ async def _resolve_via_hostinger(url: str) -> Tuple[bool, Dict[str, Any], Option
         client_timeout = aiohttp.ClientTimeout(total=45, connect=10)
         async with aiohttp.ClientSession(connector=connector, headers=headers, timeout=client_timeout) as session:
             async with session.get(target_api) as resp:
-                if resp.status != 200:
-                    return False, {}, f"Hostinger API returned HTTP {resp.status}"
+                resp_text = await resp.text()
+                logger.info(f"[_resolve_via_hostinger] HTTP {resp.status} | Body: {resp_text[:300]}")
 
-                data = await resp.json(content_type=None)
+                if resp.status != 200:
+                    return False, {}, f"HTTP {resp.status}: {resp_text[:150]}"
+
+                try:
+                    data = json.loads(resp_text)
+                except Exception:
+                    return False, {}, f"Non-JSON response: {resp_text[:150]}"
+
                 if not data or not isinstance(data, dict):
-                    return False, {}, "Invalid response from Hostinger resolver."
+                    return False, {}, "Invalid response format from Hostinger resolver."
 
                 if not data.get("success"):
-                    msg = data.get("message") or data.get("error") or "Unknown error"
+                    msg = data.get("message") or data.get("error") or resp_text[:150]
                     return False, {}, msg
 
                 play_url = data.get("play_url")
                 if not play_url:
-                    return False, {}, "No play_url in Hostinger response"
+                    return False, {}, f"No play_url in response: {resp_text[:150]}"
 
                 return True, {
                     "id": uuid.uuid4().hex[:8],
@@ -132,6 +139,7 @@ async def _resolve_via_hostinger(url: str) -> Tuple[bool, Dict[str, Any], Option
                     "engine": "hostinger",
                 }, None
     except Exception as e:
+        logger.error(f"[_resolve_via_hostinger] Exception: {e}", exc_info=True)
         return False, {}, str(e)
 
 
@@ -145,6 +153,11 @@ async def _resolve_via_gateway(url: str) -> Tuple[bool, Dict[str, Any], Optional
     raw_cookie = get_terabox_cookie()
     cookie_header = format_cookie_header(raw_cookie)
 
+    logger.info(f"[_resolve_via_gateway] Starting resolution for surl={surl}")
+    logger.info(f"[_resolve_via_gateway] Loaded cookie len={len(raw_cookie) if raw_cookie else 0}, header preview: {cookie_header[:80] if cookie_header else 'NONE'}")
+
+    diag_logs = []
+
     # Candidate endpoints to query
     endpoints = []
 
@@ -152,8 +165,12 @@ async def _resolve_via_gateway(url: str) -> Tuple[bool, Dict[str, Any], Optional
     if surl and cookie_header:
         endpoints.append(f"https://www.1024terabox.com/share/list?app_id=250528&shorturl={surl}&root=1")
         endpoints.append(f"https://www.terabox.app/share/list?app_id=250528&shorturl={surl}&root=1")
+        endpoints.append(f"https://www.1024terabox.com/share/list?app_id=250528&shorturl=1{surl}&root=1")
+        endpoints.append(f"https://www.terabox.app/share/list?app_id=250528&shorturl=1{surl}&root=1")
         endpoints.append(f"https://www.1024terabox.com/api/shorturlinfo?shorturl={surl}&root=1")
         endpoints.append(f"https://teraboxapp.com/api/shorturlinfo?shorturl={surl}&root=1")
+    elif not cookie_header:
+        diag_logs.append("No active cookies found in cooky/terabox/cookies.txt")
 
     # 2. Custom gateway instance from .env
     if custom_gateway:
@@ -166,9 +183,12 @@ async def _resolve_via_gateway(url: str) -> Tuple[bool, Dict[str, Any], Optional
     endpoints.append(f"https://terabox-dl.qtcloud.workers.dev/api/get-info?url={encoded_url}")
     endpoints.append(f"https://terabox-videodownloader.online/api/info?url={encoded_url}")
 
+    referer_url = f"https://www.terabox.app/sharing/link?surl={surl}" if surl else url
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         'Accept': 'application/json, text/plain, */*',
+        'Referer': referer_url,
+        'Origin': 'https://www.terabox.app',
     }
     if cookie_header:
         headers['Cookie'] = cookie_header
@@ -178,12 +198,25 @@ async def _resolve_via_gateway(url: str) -> Tuple[bool, Dict[str, Any], Optional
 
     for ep in endpoints:
         try:
+            parsed_ep = urllib.parse.urlparse(ep)
+            ep_label = f"{parsed_ep.netloc}{parsed_ep.path}"
             async with aiohttp.ClientSession(connector=connector, headers=headers, timeout=client_timeout) as session:
                 async with session.get(ep) as resp:
+                    resp_text = await resp.text()
+                    logger.info(f"[_resolve_via_gateway] {ep_label} -> HTTP {resp.status} | Body: {resp_text[:300]}")
+
                     if resp.status != 200:
+                        diag_logs.append(f"{ep_label}: HTTP {resp.status}")
                         continue
-                    data = await resp.json(content_type=None)
+
+                    try:
+                        data = json.loads(resp_text)
+                    except Exception:
+                        diag_logs.append(f"{ep_label}: invalid JSON ({resp_text[:80]})")
+                        continue
+
                     if not data:
+                        diag_logs.append(f"{ep_label}: empty JSON")
                         continue
 
                     # Handle list of files format from terabox-gateway
@@ -191,6 +224,7 @@ async def _resolve_via_gateway(url: str) -> Tuple[bool, Dict[str, Any], Optional
                         first = data[0]
                         dlink = first.get("download_link") or first.get("direct_link") or first.get("link")
                         if dlink:
+                            logger.info(f"[_resolve_via_gateway] Success via gateway list: {dlink[:60]}")
                             return True, {
                                 "id": uuid.uuid4().hex[:8],
                                 "title": first.get("filename") or "TeraBox_Video",
@@ -205,6 +239,13 @@ async def _resolve_via_gateway(url: str) -> Tuple[bool, Dict[str, Any], Optional
 
                     # Handle dictionary response
                     if isinstance(data, dict):
+                        errno = data.get("errno")
+                        errmsg = data.get("errmsg") or data.get("msg") or data.get("message") or ""
+                        if errno not in (None, 0):
+                            logger.warning(f"[_resolve_via_gateway] {ep_label} returned errno: {errno} ({errmsg})")
+                            diag_logs.append(f"{ep_label}: errno={errno} ({errmsg or 'error'})")
+                            continue
+
                         # Format 1: direct link / dlink / stream_url / play_url
                         play_url = (
                             data.get("play_url")
@@ -214,17 +255,48 @@ async def _resolve_via_gateway(url: str) -> Tuple[bool, Dict[str, Any], Optional
                             or data.get("stream_url")
                             or data.get("fast_download_link")
                         )
-                        # Format 2: nested list or response
-                        if not play_url and "list" in data and isinstance(data["list"], list) and len(data["list"]) > 0:
+                        title = data.get("title") or data.get("filename") or "TeraBox_Video"
+                        thumb = data.get("thumbnail") or data.get("thumb")
+
+                        # Format 2: nested list from official /share/list
+                        if "list" in data and isinstance(data["list"], list) and len(data["list"]) > 0:
                             item = data["list"][0]
-                            play_url = item.get("dlink") or item.get("direct_link") or item.get("download_link")
-                            title = item.get("server_filename") or item.get("filename") or "TeraBox_Video"
-                            thumb = (item.get("thumbs") or {}).get("url3") or item.get("thumbnail")
-                        else:
-                            title = data.get("title") or data.get("filename") or "TeraBox_Video"
-                            thumb = data.get("thumbnail") or data.get("thumb")
+                            title = item.get("server_filename") or item.get("filename") or title
+                            thumb = (item.get("thumbs") or {}).get("url3") or item.get("thumbnail") or thumb
+                            play_url = play_url or item.get("dlink") or item.get("direct_link") or item.get("download_link")
+
+                            # If no dlink in share/list, attempt step-2 /share/download API call
+                            if not play_url and item.get("fs_id") and data.get("shareid") and data.get("uk"):
+                                try:
+                                    fs_id = item["fs_id"]
+                                    shareid = data["shareid"]
+                                    uk = data["uk"]
+                                    sign = data.get("sign", "")
+                                    timestamp = data.get("timestamp", int(time.time()))
+                                    jsToken = data.get("jsToken", "")
+                                    dl_ep = (
+                                        f"https://www.terabox.app/share/download?"
+                                        f"app_id=250528&web=1&channel=dubox&clienttype=0"
+                                        f"&jsToken={jsToken}&shareid={shareid}&uk={uk}&sign={sign}&timestamp={timestamp}"
+                                        f"&primaryid={shareid}&fid_list=[{fs_id}]"
+                                    )
+                                    logger.info(f"[_resolve_via_gateway] Attempting 2-step /share/download for fs_id={fs_id}")
+                                    async with session.get(dl_ep) as dl_resp:
+                                        dl_text = await dl_resp.text()
+                                        logger.info(f"[_resolve_via_gateway] Step-2 dl_ep -> HTTP {dl_resp.status} | Body: {dl_text[:300]}")
+                                        if dl_resp.status == 200:
+                                            dl_data = json.loads(dl_text)
+                                            if dl_data and dl_data.get("errno") == 0:
+                                                play_url = dl_data.get("dlink")
+                                                logger.info(f"[_resolve_via_gateway] Step-2 download succeeded: {bool(play_url)}")
+                                            else:
+                                                diag_logs.append(f"share/download: errno={dl_data.get('errno')} ({dl_data.get('errmsg', '')})")
+                                except Exception as dl_err:
+                                    logger.warning(f"[_resolve_via_gateway] Step-2 download error: {dl_err}")
+                                    diag_logs.append(f"share/download exception: {dl_err}")
 
                         if play_url:
+                            logger.info(f"[_resolve_via_gateway] Successfully extracted play_url: {play_url[:60]}...")
                             return True, {
                                 "id": uuid.uuid4().hex[:8],
                                 "title": title,
@@ -236,11 +308,15 @@ async def _resolve_via_gateway(url: str) -> Tuple[bool, Dict[str, Any], Optional
                                 "formats": [],
                                 "engine": "cookie_gateway",
                             }, None
+                        else:
+                            diag_logs.append(f"{ep_label}: no play_url in response ({resp_text[:100]})")
         except Exception as e:
             logger.debug(f"Gateway endpoint {ep} failed: {e}")
+            diag_logs.append(f"{ep_label}: {e}")
             continue
 
-    return False, {}, "Could not resolve link via primary Cookie/Gateway architecture."
+    summary = "\n• ".join(diag_logs[:4]) if diag_logs else "All endpoints returned empty or failed"
+    return False, {}, f"• {summary}"
 
 
 from browser_verifier import (
@@ -293,20 +369,32 @@ async def extract_terabox_info(
         )
         if solved:
             logger.info("CAPTCHA resolved! Re-attempting primary resolution with new session...")
+            # Retry 1: Cookie Gateway
             retry_success, retry_info, retry_err = await _resolve_via_gateway(url)
             if retry_success and retry_info:
                 return True, retry_info, None
-            else:
-                logger.error(f"Re-resolution after CAPTCHA solve failed: {retry_err}")
+            logger.warning(f"Re-resolution via Gateway failed ({retry_err}). Re-attempting Hostinger backup...")
+
+            # Retry 2: Hostinger backup
+            h_success, h_info, h_err = await _resolve_via_hostinger(url)
+            if h_success and h_info:
+                return True, h_info, None
+            logger.error(f"Re-resolution via Hostinger after CAPTCHA solve also failed: {h_err}")
         else:
             logger.error(f"Interactive CAPTCHA solver failed: {captcha_err}")
-    else:
-        logger.warning(
-            f"Browserless solver bypassed: is_browserless_configured={is_browserless_configured()}, "
-            f"has_notify_admin_callback={bool(notify_admin_callback)}"
-        )
 
-    return False, {}, f"TeraBox Resolution Failed: Primary Cookie/Gateway ({gw_err}) | Backup Hostinger ({err})"
+    raw_cookie = get_terabox_cookie()
+    cookie_status = f"✅ Present ({len(raw_cookie)} chars)" if raw_cookie else "⚠️ None (cooky/terabox/cookies.txt missing)"
+
+    full_error_report = (
+        f"❌ **TeraBox Resolution Failed**\n\n"
+        f"🔐 **Cookie Status:** {cookie_status}\n\n"
+        f"🌐 **Primary Gateway Responses:**\n{gw_err}\n\n"
+        f"🔄 **Backup Hostinger API:**\n• {err}"
+    )
+
+    logger.error(f"[extract_terabox_info] Complete failure report:\n{full_error_report}")
+    return False, {}, full_error_report
 
 
 async def download_terabox_media(

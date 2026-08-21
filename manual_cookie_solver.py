@@ -5,20 +5,22 @@ Manual TeraBox CAPTCHA & Cookie Solver (Xvfb + noVNC Web Desktop)
 Runs on your Ubuntu EC2 server. Launches a full virtual desktop with Chrome,
 serves a web-accessible noVNC viewer in your browser, lets you log in / solve
 the CAPTCHA on your server's own IP address, and automatically exports the
-valid Netscape session cookies to cooky/terabox/cookies.txt.
+valid Netscape session cookies directly from Chromium memory to cooky/terabox/cookies.txt.
 
 Usage on EC2:
-    python scripts/manual_cookie_solver.py
+    python3 scripts/manual_cookie_solver.py
 """
 
 import os
 import sys
 import time
+import json
 import shutil
-import sqlite3
+import asyncio
 import subprocess
-import signal
 from pathlib import Path
+
+import aiohttp
 
 # Add project root to sys.path
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -44,71 +46,94 @@ def find_chrome_binary():
     return None
 
 
-def export_sqlite_cookies(profile_dir: Path, output_file: Path):
-    """Reads Chromium's SQLite cookie database and exports to standard Netscape cookies.txt."""
-    possible_dbs = [
-        profile_dir / "Default" / "Network" / "Cookies",
-        profile_dir / "Default" / "Cookies",
-        profile_dir / "Cookies",
+def cookies_to_netscape(cookies: list) -> str:
+    lines = [
+        "# Netscape HTTP Cookie File",
+        "# Generated automatically after manual login",
+        "",
     ]
-    db_path = None
-    for p in possible_dbs:
-        if p.exists() and p.is_file():
-            db_path = p
-            break
+    for c in cookies:
+        domain = c.get("domain", ".terabox.app")
+        include_sub = "TRUE" if domain.startswith(".") else "FALSE"
+        path = c.get("path", "/")
+        secure = "TRUE" if c.get("secure", False) else "FALSE"
+        expires = int(c.get("expires", 0)) if c.get("expires") else 2147483647
+        name, value = c.get("name", ""), c.get("value", "")
+        if name and value:
+            lines.append(f"{domain}\t{include_sub}\t{path}\t{secure}\t{expires}\t{name}\t{value}")
+    return "\n".join(lines)
 
-    if not db_path:
-        print(f"⚠️  Could not locate Chromium Cookies DB in {profile_dir}")
-        return False
 
-    temp_copy = profile_dir / "temp_cookies.db"
-    try:
-        shutil.copy2(db_path, temp_copy)
-        conn = sqlite3.connect(temp_copy)
-        cursor = conn.cursor()
+async def extract_cdp_cookies(debug_port: int = 9222) -> list:
+    """Extracts 100% decrypted, valid session cookies directly from running Chrome via CDP."""
+    connector = aiohttp.TCPConnector(ssl=False)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        # Get tab list
+        ws_url = None
+        try:
+            async with session.get(f"http://127.0.0.1:{debug_port}/json/list") as resp:
+                if resp.status == 200:
+                    tabs = await resp.json(content_type=None)
+                    for t in tabs:
+                        if t.get("type") == "page" and t.get("webSocketDebuggerUrl"):
+                            ws_url = t.get("webSocketDebuggerUrl")
+                            break
+                    if not ws_url and tabs:
+                        ws_url = tabs[0].get("webSocketDebuggerUrl")
+        except Exception as e:
+            print(f"⚠️  Could not connect to Chrome debug port HTTP: {e}")
+            return []
 
-        cursor.execute("SELECT host_key, path, is_secure, expires_utc, name, value, encrypted_value FROM cookies WHERE host_key LIKE '%terabox%' OR host_key LIKE '%1024tera%'")
-        rows = cursor.fetchall()
-        conn.close()
+        if not ws_url:
+            print("⚠️  No active page WebSocket found in Chrome.")
+            return []
 
-        lines = [
-            "# Netscape HTTP Cookie File",
-            "# Exported from manual Ubuntu browser session",
-            "",
-        ]
+        print(f"🔌 Connecting to Chrome DevTools WebSocket...")
+        cookies = []
+        try:
+            async with session.ws_connect(ws_url, timeout=aiohttp.ClientTimeout(total=10)) as ws:
+                # 1. Storage.getCookies
+                await ws.send_json({"id": 1, "method": "Storage.getCookies", "params": {}})
+                for _ in range(8):
+                    try:
+                        msg = await asyncio.wait_for(ws.receive(), timeout=1.5)
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            data = json.loads(msg.data)
+                            if data.get("id") == 1 and "result" in data:
+                                cookies = data["result"].get("cookies", [])
+                                if cookies:
+                                    break
+                    except Exception:
+                        break
 
-        for host_key, path, is_secure, expires_utc, name, value, enc_value in rows:
-            include_sub = "TRUE" if host_key.startswith(".") else "FALSE"
-            secure_str = "TRUE" if is_secure else "FALSE"
-            # Chromium epoch to unix epoch
-            exp_unix = int((expires_utc / 1000000) - 11644473600) if expires_utc > 0 else 2147483647
-            val = value
-            # On Linux if unencrypted value is present
-            if not val and enc_value:
-                # Try simple string decode or fallback
-                try:
-                    val = enc_value.decode('utf-8', errors='ignore')
-                except Exception:
-                    val = str(enc_value)
+                # 2. Network.getCookies
+                if not cookies:
+                    await ws.send_json({"id": 2, "method": "Network.enable", "params": {}})
+                    await ws.send_json({
+                        "id": 3,
+                        "method": "Network.getCookies",
+                        "params": {"urls": [
+                            "https://www.1024terabox.com",
+                            "https://www.terabox.app",
+                            "https://terabox.com",
+                            "https://1024tera.com",
+                        ]},
+                    })
+                    for _ in range(8):
+                        try:
+                            msg = await asyncio.wait_for(ws.receive(), timeout=1.5)
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                data = json.loads(msg.data)
+                                if data.get("id") == 3 and "result" in data:
+                                    cookies = data["result"].get("cookies", [])
+                                    if cookies:
+                                        break
+                        except Exception:
+                            break
+        except Exception as ws_err:
+            print(f"⚠️  WebSocket error: {ws_err}")
 
-            if val:
-                lines.append(f"{host_key}\t{include_sub}\t{path}\t{secure_str}\t{exp_unix}\t{name}\t{val}")
-
-        if len(lines) > 3:
-            output_file.parent.mkdir(parents=True, exist_ok=True)
-            output_file.write_text("\n".join(lines), encoding="utf-8")
-            print(f"🎉 Successfully exported {len(rows)} cookies to: {output_file}")
-            return True
-        else:
-            print("⚠️  No TeraBox cookies found in SQLite database.")
-            return False
-
-    except Exception as e:
-        print(f"❌ Error reading cookies SQLite DB: {e}")
-        return False
-    finally:
-        if temp_copy.exists():
-            temp_copy.unlink()
+        return cookies
 
 
 def main():
@@ -121,7 +146,6 @@ def main():
     print("🧩 TeraBox Manual CAPTCHA & Cookie Solver (Xvfb + noVNC)")
     print("=" * 65)
 
-    novnc_path = shutil.which("novnc") or "/usr/share/novnc" or shutil.which("novnc_proxy")
     has_xvfb = bool(shutil.which("Xvfb"))
     has_x11vnc = bool(shutil.which("x11vnc"))
 
@@ -133,6 +157,7 @@ def main():
     display = ":99"
     vnc_port = 5900
     web_port = 6080
+    debug_port = 9222
     processes = []
 
     try:
@@ -157,11 +182,14 @@ def main():
         processes.append(p_novnc)
         time.sleep(1)
 
-        # 4. Start Chromium in the virtual display
+        # 4. Start Chromium in the virtual display with debugging port
         env = os.environ.copy()
         env["DISPLAY"] = display
         chrome_args = [
             chrome_bin,
+            f"--remote-debugging-port={debug_port}",
+            "--remote-debugging-address=0.0.0.0",
+            "--remote-allow-origins=*",
             f"--user-data-dir={PROFILE_DIR}",
             "--no-first-run",
             "--no-default-browser-check",
@@ -192,28 +220,30 @@ def main():
         print("👉 Instructions:")
         print("   1. Open the link above in your browser.")
         print("   2. You will see the full Chrome desktop running on your EC2.")
-        print("   3. Log into TeraBox or slide the verification CAPTCHA puzzle.")
-        print("   4. Once you are logged in and see your files on the screen...")
+        print("   3. Log into TeraBox or solve the verification CAPTCHA slider.")
+        print("   4. Once you are logged in / solved...")
         print("   5. Come back to this terminal and press [ENTER] to save cookies!")
         print("=" * 65 + "\n")
 
         input("👉 Press [ENTER] here once you have solved the captcha / logged in: ")
 
-        print("\n⏳ Extracting session cookies from browser profile...")
-        time.sleep(1)
+        print("\n⏳ Extracting live plaintext cookies directly from Chrome memory...")
+        cookies = asyncio.run(extract_cdp_cookies(debug_port))
 
-        # Terminate Chrome so SQLite DB is flushed
-        p_chrome.terminate()
-        try:
-            p_chrome.wait(timeout=3)
-        except Exception:
-            pass
+        if cookies:
+            cookie_map = {c.get("name"): c.get("value", "") for c in cookies}
+            ndus = cookie_map.get("ndus", "")
+            print(f"📋 Captured {len(cookies)} cookies total!")
+            print(f"🍪 Cookie names: {list(cookie_map.keys())}")
+            print(f"🔑 'ndus' cookie: {'✅ PRESENT (len=' + str(len(ndus)) + ')' if ndus else '⚠️ MISSING'}")
 
-        success = export_sqlite_cookies(PROFILE_DIR, COOKIE_OUTPUT_PATH)
-        if success:
-            print("✅ All set! Your Telegram bot can now download without CAPTCHA blocks.")
+            netscape_text = cookies_to_netscape(cookies)
+            COOKIE_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+            COOKIE_OUTPUT_PATH.write_text(netscape_text, encoding="utf-8")
+            print(f"🎉 Successfully saved cookies to: {COOKIE_OUTPUT_PATH}")
+            print("✅ All set! You can restart tgbot.service now.")
         else:
-            print("⚠️  Cookies could not be extracted automatically. You can copy-paste cookie string into .env TERABOX_COOKIE.")
+            print("❌ Could not capture cookies from Chrome memory. Please try again.")
 
     except KeyboardInterrupt:
         print("\n🛑 Aborted by user.")
