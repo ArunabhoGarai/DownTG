@@ -876,8 +876,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
                 else:
                     err = error_msg or "TeraBox download failed."
+                    # Log 100% full raw technical error to terminal
                     logger.error(f"[handle_message] TeraBox failed: {err}")
-                    await edit_status_msg_safe(status_msg, f"❌ **TeraBox Download Failed**\n\n```\n{err}\n```")
+                    # Show clean generic message in Telegram
+                    await edit_status_msg_safe(status_msg, "❌ **Download Failed**\n\nUnable to retrieve this video. Please try again in a moment or verify the link.")
                     return
 
         # Extract metadata without downloading (routed to dedicated engine)

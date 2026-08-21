@@ -778,7 +778,7 @@ async def _download_via_node_crawler(
     logger.info(f"[_download_via_node_crawler] Spawning crawler on {display}: {' '.join(cmd)}")
     if progress_updater:
         try:
-            await progress_updater("🚀 Launching Stealth Browser Engine...")
+            await progress_updater("⏳ **Processing media link...**")
         except Exception:
             pass
 
@@ -801,24 +801,16 @@ async def _download_via_node_crawler(
             if not line:
                 continue
 
+            # Keep 100% full technical logs in terminal
             logger.info(f"[Crawler Output] {line}")
 
             now = time.time()
-            if line.startswith("[STATUS]"):
-                status_text = line.replace("[STATUS]", "").strip()
-                if progress_updater and (now - last_progress_time > 2.0):
-                    last_progress_time = now
-                    try:
-                        await progress_updater(f"🌐 {status_text}")
-                    except Exception:
-                        pass
-
-            elif line.startswith("[PROGRESS]"):
+            if line.startswith("[PROGRESS]"):
                 prog_text = line.replace("[PROGRESS]", "").strip()
-                if progress_updater and (now - last_progress_time > 2.0):
+                if progress_updater and (now - last_progress_time > 1.8):
                     last_progress_time = now
                     try:
-                        await progress_updater(f"📥 {prog_text}")
+                        await progress_updater(f"📥 **{prog_text}...**")
                     except Exception:
                         pass
 
