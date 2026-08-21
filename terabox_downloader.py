@@ -703,10 +703,10 @@ def _ensure_xvfb_running() -> str:
                 except Exception:
                     pass
 
-        logger.info(f"Starting Xvfb virtual display on {display}...")
+        logger.info(f"Starting Xvfb virtual display on {display} (1920x1080)...")
         try:
             subprocess.Popen(
-                ["Xvfb", display, "-screen", "0", "1366x850x24", "-ac", "+extension", "GLX", "+render", "-noreset"],
+                ["Xvfb", display, "-screen", "0", "1920x1080x24", "-ac", "+extension", "GLX", "+render", "-noreset"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )

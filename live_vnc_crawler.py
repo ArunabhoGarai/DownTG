@@ -49,8 +49,8 @@ def main():
         time.sleep(1)
 
         # 1. Start Xvfb
-        print(f"\n🖥️ Starting Xvfb virtual display on {display} (1366x850)...")
-        p_xvfb = subprocess.Popen(["Xvfb", display, "-screen", "0", "1366x850x24"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"\n🖥️ Starting Xvfb virtual display on {display} (1920x1080 Full HD)...")
+        p_xvfb = subprocess.Popen(["Xvfb", display, "-screen", "0", "1920x1080x24"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         processes.append(p_xvfb)
         time.sleep(1)
 

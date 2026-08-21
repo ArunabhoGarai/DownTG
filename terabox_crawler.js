@@ -82,14 +82,15 @@ function logStatus(msg) {
         }
     }
 
-    logStatus('Launching browser with stealth mode...');
+    logStatus('Launching browser with stealth mode (1920x1080 Full HD)...');
     const isLinux = process.platform === 'linux';
     const launchArgs = [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-blink-features=AutomationControlled',
-        '--window-size=1366,850',
+        '--window-size=1920,1080',
+        '--start-maximized',
     ];
 
     if (isLinux) {
@@ -100,7 +101,7 @@ function logStatus(msg) {
     try {
         browser = await puppeteer.launch({
             headless: false, // GUI mode under Xvfb / Desktop
-            defaultViewport: null,
+            defaultViewport: { width: 1920, height: 1080 },
             args: launchArgs,
         });
     } catch (launchErr) {
@@ -108,7 +109,7 @@ function logStatus(msg) {
         try {
             browser = await puppeteer.launch({
                 headless: 'new',
-                defaultViewport: null,
+                defaultViewport: { width: 1920, height: 1080 },
                 args: launchArgs,
             });
         } catch (fbErr) {
@@ -119,7 +120,7 @@ function logStatus(msg) {
 
     const page = await browser.newPage();
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
-    await page.setViewport({ width: 1366, height: 850 });
+    await page.setViewport({ width: 1920, height: 1080, deviceScaleFactor: 1 });
 
     // 1. Inject Session Cookies
     const cookies = parseNetscapeCookies(COOKIE_FILE);
@@ -164,7 +165,15 @@ function logStatus(msg) {
         // Continue even if networkidle2 times out
     }
 
-    logStatus('Waiting for UI components to render...');
+    logStatus('Adjusting page zoom & waiting for components to render...');
+    try {
+        await page.evaluate(() => {
+            // Zoom out slightly to unveil all bottom buttons
+            document.body.style.zoom = '85%';
+            window.scrollBy(0, 250);
+        });
+    } catch (e) {}
+
     await new Promise(r => setTimeout(r, 3500));
 
     // 4. Extract page metadata
