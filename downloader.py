@@ -54,6 +54,10 @@ def get_platform_badge(url: str) -> str:
         return "🎵 TikTok"
     elif "twitter.com" in url_lower or "x.com" in url_lower:
         return "🐦 X / Twitter"
+    elif "terabox" in url_lower or "1024tera" in url_lower or "4funbox" in url_lower or "mirrobox" in url_lower or "nephobox" in url_lower:
+        return "📦 TeraBox"
+    elif "diskwala.com" in url_lower:
+        return "💿 Diskwala"
     return "🌐 Video"
 
 

@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import time
 import json
@@ -14,11 +15,229 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, Callable
 from urllib.parse import urlparse, parse_qs
 import aiohttp
+import requests
 import yt_dlp
 
 from config import DOWNLOAD_DIR, BASE_DIR
+from downloader import format_bytes, remove_file_safely
 
 logger = logging.getLogger(__name__)
+
+# Path to project .env file
+ENV_FILE = BASE_DIR / ".env"
+
+
+def get_terabox_token() -> str:
+    """Returns the current TeraBox MiniApp Bearer token directly from .env or os.environ."""
+    tok = os.environ.get("TERABOX_BEARER_TOKEN", "").strip()
+    if not tok and ENV_FILE.exists():
+        try:
+            with open(ENV_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    line_clean = line.strip()
+                    if line_clean.startswith("TERABOX_BEARER_TOKEN="):
+                        val = line_clean.split("=", 1)[1].strip().strip('"').strip("'")
+                        if val:
+                            tok = val
+                            os.environ["TERABOX_BEARER_TOKEN"] = tok
+                            break
+        except Exception as e:
+            logger.error(f"[TeraBox] Error reading token from .env: {e}")
+
+    if tok:
+        return tok if tok.startswith("Bearer ") else f"Bearer {tok}"
+    return ""
+
+
+def save_terabox_token(token: str) -> bool:
+    """Saves and updates the TeraBox MiniApp Bearer token directly in the .env file."""
+    clean_val = token.strip()
+    if clean_val.startswith("Bearer "):
+        full_token = clean_val
+    else:
+        full_token = f"Bearer {clean_val}"
+
+    os.environ["TERABOX_BEARER_TOKEN"] = full_token
+
+    try:
+        lines = []
+        found = False
+        if ENV_FILE.exists():
+            with open(ENV_FILE, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+
+        new_lines = []
+        for line in lines:
+            if line.strip().startswith("TERABOX_BEARER_TOKEN="):
+                new_lines.append(f"TERABOX_BEARER_TOKEN={full_token}\n")
+                found = True
+            else:
+                new_lines.append(line)
+
+        if not found:
+            if new_lines and not new_lines[-1].endswith("\n"):
+                new_lines.append("\n")
+            new_lines.append(f"TERABOX_BEARER_TOKEN={full_token}\n")
+
+        with open(ENV_FILE, "w", encoding="utf-8") as f:
+            f.writelines(new_lines)
+
+        logger.info("[TeraBox] Updated TERABOX_BEARER_TOKEN in .env successfully.")
+        return True
+    except Exception as e:
+        logger.error(f"[TeraBox] Failed to write token to .env: {e}")
+        return False
+
+
+def _clean_filename(name: str) -> str:
+    """Sanitizes filename for safe filesystem storage."""
+    safe = re.sub(r'[\\/*?:"<>|]', "_", name).strip()
+    return safe or "terabox_video.mp4"
+
+
+async def _resolve_via_miniapp_api(terabox_url: str) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Directly resolves TeraBox links via the high-speed MiniApp API (apiwala.teradownloader.pro).
+    """
+    token = get_terabox_token()
+    if not token:
+        return False, None, "TeraBox MiniApp token is not set."
+
+    logger.info(f"[TeraBox] Querying MiniApp Direct API for {terabox_url[:80]}...")
+
+    headers = {
+        "accept": "*/*",
+        "accept-language": "en-US,en;q=0.6",
+        "authorization": token,
+        "content-type": "application/json",
+        "origin": "https://twa.teradownloader.pro",
+        "referer": "https://twa.teradownloader.pro/",
+        "user-agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "x-bot-id": "terabox_player",
+    }
+
+    payload = {
+        "link": terabox_url,
+        "dir_path": "",
+        "page": 1,
+    }
+
+    def _post():
+        return requests.post(
+            "https://apiwala.teradownloader.pro/api/terabox/new",
+            json=payload,
+            headers=headers,
+            timeout=15,
+        )
+
+    try:
+        resp = await asyncio.to_thread(_post)
+        if resp.status_code == 401:
+            logger.warning("[TeraBox] MiniApp token unauthorized or expired (HTTP 401).")
+            return False, None, "TeraBox MiniApp token is unauthorized or expired."
+
+        if resp.status_code != 200:
+            logger.warning(f"[TeraBox] MiniApp API returned HTTP {resp.status_code}")
+            return False, None, f"MiniApp API returned HTTP {resp.status_code}"
+
+        res_data = resp.json()
+        if not res_data.get("success"):
+            err_msg = res_data.get("message") or "MiniApp reported unsuccessful response."
+            logger.warning(f"[TeraBox] MiniApp resolution error: {err_msg}")
+            return False, None, err_msg
+
+        items = res_data.get("data", [])
+        if not items:
+            return False, None, "No files found in TeraBox link."
+
+        # Pick first file item that has a download link
+        selected = None
+        for it in items:
+            if not it.get("isDir") and it.get("downloadLink"):
+                selected = it
+                break
+        if not selected:
+            selected = items[0]
+
+        download_link = selected.get("downloadLink") or selected.get("streamUrl")
+        if not download_link:
+            return False, None, "No download link found in MiniApp response."
+
+        filename = _clean_filename(selected.get("fileName") or "terabox_video.mp4")
+        filesize = int(selected.get("fileSize") or 0)
+        thumb = selected.get("thumbnail")
+
+        info = {
+            "title": filename,
+            "filename": filename,
+            "filesize": filesize,
+            "download_url": download_link,
+            "stream_url": selected.get("streamUrl"),
+            "thumbnail": thumb,
+            "uploader": "TeraBox",
+            "extractor": "terabox_miniapp_api",
+        }
+        logger.info(f"[TeraBox] MiniApp resolved: {filename} ({format_bytes(filesize)})")
+        return True, info, None
+
+    except Exception as e:
+        logger.error(f"[TeraBox] MiniApp request exception: {e}")
+        return False, None, str(e)
+
+
+async def _stream_miniapp_download(
+    download_url: str,
+    dest_path: str,
+    filesize_expected: int,
+    progress_updater: Optional[Callable[[str], None]] = None,
+) -> bool:
+    """Streams file directly to disk in 1MB chunks with progress updates."""
+    def _do_stream():
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            ),
+            "Accept": "*/*",
+            "Connection": "keep-alive",
+        })
+        with session.get(download_url, stream=True, timeout=60) as r:
+            r.raise_for_status()
+            total_bytes = int(r.headers.get("content-length", filesize_expected) or 0)
+
+            downloaded_bytes = 0
+            last_update = 0
+            chunk_size = 1024 * 1024
+
+            with open(dest_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=chunk_size):
+                    if not chunk:
+                        continue
+                    f.write(chunk)
+                    downloaded_bytes += len(chunk)
+
+                    now = time.time()
+                    if progress_updater and (now - last_update > 1.8):
+                        last_update = now
+                        if total_bytes > 0:
+                            pct = int((downloaded_bytes / total_bytes) * 100)
+                            msg = f"📥 **Downloading: {pct}%** ({format_bytes(downloaded_bytes)} / {format_bytes(total_bytes)})"
+                        else:
+                            msg = f"📥 **Downloading: {format_bytes(downloaded_bytes)}...**"
+                        try:
+                            asyncio.run_coroutine_threadsafe(progress_updater(msg), loop)
+                        except Exception:
+                            pass
+            return True
+
+    loop = asyncio.get_running_loop()
+    await asyncio.to_thread(_do_stream)
+    return os.path.exists(dest_path) and os.path.getsize(dest_path) > 50 * 1024
+
 
 # TeraBox domain matching keywords
 TERABOX_DOMAINS = [
@@ -637,7 +856,15 @@ async def extract_terabox_info(
         except Exception:
             pass
 
-    # 1. Primary Engine (Local Headless Chromium Engine)
+    # 1. First Priority: High-Speed Telegram MiniApp API (teradownloader.pro)
+    if get_terabox_token():
+        ma_success, ma_info, ma_err = await _resolve_via_miniapp_api(url)
+        if ma_success and ma_info:
+            logger.info("TeraBox link resolved successfully via high-speed MiniApp API engine.")
+            return True, ma_info, None
+        logger.warning(f"TeraBox MiniApp API resolver failed ({ma_err}). Falling back to browser engine...")
+
+    # 2. Local Headless Chromium Engine
     hl_success, hl_info, hl_err = await _resolve_via_headless_browser(url, timeout_sec=15)
     if hl_success and hl_info:
         logger.info("TeraBox link resolved successfully via headless browser engine.")
@@ -743,6 +970,57 @@ def _ensure_xvfb_running() -> str:
     return display
 
 
+CRAWLER_TIMEOUT_SEC = 180  # Strict 3-minute maximum budget for crawler
+
+
+async def _kill_crawler_and_chrome(proc: Optional[asyncio.subprocess.Process], download_id: str):
+    """Forcefully terminates the crawler process, its Chrome children, and cleans temp files."""
+    if proc:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=2.0)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    # Terminate any orphaned Chrome/Chromium processes under DISPLAY=:99 on Linux
+    if sys.platform == "linux":
+        try:
+            subprocess.run(
+                ["pkill", "-9", "-f", "chrome.*(1920,1080|terabox)"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+    elif sys.platform == "win32":
+        try:
+            if proc and proc.pid:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+        except Exception:
+            pass
+
+    # Clean any temporary .crdownload files in DOWNLOAD_DIR
+    try:
+        for f in DOWNLOAD_DIR.iterdir():
+            if f.is_file() and (f.name.endswith(".crdownload") or download_id in f.name):
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
 async def _download_via_node_crawler(
     url: str,
     output_dir: Path,
@@ -752,6 +1030,7 @@ async def _download_via_node_crawler(
     """
     Priority Downloader Engine: Spawns Node.js Puppeteer Stealth Crawler in Xvfb GUI.
     Downloads the file directly to output_dir and emits real-time progress.
+    Strictly enforced with a 3-minute hard timeout and automatic process termination.
     """
     node_bin = shutil.which("node")
     if not node_bin:
@@ -778,10 +1057,11 @@ async def _download_via_node_crawler(
     logger.info(f"[_download_via_node_crawler] Spawning crawler on {display}: {' '.join(cmd)}")
     if progress_updater:
         try:
-            await progress_updater("⏳ **Processing media link...**")
+            await progress_updater("⏳ **Processing media link via browser...**")
         except Exception:
             pass
 
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -793,32 +1073,47 @@ async def _download_via_node_crawler(
         last_json_line = None
         last_progress_time = 0
 
-        while True:
-            line_bytes = await proc.stdout.readline()
-            if not line_bytes:
-                break
-            line = line_bytes.decode("utf-8", errors="ignore").strip()
-            if not line:
-                continue
+        async def _read_and_wait():
+            nonlocal last_json_line, last_progress_time
+            while True:
+                line_bytes = await proc.stdout.readline()
+                if not line_bytes:
+                    break
+                line = line_bytes.decode("utf-8", errors="ignore").strip()
+                if not line:
+                    continue
 
-            # Keep 100% full technical logs in terminal
-            logger.info(f"[Crawler Output] {line}")
+                # Keep 100% full technical logs in terminal
+                logger.info(f"[Crawler Output] {line}")
 
-            now = time.time()
-            if line.startswith("[PROGRESS]"):
-                prog_text = line.replace("[PROGRESS]", "").strip()
-                if progress_updater and (now - last_progress_time > 1.8):
-                    last_progress_time = now
-                    try:
-                        await progress_updater(f"📥 **{prog_text}...**")
-                    except Exception:
-                        pass
+                now = time.time()
+                if line.startswith("[PROGRESS]"):
+                    prog_text = line.replace("[PROGRESS]", "").strip()
+                    if progress_updater and (now - last_progress_time > 1.8):
+                        last_progress_time = now
+                        try:
+                            await progress_updater(f"📥 **{prog_text}...**")
+                        except Exception:
+                            pass
 
-            elif line.startswith("{") and line.endswith("}"):
-                last_json_line = line
+                elif line.startswith("{") and line.endswith("}"):
+                    last_json_line = line
 
-        stderr_bytes = await proc.stderr.read()
-        return_code = await proc.wait()
+            stderr_bytes = await proc.stderr.read()
+            return_code = await proc.wait()
+            return return_code, stderr_bytes
+
+        try:
+            return_code, stderr_bytes = await asyncio.wait_for(
+                _read_and_wait(), timeout=CRAWLER_TIMEOUT_SEC
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"[_download_via_node_crawler] Crawler exceeded strict 3-minute ({CRAWLER_TIMEOUT_SEC}s) limit! Aborting.")
+            await _kill_crawler_and_chrome(proc, download_id)
+            return False, None, None, "TeraBox download timed out (exceeded 3 minutes limit)."
+
+        # Ensure Chrome and worker are 100% cleaned up
+        await _kill_crawler_and_chrome(proc, download_id)
 
         if return_code == 0 and last_json_line:
             try:
@@ -844,7 +1139,7 @@ async def _download_via_node_crawler(
             except Exception as parse_ex:
                 logger.error(f"Error parsing crawler output JSON: {parse_ex}")
 
-        err_msg = stderr_bytes.decode("utf-8", errors="ignore").strip()
+        err_msg = stderr_bytes.decode("utf-8", errors="ignore").strip() if stderr_bytes else ""
         if last_json_line:
             try:
                 err_data = json.loads(last_json_line)
@@ -856,6 +1151,8 @@ async def _download_via_node_crawler(
 
     except Exception as e:
         logger.error(f"[_download_via_node_crawler] Exception: {e}", exc_info=True)
+        if proc:
+            await _kill_crawler_and_chrome(proc, download_id)
         return False, None, None, str(e)
 
 
@@ -874,7 +1171,53 @@ async def download_terabox_media(
     """
     download_id = uuid.uuid4().hex[:8]
 
-    # Priority Engine: Node.js Puppeteer Stealth Crawler in Xvfb GUI
+    # 🚀 PRIORITY 1: High-Speed Telegram MiniApp API (teradownloader.pro)
+    if get_terabox_token():
+        if progress_updater:
+            try:
+                await progress_updater("⏳ **Resolving TeraBox link...**")
+            except Exception:
+                pass
+
+        ma_success, ma_info, ma_err = await _resolve_via_miniapp_api(url)
+        if ma_success and ma_info and ma_info.get("download_url"):
+            filename = ma_info.get("filename") or f"terabox_{download_id}.mp4"
+            dest_file = DOWNLOAD_DIR / f"tera_{download_id}_{filename}"
+            dest_path = str(dest_file)
+
+            if progress_updater:
+                try:
+                    await progress_updater("📥 **Starting download...**")
+                except Exception:
+                    pass
+
+            try:
+                dl_ok = await _stream_miniapp_download(
+                    download_url=ma_info["download_url"],
+                    dest_path=dest_path,
+                    filesize_expected=ma_info.get("filesize", 0),
+                    progress_updater=progress_updater,
+                )
+                if dl_ok and os.path.exists(dest_path):
+                    actual_size = os.path.getsize(dest_path)
+                    ma_info["filesize"] = actual_size
+                    ma_info["filepath"] = dest_path
+                    ma_info["id"] = download_id
+                    logger.info(f"[TeraBox] 🎉 Download completed via MiniApp API: {dest_path} ({format_bytes(actual_size)})")
+                    return True, dest_path, ma_info, None
+            except Exception as stream_ex:
+                logger.warning(f"[TeraBox] MiniApp streaming failed: {stream_ex}. Falling back to browser crawler...")
+                remove_file_safely(dest_path)
+        else:
+            logger.warning(f"[TeraBox] MiniApp API failed ({ma_err}). Falling back to browser crawler...")
+
+    # 🔄 FALLBACK: Original Node.js Puppeteer Stealth Crawler in Xvfb GUI
+    if progress_updater:
+        try:
+            await progress_updater("⏳ **Processing TeraBox link via browser engine...**")
+        except Exception:
+            pass
+
     crawler_success, crawler_file, crawler_info, crawler_err = await _download_via_node_crawler(
         url=url,
         output_dir=DOWNLOAD_DIR,

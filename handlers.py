@@ -53,18 +53,34 @@ from terabox_downloader import (
     is_terabox_url,
     extract_terabox_info,
     download_terabox_media,
+    save_terabox_token,
+    get_terabox_token,
+)
+from diskwala_downloader import (
+    is_diskwala_url,
+    extract_diskwala_info,
+    download_diskwala_media,
+    save_diskwala_token,
+    get_diskwala_token,
 )
 from mtproto_uploader import (
     is_mtproto_active,
     upload_media_mtproto,
 )
+from vnc_manager import (
+    start_vnc_capture_session,
+    stop_vnc_session,
+)
 
 logger = logging.getLogger(__name__)
 
+DEV_RESTRICTED_MESSAGE = "⛔ This command is restricted to the bot developer."
+
+
 def is_admin(user_id: int) -> bool:
-    """Checks if a user ID is the configured bot administrator."""
+    """Checks if a user ID is the configured bot developer/administrator."""
     if not ADMIN_USER_ID:
-        return True
+        return False
     admin_ids = [aid.strip() for aid in str(ADMIN_USER_ID).split(",") if aid.strip()]
     return str(user_id) in admin_ids
 
@@ -268,6 +284,8 @@ async def route_extract_info(
             notify_admin_callback=notify_admin_callback,
             progress_updater=progress_updater,
         )
+    elif is_diskwala_url(url):
+        return await extract_diskwala_info(url, progress_updater=progress_updater)
     elif is_youtube_url(url):
         return await extract_media_info(url)
     elif is_instagram_url(url):
@@ -339,6 +357,14 @@ async def route_download_media(
     """Routes media download to the dedicated platform downloader."""
     if is_terabox_url(url):
         return await download_terabox_media(
+            url,
+            quality=quality,
+            format_selector=format_selector,
+            notify_admin_callback=notify_admin_callback,
+            progress_updater=progress_updater,
+        )
+    elif is_diskwala_url(url):
+        return await download_diskwala_media(
             url,
             quality=quality,
             format_selector=format_selector,
@@ -520,7 +546,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 🔴 **YouTube**: Videos, Shorts & MP3\n"
         "• 📸 **Instagram**: Reels, Posts & Stories\n"
         "• 🔵 **Facebook**: Videos & Reels\n"
-        "• 📦 **TeraBox**: Cloud videos & shares\n"
+        "• 📦 **TeraBox & 💿 Diskwala**: Cloud videos & share links\n"
         "• 🎵 **TikTok & 🐦 X / Twitter**\n"
         "• 🌐 **Reddit, Pinterest, Vimeo, Twitch, Threads, Dailymotion**\n"
         "• 🔗 **Direct MP4 / WebM / HLS video URLs**\n\n"
@@ -560,6 +586,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/setcookie <platform> <cookie_text>` — Save raw cookie text directly in chat (e.g. `/setcookie terabox ndus=...`).\n"
         "• `/clearcookie <platform>` — Delete cookies for `youtube`, `instagram`, `facebook`, `terabox`, or `generic`.\n"
         "• *Tip:* Drag & drop any `cookies.txt` document with caption `youtube`, `instagram`, `facebook`, or `terabox` to update automatically!\n\n"
+        "💿 **Diskwala MiniApp Controls:**\n"
+        "• `/setdiskwala <bearer_token>` — Update or refresh Diskwala MiniApp Authorization token.\n"
+        "• `/diskwalastatus` — Check Diskwala API & resolver status.\n\n"
+        "📦 **TeraBox MiniApp Controls:**\n"
+        "• `/setterabox <bearer_token>` — Update or refresh TeraBox MiniApp Authorization token.\n"
+        "• `/teraboxstatus` — Check TeraBox API resolver & fallback status.\n\n"
+        "🖥️ **Live VNC Remote Desktop (Token Capture):**\n"
+        "• `/vnc [bot_name_or_link]` — Fire up VNC with persistent Telegram login to auto-capture Diskwala & TeraBox tokens.\n"
+        "• `/stopvnc` — Close the VNC browser session.\n\n"
         "👥 **Group Chat Management:**\n"
         "• `/startgc` — Activate and authorize the bot inside the current group chat.\n"
         "• `/stopgc` — Deactivate and revoke bot access in the current group chat.\n"
@@ -609,7 +644,7 @@ async def gchelp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 🔴 **YouTube**: Videos, Shorts & Audio (MP3)\n"
         "• 📸 **Instagram**: Reels, Posts & Stories\n"
         "• 🔵 **Facebook**: Videos & Reels\n"
-        "• 📦 **TeraBox**: Cloud videos & share links\n"
+        "• 📦 **TeraBox & 💿 Diskwala**: Cloud videos & share links\n"
         "• 🎵 **TikTok & 🐦 X (Twitter)**\n"
         "• 🌐 **Reddit, Pinterest, Vimeo, Twitch & Direct MP4 links**\n\n"
         "⏹️ **Process Control:**\n"
@@ -878,8 +913,71 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     err = error_msg or "TeraBox download failed."
                     # Log 100% full raw technical error to terminal
                     logger.error(f"[handle_message] TeraBox failed: {err}")
-                    # Show clean generic message in Telegram
-                    await edit_status_msg_safe(status_msg, "❌ **Download Failed**\n\nUnable to retrieve this video. Please try again in a moment or verify the link.")
+                    if "timed out" in err.lower() or "timeout" in err.lower():
+                        await edit_status_msg_safe(
+                            status_msg,
+                            "❌ **Download Failed**\n\nTeraBox download timed out (exceeded 3 minutes limit). Please try again or verify the link."
+                        )
+                    else:
+                        await edit_status_msg_safe(
+                            status_msg,
+                            "❌ **Download Failed**\n\nUnable to retrieve this video. Please try again in a moment or verify the link."
+                        )
+                    return
+
+        # For Diskwala links: Run Diskwala download directly
+        if is_diskwala_url(url):
+            async with get_semaphore():
+                success, downloaded_file, dl_info, error_msg = await route_download_media(
+                    url,
+                    quality="best",
+                    progress_updater=lambda txt: edit_status_msg_safe(status_msg, txt),
+                )
+                if success and downloaded_file and os.path.exists(downloaded_file):
+                    file_size = os.path.getsize(downloaded_file)
+                    try:
+                        await status_msg.edit_text(
+                            f"📤 **Uploading {format_bytes(file_size)} to Telegram...**",
+                            parse_mode=constants.ParseMode.MARKDOWN,
+                        )
+                    except Exception:
+                        pass
+
+                    dw_title = dl_info.get("title") if dl_info else Path(downloaded_file).name
+                    await send_media_to_chat(
+                        bot=context.bot,
+                        chat_id=update.effective_chat.id,
+                        file_path=downloaded_file,
+                        title=dw_title,
+                        uploader=dl_info.get("uploader", "Diskwala") if dl_info else "Diskwala",
+                        duration_sec=None,
+                        url=url,
+                        quality="best",
+                        info=dl_info,
+                        progress_status_updater=lambda txt: edit_status_msg_safe(status_msg, txt),
+                    )
+                    try:
+                        await status_msg.delete()
+                    except Exception:
+                        pass
+                    return
+                else:
+                    err = error_msg or "Diskwala download failed."
+                    # Log 100% full raw technical error to terminal
+                    logger.error(f"[handle_message] Diskwala failed: {err}")
+                    if is_admin(user_id):
+                        if "token" in err.lower() or "unauthorized" in err.lower() or "expired" in err.lower():
+                            await edit_status_msg_safe(
+                                status_msg,
+                                f"⚠️ **Diskwala Token Error**\n\n{err}\n\n👉 Run `/vnc` to auto-capture or `/setdiskwala <token>` in this chat."
+                            )
+                        else:
+                            await edit_status_msg_safe(status_msg, f"❌ **Download Failed**\n\n{err}")
+                    else:
+                        await edit_status_msg_safe(
+                            status_msg,
+                            "❌ **Download Failed**\n\nUnable to retrieve this video. Please try again in a moment or verify the link."
+                        )
                     return
 
         # Extract metadata without downloading (routed to dedicated engine)
@@ -1062,6 +1160,16 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception:
             await edit_query_message(query, "🛑 **Process stopped by user.**")
         await query.answer("Stopped.")
+        return
+
+    if action == "stop_vnc_session":
+        user_id = query.from_user.id
+        if not is_admin(user_id):
+            await query.answer("⚠️ Only the administrator can stop VNC.", show_alert=True)
+            return
+        await stop_vnc_session()
+        await edit_query_message(query, "🛑 **VNC Browser Session Closed.**")
+        await query.answer("VNC Closed.")
         return
 
     if action == "cancel":
@@ -1249,14 +1357,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             URL_CACHE.pop(cache_key, None)
 
 
-def is_admin(user_id: int) -> bool:
-    """Check if the user is authorized as an admin in .env (supports single or comma-separated IDs)."""
-    if not ADMIN_USER_ID:
-        return False
-    admin_ids = [aid.strip() for aid in str(ADMIN_USER_ID).split(",") if aid.strip()]
-    return str(user_id) in admin_ids
-
-
 def get_cookie_target_path(platform: str) -> Optional[Tuple[str, Path]]:
     """Resolves platform name to its isolated cookie file path."""
     p = platform.lower().strip()
@@ -1277,7 +1377,7 @@ async def setcookie_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Sets raw cookie text for a specific platform. Usage: /setcookie <platform> <cookie_text>"""
     user_id = update.effective_user.id
     if not is_admin(user_id):
-        await update.message.reply_text("⛔ You are not authorized to use this command.")
+        await update.message.reply_text(DEV_RESTRICTED_MESSAGE)
         return
 
     if not context.args or len(context.args) < 2:
@@ -1320,7 +1420,7 @@ async def clearcookie_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Clears/deletes cookies for a platform. Usage: /clearcookie <platform>"""
     user_id = update.effective_user.id
     if not is_admin(user_id):
-        await update.message.reply_text("⛔ You are not authorized to use this command.")
+        await update.message.reply_text(DEV_RESTRICTED_MESSAGE)
         return
 
     if not context.args:
@@ -1344,7 +1444,7 @@ async def cookiestatus_command(update: Update, context: ContextTypes.DEFAULT_TYP
     """Shows cookie status for all isolated platforms."""
     user_id = update.effective_user.id
     if not is_admin(user_id):
-        await update.message.reply_text("⛔ You are not authorized to use this command.")
+        await update.message.reply_text(DEV_RESTRICTED_MESSAGE)
         return
 
     platforms = [
@@ -1435,7 +1535,7 @@ async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global _SEMAPHORE
     user_id = update.effective_user.id
     if not is_admin(user_id):
-        await update.message.reply_text("⛔ You are not authorized to use this command.")
+        await update.message.reply_text(DEV_RESTRICTED_MESSAGE)
         return
 
     killed_count = 0
@@ -1475,6 +1575,13 @@ async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+    # Stop any running VNC browser session
+    try:
+        await stop_vnc_session()
+        killed_processes.append("VNC Browser Session")
+    except Exception:
+        pass
+
     # Clean orphaned files in downloads folder
     from config import DOWNLOAD_DIR
     cleaned_files = 0
@@ -1505,10 +1612,7 @@ async def startgc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Activates bot in the current group chat. Restricted to bot developer/admin."""
     user_id = update.effective_user.id
     if not is_admin(user_id):
-        await update.message.reply_text(
-            "⛔ Only the bot administrator can activate this bot in group chats.",
-            reply_to_message_id=update.message.message_id,
-        )
+        await update.message.reply_text(DEV_RESTRICTED_MESSAGE, reply_to_message_id=update.message.message_id)
         return
 
     chat = update.effective_chat
@@ -1535,10 +1639,7 @@ async def stopgc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Deactivates bot in the current group chat. Restricted to bot developer/admin."""
     user_id = update.effective_user.id
     if not is_admin(user_id):
-        await update.message.reply_text(
-            "⛔ Only the bot administrator can deactivate this bot in group chats.",
-            reply_to_message_id=update.message.message_id,
-        )
+        await update.message.reply_text(DEV_RESTRICTED_MESSAGE, reply_to_message_id=update.message.message_id)
         return
 
     chat = update.effective_chat
@@ -1563,7 +1664,7 @@ async def allow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Authorizes a user by Telegram ID to use the bot in private DMs. Usage: /allow <user_id> [note]"""
     user_id = update.effective_user.id
     if not is_admin(user_id):
-        await update.message.reply_text("⛔ Only the bot administrator can authorize users.")
+        await update.message.reply_text(DEV_RESTRICTED_MESSAGE)
         return
 
     if not context.args:
@@ -1598,7 +1699,7 @@ async def disallow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Revokes a user's DM access by Telegram ID. Usage: /disallow <user_id>"""
     user_id = update.effective_user.id
     if not is_admin(user_id):
-        await update.message.reply_text("⛔ Only the bot administrator can revoke authorization.")
+        await update.message.reply_text(DEV_RESTRICTED_MESSAGE)
         return
 
     if not context.args:
@@ -1629,7 +1730,7 @@ async def listusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Lists all authorized DM users."""
     user_id = update.effective_user.id
     if not is_admin(user_id):
-        await update.message.reply_text("⛔ Only the bot administrator can view authorized users.")
+        await update.message.reply_text(DEV_RESTRICTED_MESSAGE)
         return
 
     users = list_allowed_users()
@@ -1683,6 +1784,197 @@ async def download_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await handle_message(update, context)
 
 
+async def setdiskwala_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to update Diskwala MiniApp bearer token in .env."""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text(DEV_RESTRICTED_MESSAGE)
+        return
+
+    raw_text = update.message.text or ""
+    parts = raw_text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await update.message.reply_text(
+            "📝 **Usage:** `/setdiskwala <bearer_token_or_initData>`\n\n"
+            "💡 *Paste the full Authorization string or initData extracted from the miniapp.*",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_to_message_id=update.message.message_id,
+        )
+        return
+
+    new_token = parts[1].strip()
+    if save_diskwala_token(new_token):
+        await update.message.reply_text(
+            "✅ **Diskwala Token Saved to `.env`!**\n\n"
+            "Direct API resolution with AES-GCM decryption is now active.",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_to_message_id=update.message.message_id,
+        )
+    else:
+        await update.message.reply_text("❌ Failed to save Diskwala token to `.env`.")
+
+
+async def diskwalastatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to check Diskwala resolver status."""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text(DEV_RESTRICTED_MESSAGE)
+        return
+
+    tok = get_diskwala_token()
+    token_status = "🟢 Configured (.env Active)" if tok else "🔴 Not Set (Use /setdiskwala or /vnc)"
+
+    msg = (
+        "💿 **Diskwala Resolver Status**\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"⚡ **MiniApp Direct API**: {token_status}\n"
+        "🔐 **Decryption**: AES-GCM (Hardware-Accelerated)\n"
+        "📁 **Storage**: Saved directly in `.env` (`DISKWALA_BEARER_TOKEN`)\n\n"
+        "💡 *Use `/vnc` to auto-capture or `/setdiskwala <token>` to paste manually.*"
+    )
+    await update.message.reply_text(msg, parse_mode=constants.ParseMode.MARKDOWN, reply_to_message_id=update.message.message_id)
+
+
+async def setterabox_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to update TeraBox MiniApp bearer token in .env."""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text(DEV_RESTRICTED_MESSAGE)
+        return
+
+    raw_text = update.message.text or ""
+    parts = raw_text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await update.message.reply_text(
+            "📝 **Usage:** `/setterabox <bearer_token_or_initData>`\n\n"
+            "💡 *Paste the full Authorization string or initData extracted from the miniapp.*",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_to_message_id=update.message.message_id,
+        )
+        return
+
+    new_token = parts[1].strip()
+    if save_terabox_token(new_token):
+        await update.message.reply_text(
+            "✅ **TeraBox Token Saved to `.env`!**\n\n"
+            "High-speed MiniApp API resolution is now active as Priority 1.",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_to_message_id=update.message.message_id,
+        )
+    else:
+        await update.message.reply_text("❌ Failed to save TeraBox token to `.env`.")
+
+
+async def teraboxstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to check TeraBox resolver status."""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text(DEV_RESTRICTED_MESSAGE)
+        return
+
+    tok = get_terabox_token()
+    token_status = "🟢 Configured (.env Active)" if tok else "🔴 Not Set (Use /setterabox or /vnc)"
+
+    msg = (
+        "📦 **TeraBox Resolver Status**\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"⚡ **Priority 1 (MiniApp API)**: {token_status}\n"
+        "🕷️ **Priority 2 (Headless Crawler)**: 🟢 Available (Fallback)\n"
+        "🍪 **Priority 3 (Gateway / Cookies)**: 🟢 Available (Fallback)\n"
+        "📁 **Storage**: Saved directly in `.env` (`TERABOX_BEARER_TOKEN`)\n\n"
+        "💡 *Use `/vnc` to auto-capture or `/setterabox <token>` to paste manually.*"
+    )
+    await update.message.reply_text(msg, parse_mode=constants.ParseMode.MARKDOWN, reply_to_message_id=update.message.message_id)
+
+
+async def vnc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to start VNC desktop with persistent Telegram profile for token capture."""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text(DEV_RESTRICTED_MESSAGE)
+        return
+
+    target_bot = context.args[0] if context.args else None
+    status_msg = await update.message.reply_text(
+        "⏳ **Firing up VNC Desktop & Telegram Web...**\n"
+        "Starting Xvfb virtual display, x11vnc, noVNC proxy, and persistent browser session...",
+        parse_mode=constants.ParseMode.MARKDOWN,
+    )
+
+    async def on_token_captured(platform: str, captured_tok: str):
+        plat_title = "TeraBox" if platform == "terabox" else "Diskwala"
+        env_key = "TERABOX_BEARER_TOKEN" if platform == "terabox" else "DISKWALA_BEARER_TOKEN"
+        msg = (
+            f"🎉 **{plat_title} Bearer Token Captured Automatically!**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"• **Saved to:** `.env` (`{env_key}`)\n"
+            f"• **Engine:** {plat_title} MiniApp API is now active!\n"
+            "• **Action:** You can now close your VNC viewer tab or click Stop below."
+        )
+        try:
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🛑 Stop VNC Browser", callback_data="stop_vnc_session")],
+            ])
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=msg,
+                reply_markup=keyboard,
+                parse_mode=constants.ParseMode.MARKDOWN,
+            )
+        except Exception as e:
+            logger.error(f"Error sending token notification: {e}")
+
+    success, vnc_url, err = await start_vnc_capture_session(
+        target_bot=target_bot,
+        on_token_captured=on_token_captured,
+    )
+
+    if not success:
+        await status_msg.edit_text(
+            f"❌ **Failed to start VNC:**\n`{err}`",
+            parse_mode=constants.ParseMode.MARKDOWN,
+        )
+        return
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🖥️ Open Live VNC Desktop", url=vnc_url)],
+        [InlineKeyboardButton("🛑 Stop VNC Browser", callback_data="stop_vnc_session")],
+    ])
+
+    instructions = (
+        "🖥️ **Live VNC Desktop is Ready!**\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🔗 **Web Viewer:** [Click Here to Open VNC]({vnc_url})\n\n"
+        "📋 **Steps to capture token:**\n"
+        "1. Click the button below to view the browser live.\n"
+        "2. *(First time only)* Log in to your Telegram account. Your session is saved permanently in your server profile!\n"
+        "3. Open the bot & click the Diskwala or TeraBox MiniApp button.\n"
+        "4. As soon as the MiniApp opens, the bot **automatically captures the Bearer Token** and saves it to `.env`!\n\n"
+        "💡 *Click 'Stop VNC Browser' or use `/stopvnc` when finished.*"
+    )
+
+    await status_msg.edit_text(
+        instructions,
+        reply_markup=keyboard,
+        parse_mode=constants.ParseMode.MARKDOWN,
+    )
+
+
+async def stopvnc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to stop VNC browser session."""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text(DEV_RESTRICTED_MESSAGE)
+        return
+
+    await stop_vnc_session()
+    await update.message.reply_text(
+        "🛑 **VNC Browser Session Closed.**\nChrome and capture processes have been terminated.",
+        parse_mode=constants.ParseMode.MARKDOWN,
+        reply_to_message_id=update.message.message_id,
+    )
+
+
 def register_handlers(application):
     """Register all bot command and message handlers."""
     application.add_handler(CommandHandler("start", start_command))
@@ -1705,6 +1997,13 @@ def register_handlers(application):
     application.add_handler(CommandHandler("setcookie", setcookie_command))
     application.add_handler(CommandHandler("clearcookie", clearcookie_command))
     application.add_handler(CommandHandler("cookiestatus", cookiestatus_command))
+    application.add_handler(CommandHandler("setdiskwala", setdiskwala_command))
+    application.add_handler(CommandHandler("diskwalastatus", diskwalastatus_command))
+    application.add_handler(CommandHandler("setterabox", setterabox_command))
+    application.add_handler(CommandHandler("teraboxstatus", teraboxstatus_command))
+    application.add_handler(CommandHandler("vnc", vnc_command))
+    application.add_handler(CommandHandler("stopvnc", stopvnc_command))
+    application.add_handler(CommandHandler("killvnc", stopvnc_command))
     application.add_handler(CallbackQueryHandler(handle_callback_query))
     application.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, handle_document))
     application.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, handle_message))

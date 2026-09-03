@@ -5,4 +5,5 @@ static-ffmpeg>=2.5
 aiohttp>=3.9.0
 aiofiles>=23.2.0
 pyrogram>=2.0.106
-
+cryptography>=42.0.0
+requests>=2.31.0

@@ -62,61 +62,94 @@ function logStatus(msg) {
     console.log(`[STATUS] ${msg}`);
 }
 
-(async () => {
-    let puppeteer;
-    try {
-        const { addExtra } = require('puppeteer-extra');
-        const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-        const puppeteerVanillaModule = await import('puppeteer');
-        const puppeteerVanilla = puppeteerVanillaModule.default || puppeteerVanillaModule;
+const CRAWLER_TIMEOUT_MS = 180 * 1000; // Strict 3-minute timeout limit
+let browser = null;
 
-        puppeteer = addExtra(puppeteerVanilla);
-        puppeteer.use(StealthPlugin());
-    } catch (err) {
-        try {
-            const puppeteerModule = await import('puppeteer');
-            puppeteer = puppeteerModule.default || puppeteerModule;
-        } catch (e) {
-            console.log(JSON.stringify({ success: false, error: 'Puppeteer is not installed in node_modules.' }));
-            process.exit(1);
+const cleanupAndExit = async (code, resultObj) => {
+    try {
+        if (browser) {
+            logStatus('Closing browser...');
+            await browser.close();
+            browser = null;
         }
+    } catch (_) {}
+    if (resultObj) {
+        console.log(JSON.stringify(resultObj));
     }
+    process.exit(code);
+};
 
-    logStatus('Launching browser with stealth mode (1920x1080 Full HD)...');
-    const isLinux = process.platform === 'linux';
-    const launchArgs = [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-blink-features=AutomationControlled',
-        '--window-size=1920,1080',
-        '--start-maximized',
-    ];
+const watchdogTimer = setTimeout(async () => {
+    logStatus('Strict 3-minute timeout reached. Forcibly terminating browser and crawler...');
+    await cleanupAndExit(1, {
+        success: false,
+        error: 'TeraBox download timed out (exceeded 3 minutes limit).'
+    });
+}, CRAWLER_TIMEOUT_MS);
+if (watchdogTimer.unref) watchdogTimer.unref();
 
-    if (isLinux) {
-        launchArgs.push('--disable-gpu');
-    }
+['SIGINT', 'SIGTERM', 'SIGHUP'].forEach(sig => {
+    process.on(sig, async () => {
+        logStatus(`Received ${sig}. Forcibly closing browser...`);
+        await cleanupAndExit(1, { success: false, error: `Process killed via ${sig}` });
+    });
+});
 
-    let browser;
+(async () => {
     try {
-        browser = await puppeteer.launch({
-            headless: false, // GUI mode under Xvfb / Desktop
-            defaultViewport: { width: 1920, height: 1080 },
-            args: launchArgs,
-        });
-    } catch (launchErr) {
-        // Fallback to headless: "new" if no display server is running
+        let puppeteer;
+        try {
+            const { addExtra } = require('puppeteer-extra');
+            const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+            const puppeteerVanillaModule = await import('puppeteer');
+            const puppeteerVanilla = puppeteerVanillaModule.default || puppeteerVanillaModule;
+
+            puppeteer = addExtra(puppeteerVanilla);
+            puppeteer.use(StealthPlugin());
+        } catch (err) {
+            try {
+                const puppeteerModule = await import('puppeteer');
+                puppeteer = puppeteerModule.default || puppeteerModule;
+            } catch (e) {
+                console.log(JSON.stringify({ success: false, error: 'Puppeteer is not installed in node_modules.' }));
+                process.exit(1);
+            }
+        }
+
+        logStatus('Launching browser with stealth mode (1920x1080 Full HD)...');
+        const isLinux = process.platform === 'linux';
+        const launchArgs = [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-blink-features=AutomationControlled',
+            '--window-size=1920,1080',
+            '--start-maximized',
+        ];
+
+        if (isLinux) {
+            launchArgs.push('--disable-gpu');
+        }
+
         try {
             browser = await puppeteer.launch({
-                headless: 'new',
+                headless: false, // GUI mode under Xvfb / Desktop
                 defaultViewport: { width: 1920, height: 1080 },
                 args: launchArgs,
             });
-        } catch (fbErr) {
-            console.log(JSON.stringify({ success: false, error: `Browser launch failed: ${launchErr.message}` }));
-            process.exit(1);
+        } catch (launchErr) {
+            // Fallback to headless: "new" if no display server is running
+            try {
+                browser = await puppeteer.launch({
+                    headless: 'new',
+                    defaultViewport: { width: 1920, height: 1080 },
+                    args: launchArgs,
+                });
+            } catch (fbErr) {
+                console.log(JSON.stringify({ success: false, error: `Browser launch failed: ${launchErr.message}` }));
+                process.exit(1);
+            }
         }
-    }
 
     const page = await browser.newPage();
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
@@ -309,11 +342,11 @@ function logStatus(msg) {
     }
 
     // 7. Track the file download in OUTPUT_DIR until finished
-    logStatus('Monitoring download directory for file completion...');
+    logStatus('Monitoring download directory for file completion (3-minute hard limit)...');
     const snapshotBefore = new Set(fs.existsSync(downloadDir) ? fs.readdirSync(downloadDir) : []);
     
     let downloadedFilePath = null;
-    const maxWaitSec = 600; // 10 minutes maximum for large files
+    const maxWaitSec = 170; // Strictly under 3 minutes
     const startTime = Date.now();
     let lastSize = -1;
     let sizeStallCount = 0;
@@ -327,6 +360,12 @@ function logStatus(msg) {
         
         // Find newly created files
         const newFiles = currentFiles.filter(f => !snapshotBefore.has(f));
+
+        // If download hasn't started after 35s, abort to avoid keeping browser open uselessly
+        if ((Date.now() - startTime) > 35000 && newFiles.length === 0) {
+            logStatus('Download did not trigger after 35 seconds. Aborting crawler...');
+            break;
+        }
         
         // If download hasn't started after 7s, retry clicking all download buttons
         if ((Date.now() - startTime) > 7000 && !retriggered && newFiles.length === 0) {
@@ -396,11 +435,6 @@ function logStatus(msg) {
         }
     }
 
-    // Close browser cleanly
-    try {
-        await browser.close();
-    } catch (e) {}
-
     // Emit final result JSON
     if (downloadedFilePath && fs.existsSync(downloadedFilePath)) {
         let finalPath = downloadedFilePath;
@@ -433,14 +467,25 @@ function logStatus(msg) {
             filesize: stats.size,
             download_id: DOWNLOAD_ID,
         };
-        console.log(JSON.stringify(result));
-        process.exit(0);
+        await cleanupAndExit(0, result);
     } else {
         const errResult = {
             success: false,
-            error: 'Download timed out or no file was saved by browser.',
+            error: 'TeraBox download timed out or could not be downloaded within 3 minutes.',
         };
-        console.log(JSON.stringify(errResult));
-        process.exit(1);
+        await cleanupAndExit(1, errResult);
     }
+} catch (err) {
+    logStatus(`Crawler encountered an unexpected error: ${err.message}`);
+    await cleanupAndExit(1, { success: false, error: err.message });
+} finally {
+    clearTimeout(watchdogTimer);
+    try {
+        if (browser) {
+            logStatus('Closing browser in finally block...');
+            await browser.close();
+            browser = null;
+        }
+    } catch (_) {}
+}
 })();

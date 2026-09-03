@@ -51,3 +51,12 @@ BROWSERLESS_TOKEN = os.getenv("BROWSERLESS_TOKEN", "").strip()
 _raw_captcha_timeout = os.getenv("CAPTCHA_TIMEOUT_SEC", "180").strip()
 CAPTCHA_TIMEOUT_SEC = int(_raw_captcha_timeout) if _raw_captcha_timeout.isdigit() else 180
 IS_BROWSERLESS_ENABLED = bool(BROWSERBASE_API_KEY or os.getenv("BROWSERLESS_URL") or os.getenv("SERVER_PUBLIC_IP"))
+
+# Diskwala MiniApp Direct API Configuration
+DISKWALA_BEARER_TOKEN = os.getenv("DISKWALA_BEARER_TOKEN", "").strip()
+
+# TeraBox MiniApp Direct API Configuration (teradownloader.pro)
+TERABOX_BEARER_TOKEN = os.getenv("TERABOX_BEARER_TOKEN", "").strip()
+
+
+

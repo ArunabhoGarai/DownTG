@@ -9,6 +9,8 @@ WorkingDirectory=/home/ubuntu/DownTG/DownTG
 ExecStart=/home/ubuntu/DownTG/DownTG/.venv/bin/python bot.py
 Restart=always
 RestartSec=5
+Environment="PATH=/home/ubuntu/.deno/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="HOME=/home/ubuntu"
 
 # 🛡️ Resource Protection Settings (Ensures other EC2 processes are not hampered)
 # 1. Lower process priority so web servers / databases get CPU first
