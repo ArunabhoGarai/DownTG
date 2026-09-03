@@ -220,6 +220,111 @@ async def start_vnc_capture_session(
         return False, "", str(e)
 
 
+async def start_autovnc_session(
+    platform: str,
+    target_bot: Optional[str] = None,
+    on_token_captured: Optional[Callable[[str, str], Awaitable[None]]] = None,
+    progress_updater: Optional[Callable[[str], Awaitable[None]]] = None,
+) -> Tuple[bool, str, str]:
+    """
+    Starts VNC stack and launches automated Puppeteer Extra Stealth worker to navigate Telegram Web,
+    open MiniApp, enter dummy link, click download, and auto-capture bearer token.
+    Returns (success, vnc_web_url, error_message).
+    """
+    global _ACTIVE_VNC_PROCESS, _ACTIVE_READER_TASK
+
+    await stop_vnc_session()
+
+    ok, vnc_url = ensure_vnc_running()
+    if not ok:
+        return False, "", vnc_url
+
+    script_path = BASE_DIR / "vnc_auto_capture.js"
+    if not script_path.exists():
+        return False, "", "vnc_auto_capture.js not found."
+
+    target_url = format_telegram_web_url(target_bot)
+    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+
+    env = os.environ.copy()
+    if sys.platform == "linux":
+        env["DISPLAY"] = ":99"
+
+    node_bin = shutil.which("node") or "node"
+    cmd = [
+        node_bin,
+        str(script_path),
+        platform.lower(),
+        target_url,
+        str(PROFILE_DIR),
+    ]
+
+    logger.info(f"[AutoVNC Manager] Launching auto-capture worker: {' '.join(cmd)}")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        _ACTIVE_VNC_PROCESS = proc
+
+        async def _reader():
+            last_update_time = 0
+            while True:
+                line_bytes = await proc.stdout.readline()
+                if not line_bytes:
+                    break
+                line = line_bytes.decode("utf-8", errors="ignore").strip()
+                if not line:
+                    continue
+
+                logger.info(f"[AutoVNC Worker] {line}")
+
+                if line.startswith("[AUTOVNC_STATUS]") and progress_updater:
+                    now = time.time()
+                    if now - last_update_time > 1.8:
+                        last_update_time = now
+                        status_text = line.replace("[AUTOVNC_STATUS]", "").strip()
+                        try:
+                            await progress_updater(status_text)
+                        except Exception:
+                            pass
+
+                elif line.startswith("[AUTOVNC_LOGIN_REQUIRED]") and progress_updater:
+                    try:
+                        await progress_updater("⚠️ **Telegram Web is logged out!**\nPlease run `/vnc` first to scan QR code / log in.")
+                    except Exception:
+                        pass
+
+                elif line.startswith("[TERABOX_TOKEN_CAPTURED]"):
+                    captured_token = line.replace("[TERABOX_TOKEN_CAPTURED]", "").strip()
+                    logger.info("[AutoVNC Manager] 🎉 Auto-Captured TeraBox Token!")
+                    save_terabox_token(captured_token)
+                    if on_token_captured:
+                        try:
+                            await on_token_captured("terabox", captured_token)
+                        except Exception as cb_err:
+                            logger.error(f"[AutoVNC Callback Error]: {cb_err}")
+
+                elif line.startswith("[DISKWALA_TOKEN_CAPTURED]") or line.startswith("[TOKEN_CAPTURED]"):
+                    captured_token = line.replace("[DISKWALA_TOKEN_CAPTURED]", "").replace("[TOKEN_CAPTURED]", "").strip()
+                    logger.info("[AutoVNC Manager] 🎉 Auto-Captured Diskwala Token!")
+                    save_diskwala_token(captured_token)
+                    if on_token_captured:
+                        try:
+                            await on_token_captured("diskwala", captured_token)
+                        except Exception as cb_err:
+                            logger.error(f"[AutoVNC Callback Error]: {cb_err}")
+
+        _ACTIVE_READER_TASK = asyncio.create_task(_reader())
+        return True, vnc_url, ""
+
+    except Exception as e:
+        logger.error(f"[AutoVNC Manager] Failed to launch Auto-VNC worker: {e}")
+        return False, "", str(e)
+
+
 async def stop_vnc_session() -> bool:
     """Stops the active VNC browser session and cleans up Chrome processes."""
     global _ACTIVE_VNC_PROCESS, _ACTIVE_READER_TASK
@@ -239,6 +344,13 @@ async def stop_vnc_session() -> bool:
     if sys.platform == "linux":
         try:
             subprocess.run(["pkill", "-f", "vnc_diskwala_capture.js"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["pkill", "-f", "vnc_auto_capture.js"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["pkill", "-9", "-f", "chrome.*(1920,1080|tg_browser_profile)"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+    elif sys.platform == "win32":
+        try:
+            subprocess.run(["taskkill", "/F", "/IM", "chrome.exe"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
             pass
     return True

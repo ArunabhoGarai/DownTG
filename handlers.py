@@ -69,6 +69,7 @@ from mtproto_uploader import (
 )
 from vnc_manager import (
     start_vnc_capture_session,
+    start_autovnc_session,
     stop_vnc_session,
 )
 
@@ -593,7 +594,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/setterabox <bearer_token>` — Update or refresh TeraBox MiniApp Authorization token.\n"
         "• `/teraboxstatus` — Check TeraBox API resolver & fallback status.\n\n"
         "🖥️ **Live VNC Remote Desktop (Token Capture):**\n"
-        "• `/vnc [bot_name_or_link]` — Fire up VNC with persistent Telegram login to auto-capture Diskwala & TeraBox tokens.\n"
+        "• `/autovnc <diskwala|tera> [@botusername]` — Fully automated token capture (opens app, types link, clicks download, saves token to `.env`).\n"
+        "• `/vnc [bot_name_or_link]` — Manual VNC desktop session with persistent Telegram login.\n"
         "• `/stopvnc` — Close the VNC browser session.\n\n"
         "👥 **Group Chat Management:**\n"
         "• `/startgc` — Activate and authorize the bot inside the current group chat.\n"
@@ -1975,6 +1977,121 @@ async def stopvnc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def autovnc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to automatically navigate Telegram Web, trigger MiniApp, enter link, and capture Bearer token."""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text(DEV_RESTRICTED_MESSAGE)
+        return
+
+    if not context.args or len(context.args) < 1:
+        await update.message.reply_text(
+            "📝 **Usage:** `/autovnc <diskwala|tera> [@botusername]`\n\n"
+            "💡 *Examples:*\n"
+            "• `/autovnc diskwala @DiskwalaBot`\n"
+            "• `/autovnc tera @terabox_player`\n\n"
+            "🤖 *The bot will launch Chrome on VNC, open the chat, click Open MiniApp, type a dummy link with human delays, click Download, and auto-capture the token into `.env`!*",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_to_message_id=update.message.message_id,
+        )
+        return
+
+    platform_raw = context.args[0].lower().strip()
+    if platform_raw in ("dw", "diskwala"):
+        platform = "diskwala"
+        plat_title = "Diskwala"
+    elif platform_raw in ("tera", "terabox", "tb"):
+        platform = "tera"
+        plat_title = "TeraBox"
+    else:
+        await update.message.reply_text(
+            "❌ Unknown platform. Please specify either `diskwala` or `tera`.\n"
+            "Usage: `/autovnc <diskwala|tera> [@botusername]`",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_to_message_id=update.message.message_id,
+        )
+        return
+
+    target_bot = context.args[1] if len(context.args) > 1 else None
+
+    status_msg = await update.message.reply_text(
+        f"🤖 **Starting Auto-VNC for {plat_title}...**\n"
+        "Initializing virtual display, stealth browser, and Telegram Web...",
+        parse_mode=constants.ParseMode.MARKDOWN,
+        reply_to_message_id=update.message.message_id,
+    )
+
+    captured = False
+
+    async def on_token_captured(plat: str, captured_tok: str):
+        nonlocal captured
+        captured = True
+        title = "TeraBox" if plat == "terabox" else "Diskwala"
+        env_key = "TERABOX_BEARER_TOKEN" if plat == "terabox" else "DISKWALA_BEARER_TOKEN"
+        msg = (
+            f"🎉 **{title} Bearer Token Auto-Captured!**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"• **Saved to:** `.env` (`{env_key}`)\n"
+            f"• **Status:** {title} Direct API is now active & ready for downloads!\n"
+            "• **Browser:** Closed cleanly."
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=msg,
+                parse_mode=constants.ParseMode.MARKDOWN,
+            )
+        except Exception as e:
+            logger.error(f"Error sending token notification: {e}")
+
+    async def on_progress_update(status_txt: str):
+        if captured:
+            return
+        try:
+            await status_msg.edit_text(
+                f"🤖 **Auto-VNC ({plat_title}) In Progress**\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"⚡ {status_txt}\n\n"
+                "💡 *You can watch live using the button below or let it run automatically.*",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🖥️ Watch Live on VNC", url=vnc_url)],
+                    [InlineKeyboardButton("🛑 Stop Auto VNC", callback_data="stop_vnc_session")],
+                ]),
+                parse_mode=constants.ParseMode.MARKDOWN,
+            )
+        except Exception:
+            pass
+
+    success, vnc_url, err = await start_autovnc_session(
+        platform=platform,
+        target_bot=target_bot,
+        on_token_captured=on_token_captured,
+        progress_updater=on_progress_update,
+    )
+
+    if not success:
+        await status_msg.edit_text(
+            f"❌ **Failed to start Auto-VNC:**\n`{err}`",
+            parse_mode=constants.ParseMode.MARKDOWN,
+        )
+        return
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🖥️ Watch Live on VNC", url=vnc_url)],
+        [InlineKeyboardButton("🛑 Stop Auto VNC", callback_data="stop_vnc_session")],
+    ])
+
+    await status_msg.edit_text(
+        f"🤖 **Auto-VNC ({plat_title}) Started!**\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🎯 **Target Bot:** `{target_bot or 'Default Telegram Web'}`\n"
+        f"🔗 **Live Stream:** [Click here to watch VNC live]({vnc_url})\n\n"
+        "⏳ Navigating to chat and triggering MiniApp...",
+        reply_markup=keyboard,
+        parse_mode=constants.ParseMode.MARKDOWN,
+    )
+
+
 def register_handlers(application):
     """Register all bot command and message handlers."""
     application.add_handler(CommandHandler("start", start_command))
@@ -2002,6 +2119,7 @@ def register_handlers(application):
     application.add_handler(CommandHandler("setterabox", setterabox_command))
     application.add_handler(CommandHandler("teraboxstatus", teraboxstatus_command))
     application.add_handler(CommandHandler("vnc", vnc_command))
+    application.add_handler(CommandHandler("autovnc", autovnc_command))
     application.add_handler(CommandHandler("stopvnc", stopvnc_command))
     application.add_handler(CommandHandler("killvnc", stopvnc_command))
     application.add_handler(CallbackQueryHandler(handle_callback_query))

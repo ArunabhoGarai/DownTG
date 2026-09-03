@@ -46,19 +46,47 @@ function logStatus(msg) {
         userDataDir: USER_DATA_DIR,
         defaultViewport: null,
         args: [
+            TARGET_URL,
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--start-maximized',
             '--window-size=1920,1080',
             '--disable-dev-shm-usage',
             '--disable-infobars',
+            '--no-first-run',
+            '--no-default-browser-check',
         ],
         ignoreDefaultArgs: ['--enable-automation'],
     });
 
+    await new Promise(r => setTimeout(r, 600));
+
     const pages = await browser.pages();
-    const page = pages.length > 0 ? pages[0] : await browser.newPage();
+    let page = pages[0];
+
+    // Find the page that has TARGET_URL or use the first page
+    for (const p of pages) {
+        const u = p.url();
+        if (u.includes('telegram.org') || u === TARGET_URL) {
+            page = p;
+            break;
+        }
+    }
+
+    // Close any other tabs (e.g. blank tabs, newtab, about:blank)
+    for (const p of pages) {
+        if (p !== page) {
+            try {
+                const u = p.url();
+                if (u === 'about:blank' || u.startsWith('chrome://')) {
+                    await p.close();
+                }
+            } catch (_) {}
+        }
+    }
+
     await page.setViewport({ width: 1920, height: 1080 });
+    await page.bringToFront();
 
     let tokenCaptured = false;
 
@@ -89,17 +117,29 @@ function logStatus(msg) {
         if (target.type() === 'page') {
             try {
                 const newPage = await target.page();
-                if (newPage) await setupInterception(newPage);
+                if (newPage) {
+                    const u = newPage.url();
+                    // Close accidental blank tabs and re-focus Telegram tab
+                    if (u === 'about:blank' || u.startsWith('chrome://')) {
+                        await newPage.close();
+                        await page.bringToFront();
+                    } else {
+                        await setupInterception(newPage);
+                    }
+                }
             } catch (_) {}
         }
     });
 
-    logStatus(`Navigating to ${TARGET_URL}...`);
-    try {
-        await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    } catch (e) {
-        logStatus(`Navigation notice: ${e.message}`);
+    if (!page.url().includes('telegram.org')) {
+        logStatus(`Navigating to ${TARGET_URL}...`);
+        try {
+            await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
+        } catch (e) {
+            logStatus(`Navigation notice: ${e.message}`);
+        }
     }
+    await page.bringToFront();
 
     logStatus("Chrome is active on VNC display. Waiting for Telegram Web interaction & MiniApp token...");
 
