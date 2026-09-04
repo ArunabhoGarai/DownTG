@@ -250,6 +250,11 @@ async function launchBrowserWithFallback(puppeteer, chromePath) {
 
     let tokenCaptured = false;
 
+    const isTera = (PLATFORM === 'tera' || PLATFORM === 'terabox');
+    const targetEnvKey = isTera ? 'TERABOX_BEARER_TOKEN' : 'DISKWALA_BEARER_TOKEN';
+    const targetTag = isTera ? '[TERABOX_TOKEN_CAPTURED]' : '[DISKWALA_TOKEN_CAPTURED]';
+    const targetName = isTera ? 'TeraBox' : 'Diskwala';
+
     // 1. Setup network token interception across all pages
     async function setupInterception(p) {
         try {
@@ -258,29 +263,28 @@ async function launchBrowserWithFallback(puppeteer, chromePath) {
                 const headers = req.headers();
                 const auth = headers['authorization'] || headers['Authorization'];
 
-                if (url.includes('api2.diskwala.net') || url.includes('/api/diskwala/')) {
-                    if (auth && (auth.startsWith('Bearer ') || auth.includes('query_id='))) {
-                        if (!tokenCaptured) {
-                            tokenCaptured = true;
-                            log('🎉 [DISKWALA_TOKEN_CAPTURED]');
-                            console.log('\n--- CAPTURED DISKWALA BEARER TOKEN ---');
-                            console.log(auth);
-                            console.log('--------------------------------------\n');
-                            saveTokenToEnv('DISKWALA_BEARER_TOKEN', auth);
-                        }
-                    }
-                }
+                if (!auth) return;
+                if (!auth.startsWith('Bearer ') && !auth.includes('query_id=') && !auth.includes('user=')) return;
 
-                if (url.includes('apiwala.teradownloader.pro') || url.includes('/api/terabox/')) {
-                    if (auth && (auth.startsWith('Bearer ') || auth.includes('user='))) {
-                        if (!tokenCaptured) {
-                            tokenCaptured = true;
-                            log('🎉 [TERABOX_TOKEN_CAPTURED]');
-                            console.log('\n--- CAPTURED TERABOX BEARER TOKEN ---');
-                            console.log(auth);
-                            console.log('------------------------------------\n');
-                            saveTokenToEnv('TERABOX_BEARER_TOKEN', auth);
-                        }
+                const isApiRequest = (
+                    url.includes('diskwala') ||
+                    url.includes('api2.diskwala.net') ||
+                    url.includes('miniapp.diskwala.net') ||
+                    url.includes('terabox') ||
+                    url.includes('teradownloader') ||
+                    url.includes('apiwala') ||
+                    url.includes('/api/') ||
+                    url.includes('/download')
+                );
+
+                if (isApiRequest) {
+                    if (!tokenCaptured) {
+                        tokenCaptured = true;
+                        log(`🎉 ${targetTag}`);
+                        console.log(`\n--- CAPTURED ${targetName.toUpperCase()} BEARER TOKEN ---`);
+                        console.log(auth);
+                        console.log('--------------------------------------\n');
+                        saveTokenToEnv(targetEnvKey, auth);
                     }
                 }
             });

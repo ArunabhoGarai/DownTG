@@ -312,25 +312,34 @@ async def start_autovnc_session(
                     except Exception:
                         pass
 
-                elif line.startswith("[TERABOX_TOKEN_CAPTURED]"):
-                    captured_token = line.replace("[TERABOX_TOKEN_CAPTURED]", "").strip()
-                    logger.info("[AutoVNC Manager] 🎉 Auto-Captured TeraBox Token!")
-                    save_terabox_token(captured_token)
-                    if on_token_captured:
-                        try:
-                            await on_token_captured("terabox", captured_token)
-                        except Exception as cb_err:
-                            logger.error(f"[AutoVNC Callback Error]: {cb_err}")
-
-                elif line.startswith("[DISKWALA_TOKEN_CAPTURED]") or line.startswith("[TOKEN_CAPTURED]"):
-                    captured_token = line.replace("[DISKWALA_TOKEN_CAPTURED]", "").replace("[TOKEN_CAPTURED]", "").strip()
-                    logger.info("[AutoVNC Manager] 🎉 Auto-Captured Diskwala Token!")
-                    save_diskwala_token(captured_token)
-                    if on_token_captured:
-                        try:
-                            await on_token_captured("diskwala", captured_token)
-                        except Exception as cb_err:
-                            logger.error(f"[AutoVNC Callback Error]: {cb_err}")
+                elif (
+                    line.startswith("[TERABOX_TOKEN_CAPTURED]")
+                    or line.startswith("[DISKWALA_TOKEN_CAPTURED]")
+                    or line.startswith("[TOKEN_CAPTURED]")
+                ):
+                    captured_token = (
+                        line.replace("[TERABOX_TOKEN_CAPTURED]", "")
+                        .replace("[DISKWALA_TOKEN_CAPTURED]", "")
+                        .replace("[TOKEN_CAPTURED]", "")
+                        .strip()
+                    )
+                    is_tera_session = platform.lower() in ("tera", "terabox", "tb")
+                    if is_tera_session:
+                        logger.info("[AutoVNC Manager] 🎉 Auto-Captured TeraBox Token!")
+                        save_terabox_token(captured_token)
+                        if on_token_captured:
+                            try:
+                                await on_token_captured("terabox", captured_token)
+                            except Exception as cb_err:
+                                logger.error(f"[AutoVNC Callback Error]: {cb_err}")
+                    else:
+                        logger.info("[AutoVNC Manager] 🎉 Auto-Captured Diskwala Token!")
+                        save_diskwala_token(captured_token)
+                        if on_token_captured:
+                            try:
+                                await on_token_captured("diskwala", captured_token)
+                            except Exception as cb_err:
+                                logger.error(f"[AutoVNC Callback Error]: {cb_err}")
 
         _ACTIVE_READER_TASK = asyncio.create_task(_reader())
         return True, vnc_url, ""
