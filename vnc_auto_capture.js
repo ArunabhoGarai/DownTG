@@ -73,6 +73,268 @@ function saveTokenToEnv(key, token) {
     }
 }
 
+let currentMousePos = { x: 350, y: 350 };
+
+// Exact viewport coordinates provided by user (calibrated for standard 1920x1080 display):
+const DISKWALA_COORDS = {
+    openButton: { x: 794, y: 1008 },
+    linkInput: { x: 987, y: 402 },
+    downloadBtn: { x: 1154, y: 399 },
+};
+
+/**
+ * Generates a smooth, curved Bézier trajectory with human-like acceleration and micro-jitter.
+ */
+async function humanMouseMove(page, targetX, targetY) {
+    const startX = currentMousePos.x;
+    const startY = currentMousePos.y;
+    const dx = targetX - startX;
+    const dy = targetY - startY;
+    const distance = Math.hypot(dx, dy);
+
+    if (distance < 5) {
+        await page.mouse.move(targetX, targetY);
+        currentMousePos = { x: targetX, y: targetY };
+        return;
+    }
+
+    const steps = Math.max(15, Math.min(35, Math.floor(distance / 20)));
+    const midX = (startX + targetX) / 2;
+    const midY = (startY + targetY) / 2;
+    const perpX = -dy / distance;
+    const perpY = dx / distance;
+    const curveOffset = (Math.random() - 0.5) * Math.min(distance * 0.3, 100);
+    const ctrlX = midX + perpX * curveOffset;
+    const ctrlY = midY + perpY * curveOffset;
+
+    for (let i = 1; i <= steps; i++) {
+        const t = i / steps;
+        const ease = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+        const u = 1 - ease;
+        const x = u * u * startX + 2 * u * ease * ctrlX + ease * ease * targetX;
+        const y = u * u * startY + 2 * u * ease * ctrlY + ease * ease * targetY;
+
+        const jitterX = (Math.random() - 0.5) * 1.2;
+        const jitterY = (Math.random() - 0.5) * 1.2;
+
+        await page.mouse.move(x + jitterX, y + jitterY);
+        await sleep(Math.floor(Math.random() * 8) + 6);
+    }
+
+    await page.mouse.move(targetX, targetY);
+    currentMousePos = { x: targetX, y: targetY };
+}
+
+/**
+ * Calculates absolute viewport coordinates for an element (including elements inside nested iframes).
+ */
+async function getElementViewportCoords(page, elementHandle, frame = null) {
+    if (!elementHandle) return null;
+
+    try {
+        let box = await elementHandle.boundingBox();
+        if (box && box.width > 0 && box.height > 0) {
+            return {
+                x: box.x,
+                y: box.y,
+                width: box.width,
+                height: box.height,
+            };
+        }
+
+        if (frame && frame !== page.mainFrame()) {
+            let frameBox = null;
+            try {
+                const frameEl = await frame.frameElement();
+                if (frameEl) {
+                    frameBox = await frameEl.boundingBox();
+                }
+            } catch (_) {}
+
+            const relRect = await frame.evaluate(el => {
+                const r = el.getBoundingClientRect();
+                return { x: r.left, y: r.top, width: r.width, height: r.height };
+            }, elementHandle);
+
+            if (relRect && relRect.width > 0 && relRect.height > 0) {
+                const offsetX = frameBox ? frameBox.x : 0;
+                const offsetY = frameBox ? frameBox.y : 0;
+                return {
+                    x: offsetX + relRect.x,
+                    y: offsetY + relRect.y,
+                    width: relRect.width,
+                    height: relRect.height,
+                };
+            }
+        }
+    } catch (_) {}
+
+    return null;
+}
+
+/**
+ * Performs a true hardware-level CDP mouse click with realistic motion kinematics.
+ */
+async function humanClick(page, elementHandle, frame = null, label = 'element') {
+    if (!elementHandle) return false;
+
+    try {
+        const targetContext = frame || page;
+        await targetContext.evaluate(el => {
+            if (el.classList.contains('hide')) {
+                el.classList.remove('hide');
+                el.style.display = 'inline-flex';
+                el.style.visibility = 'visible';
+                el.style.pointerEvents = 'auto';
+                el.style.opacity = '1';
+            }
+            el.scrollIntoView({ behavior: 'instant', block: 'center', inline: 'center' });
+        }, elementHandle);
+
+        await sleep(250);
+
+        const coords = await getElementViewportCoords(page, elementHandle, frame);
+
+        if (coords && coords.width > 0 && coords.height > 0) {
+            const targetX = coords.x + coords.width * (0.2 + Math.random() * 0.6);
+            const targetY = coords.y + coords.height * (0.2 + Math.random() * 0.6);
+
+            await humanMouseMove(page, targetX, targetY);
+            await sleep(Math.floor(Math.random() * 80) + 60);
+
+            await page.mouse.down({ button: 'left' });
+            await sleep(Math.floor(Math.random() * 50) + 70);
+            await page.mouse.up({ button: 'left' });
+
+            logStatus(`🖱️ Real mouse clicked on ${label} at (${Math.round(targetX)}, ${Math.round(targetY)})`);
+            return true;
+        } else {
+            logStatus(`⚠️ Bounding box not resolved for ${label}, falling back to handle.click()...`);
+            await elementHandle.click({ delay: Math.floor(Math.random() * 50) + 70 });
+            return true;
+        }
+    } catch (err) {
+        logStatus(`humanClick warning for ${label}: ${err.message}. Trying direct handle click...`);
+        try {
+            await elementHandle.click({ delay: 80 });
+            return true;
+        } catch (_) {}
+    }
+    return false;
+}
+
+/**
+ * Performs human typing with realistic mouse focus, key clear, and variable keystroke delays.
+ */
+async function humanType(page, inputHandle, text, frame = null) {
+    if (!inputHandle) return false;
+
+    await humanClick(page, inputHandle, frame, 'input field');
+    await sleep(400);
+
+    await page.keyboard.down('Control');
+    await page.keyboard.press('KeyA');
+    await page.keyboard.up('Control');
+    await sleep(100);
+    await page.keyboard.press('Backspace');
+    await sleep(200);
+
+    for (const char of text) {
+        await page.keyboard.type(char, { delay: Math.floor(Math.random() * 45) + 50 });
+    }
+    await sleep(400);
+
+    const targetContext = frame || page;
+    const value = await targetContext.evaluate(el => el.value, inputHandle);
+    if (value !== text) {
+        logStatus(`Notice: input value had discrepancy ("${value}"). Correcting...`);
+        await targetContext.evaluate((el, val) => {
+            el.value = val;
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+        }, inputHandle, text);
+    }
+
+    return true;
+}
+
+/**
+ * Resolves coordinates adapting for viewport resolution differences if any.
+ * On 1920x1080 (standard EC2 VNC), this returns the exact input coordinates.
+ */
+async function resolveAdaptiveCoords(page, baseCoords) {
+    try {
+        const dims = await page.evaluate(() => ({
+            width: window.innerWidth,
+            height: window.innerHeight,
+        }));
+        // If within standard 1920x1080 bounds, use exact coordinates (clamped to viewport)
+        if (dims.width >= 1800 && dims.height >= 950) {
+            const clampedY = Math.min(baseCoords.y, dims.height - 10);
+            return { x: baseCoords.x, y: clampedY };
+        }
+        // Scaled for smaller test viewports (e.g. 1280x577 local display)
+        const scaleX = dims.width / 1920;
+        const scaleY = dims.height / 1080;
+        return {
+            x: Math.round(baseCoords.x * scaleX),
+            y: Math.round(baseCoords.y * scaleY),
+        };
+    } catch (_) {
+        return baseCoords;
+    }
+}
+
+/**
+ * Performs a true hardware-level CDP mouse click at specific coordinates (x, y)
+ * using realistic Bézier motion, micro-jitter, and authentic down/up hold times.
+ */
+async function humanClickCoords(page, targetX, targetY, label = 'coordinate') {
+    logStatus(`🎯 Moving real mouse along Bézier curve to (${Math.round(targetX)}, ${Math.round(targetY)}) for ${label}...`);
+    await humanMouseMove(page, targetX, targetY);
+    await sleep(Math.floor(Math.random() * 60) + 70); // Hover reaction pause
+
+    await page.mouse.down({ button: 'left' });
+    await sleep(Math.floor(Math.random() * 40) + 70); // Human click hold time (70-110ms)
+    await page.mouse.up({ button: 'left' });
+
+    logStatus(`🖱️ Real mouse clicked at (${Math.round(targetX)}, ${Math.round(targetY)}) [${label}]`);
+    return true;
+}
+
+/**
+ * Robustly isolates the MiniApp Download/Submit button inside the iframe DOM.
+ */
+async function findDownloadButton(frame) {
+    if (!frame) return null;
+    try {
+        const btnHandles = await frame.$$('button, div[role="button"], a[role="button"], .btn');
+        for (const bh of btnHandles) {
+            const isDl = await frame.evaluate((b) => {
+                const t = (b.innerText || b.textContent || '').toLowerCase().trim();
+                const r = b.getBoundingClientRect();
+                return (
+                    (t.includes('download') || t.includes('get') || t.includes('submit') || t.includes('fetch') || t.includes('play')) &&
+                    r.width > 0 && r.height > 0
+                );
+            }, bh);
+            if (isDl) return bh;
+        }
+
+        const siblingHandle = await frame.evaluateHandle(() => {
+            const input = document.querySelector('input');
+            if (input && input.parentElement) {
+                return input.parentElement.querySelector('button') || input.closest('form, div').querySelector('button');
+            }
+            return document.querySelector('button');
+        });
+        if (siblingHandle && siblingHandle.asElement()) {
+            return siblingHandle.asElement();
+        }
+    } catch (_) {}
+    return null;
+}
+
 // 360-second (6 minute) watchdog timer to handle slow EC2 VNC environments
 const HARD_TIMEOUT_MS = 360 * 1000;
 let browser = null;
@@ -163,6 +425,15 @@ if (watchdog.unref) watchdog.unref();
         // with browser UI / taskbars causes the bottom of Telegram (input/buttons) to be cut off!
         await page.bringToFront();
 
+        await page.evaluateOnNewDocument(() => {
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined,
+            });
+            if (!window.chrome) {
+                window.chrome = { runtime: {} };
+            }
+        });
+
         try {
             const dims = await page.evaluate(() => {
                 return {
@@ -224,6 +495,40 @@ if (watchdog.unref) watchdog.unref();
             } catch (_) {}
         }
 
+        function isSignedMiniAppUrl(u, plat) {
+            if (!u || typeof u !== 'string') return false;
+            if (!u.includes('tgWebAppData=')) return false;
+            const lower = u.toLowerCase();
+            if (plat === 'diskwala') {
+                return lower.includes('diskwala') || lower.includes('miniapp') || !lower.includes('teradownloader');
+            } else {
+                // For TeraBox: accept any signed MiniApp URL that isn't diskwala
+                return lower.includes('teradownloader') || lower.includes('twa.') || lower.includes('terabox') || lower.includes('apiwala') || !lower.includes('diskwala');
+            }
+        }
+
+        let miniappUrl = null;
+
+        page.on('framenavigated', (frame) => {
+            try {
+                const u = frame.url();
+                if (isSignedMiniAppUrl(u, PLATFORM) && !miniappUrl) {
+                    logStatus(`🎯 Captured signed MiniApp URL from frame navigation: ${u.slice(0, 80)}...`);
+                    miniappUrl = u;
+                }
+            } catch (_) {}
+        });
+
+        page.on('request', (req) => {
+            try {
+                const u = req.url();
+                if (isSignedMiniAppUrl(u, PLATFORM) && !miniappUrl) {
+                    logStatus(`🎯 Captured signed MiniApp URL from network request: ${u.slice(0, 80)}...`);
+                    miniappUrl = u;
+                }
+            } catch (_) {}
+        });
+
         await setupInterception(page);
 
         const targetHash = TARGET_URL.includes('#') ? ('#' + TARGET_URL.split('#')[1]) : '';
@@ -235,15 +540,25 @@ if (watchdog.unref) watchdog.unref();
                     const newPage = await target.page();
                     if (newPage && newPage !== page) {
                         const u = newPage.url();
+                        if (isSignedMiniAppUrl(u, PLATFORM) && !miniappUrl) {
+                            logStatus(`🎯 Captured signed MiniApp URL from spawned tab: ${u.slice(0, 80)}...`);
+                            miniappUrl = u;
+                        }
+                        newPage.on('framenavigated', (frame) => {
+                            try {
+                                const fu = frame.url();
+                                if (isSignedMiniAppUrl(fu, PLATFORM) && !miniappUrl) {
+                                    logStatus(`🎯 Captured signed MiniApp URL from spawned tab frame: ${fu.slice(0, 80)}...`);
+                                    miniappUrl = fu;
+                                }
+                            } catch (_) {}
+                        });
                         await setupInterception(newPage);
                         if (targetHash && u.includes(targetHash)) {
                             logStatus('Target chat opened in secondary tab. Bringing it to front!');
                             await newPage.bringToFront();
                             try { await page.close(); } catch (_) {}
                             page = newPage;
-                        } else if (u === 'about:blank' || u.startsWith('chrome://')) {
-                            await newPage.close();
-                            await page.bringToFront();
                         }
                     }
                 } catch (_) {}
@@ -336,590 +651,342 @@ if (watchdog.unref) watchdog.unref();
         } catch (_) {}
 
         // Reusable helper to detect and confirm Telegram Web launch popups ("Open this web app?", "Confirm", "Launch")
+        // NOTE: Uses non-intrusive DOM click (no mouse movement or random mouse clicks)
         async function handleLaunchConfirmationModal(p) {
             try {
-                // Retry loop for slow EC2 where clicks might get dropped or need multiple attempts
-                for (let retry = 0; retry < 3; retry++) {
-                    let clicked = false;
-                    let clickedText = '';
-
-                    // 1. Native CDP Handle search (sends hardware-level OS mouse events with isTrusted: true)
-                    const btnHandles = await p.$$('button, .btn, div[role="button"], a[role="button"], .popup-button, .confirm-dialog-button');
-                    for (const h of btnHandles) {
-                        try {
-                            const info = await p.evaluate((el) => {
-                                const rect = el.getBoundingClientRect();
-                                const isVisible = (rect.width > 0 && rect.height > 0) && window.getComputedStyle(el).visibility !== 'hidden';
-                                const raw = (el.innerText || el.textContent || '').trim();
-                                const t = raw.toLowerCase();
-                                const isConfirm = (
-                                    (t === 'confirm' || t.includes('confirm') || t === 'launch' || t.includes('launch') || t.includes('proceed')) &&
-                                    !t.includes('cancel') &&
-                                    !t.includes('close')
-                                );
-                                return { isConfirm, isVisible, text: raw };
-                            }, h);
-
-                            if (info && info.isConfirm && info.isVisible) {
-                                await p.evaluate(el => el.scrollIntoView({ behavior: 'instant', block: 'center' }), h);
-                                await sleep(250);
-                                await h.click({ delay: 100 });
-                                await p.evaluate(el => { if (typeof el.click === 'function') el.click(); }, h);
-                                clicked = true;
-                                clickedText = info.text;
-                                break;
-                            }
-                        } catch (_) {}
-                    }
-
-                    // 2. Fallback: DOM container & synthetic event chain
-                    if (!clicked) {
-                        const synRes = await p.evaluate(() => {
-                            const allElements = Array.from(document.querySelectorAll('*'));
-                            const confirmDialog = allElements.find(el => {
-                                const t = (el.innerText || '').toLowerCase();
-                                return (
-                                    (t.includes('would like to open its web app') || t.includes('access your ip address') || t.includes('open this web app')) &&
-                                    el.children.length > 0 &&
-                                    el.children.length < 15
-                                );
-                            });
-
-                            let buttons = [];
-                            if (confirmDialog) {
-                                buttons = Array.from(confirmDialog.querySelectorAll('button, .btn, div[role="button"], a[role="button"]'));
-                            }
-                            if (buttons.length === 0) {
-                                const modalContainers = Array.from(document.querySelectorAll(
-                                    '.modal-dialog, .popup, .popup-container, .modal, div[role="dialog"], .confirm-dialog, .modal-content, .popup-body, .Modal, .popup-buttons'
-                                ));
-                                for (const mc of modalContainers) {
-                                    buttons.push(...Array.from(mc.querySelectorAll('button, .btn, div[role="button"], a[role="button"]')));
-                                }
-                            }
-                            if (buttons.length === 0) {
-                                buttons = Array.from(document.querySelectorAll(
-                                    '.popup-button, .confirm-dialog-button, .Button.confirm, button.primary, button.btn-primary, button'
-                                ));
-                            }
-
-                            for (const btn of buttons) {
-                                const rawText = (btn.innerText || btn.textContent || '').trim();
-                                const text = rawText.toLowerCase();
-                                const isConfirm = (
-                                    (text === 'confirm' || text.includes('confirm') || text === 'launch' || text.includes('launch') || text.includes('proceed') || text === 'open') &&
-                                    !text.includes('cancel') &&
-                                    !text.includes('close')
-                                );
-
-                                if (isConfirm) {
-                                    if (btn.classList.contains('hide')) {
-                                        btn.classList.remove('hide');
-                                        btn.style.display = 'inline-flex';
-                                        btn.style.visibility = 'visible';
-                                        btn.style.pointerEvents = 'auto';
-                                    }
-                                    btn.scrollIntoView({ behavior: 'instant', block: 'center' });
-                                    const evOpts = { bubbles: true, cancelable: true, view: window };
-                                    btn.dispatchEvent(new PointerEvent('pointerdown', evOpts));
-                                    btn.dispatchEvent(new MouseEvent('mousedown', evOpts));
-                                    btn.dispatchEvent(new PointerEvent('pointerup', evOpts));
-                                    btn.dispatchEvent(new MouseEvent('mouseup', evOpts));
-                                    btn.dispatchEvent(new MouseEvent('click', evOpts));
-                                    if (typeof btn.click === 'function') btn.click();
-                                    return { clicked: true, text: rawText };
-                                }
-                            }
-                            return { clicked: false };
-                        });
-
-                        if (synRes && synRes.clicked) {
-                            clicked = true;
-                            clickedText = synRes.text;
+                const confirmedText = await p.evaluate(() => {
+                    const modal = document.querySelector('.popup, .modal-dialog, .confirm-dialog, .popup-container, .modal, .Modal, div[role="dialog"], .Dialog, .ConfirmDialog');
+                    if (!modal) return null;
+                    const buttons = Array.from(modal.querySelectorAll('button, .btn, .popup-button, .confirm-dialog-button, .Button, div[role="button"]'));
+                    for (const btn of buttons) {
+                        const text = (btn.innerText || btn.textContent || '').trim().toLowerCase();
+                        const rect = btn.getBoundingClientRect();
+                        const isVisible = rect.width > 0 && rect.height > 0 && window.getComputedStyle(btn).visibility !== 'hidden';
+                        if (
+                            isVisible &&
+                            (text === 'confirm' || text.includes('confirm') || text === 'launch' || text.includes('launch') || text === 'proceed' || text.includes('proceed') || text === 'open' || text.includes('open') || text === 'ok') &&
+                            !text.includes('cancel') &&
+                            !text.includes('close')
+                        ) {
+                            btn.click();
+                            return (btn.innerText || btn.textContent || '').trim();
                         }
                     }
+                    return null;
+                });
 
-                    if (clicked) {
-                        logStatus(`Clicked launch popup "Confirm" (attempt ${retry + 1}): "${clickedText}"`);
-                        // Give 1.2s for Telegram Web SPA to register on slow EC2
-                        await sleep(1200);
-
-                        // Check if modal is still open; if closed, we succeeded!
-                        const stillOpen = await p.evaluate(() => {
-                            const modal = document.querySelector('.modal-dialog, .popup, .confirm-dialog, div[role="dialog"]');
-                            if (!modal) return false;
-                            const t = (modal.innerText || '').toLowerCase();
-                            return (t.includes('confirm') || t.includes('would like to open')) && !t.includes('cancel');
-                        });
-
-                        if (!stillOpen) {
-                            return true;
-                        }
-                        logStatus('Modal still visible after click, re-triggering confirmation click...');
-                    } else {
-                        break;
-                    }
+                if (confirmedText) {
+                    logStatus(`✅ Confirmed launch popup via DOM click: "${confirmedText}"`);
+                    return true;
                 }
             } catch (_) {}
             return false;
         }
 
-        // 5. Handle bottom-left context-sensitive action buttons (.chat-input.chat-input-main button: "Open Chat", "START", "UNBLOCK", etc.)
-        logStatus('Checking for context-sensitive action button in bottom bar (.chat-input.chat-input-main button)...');
+        // 5. Inject MutationObserver into Telegram Web DOM to instantly catch signed MiniApp iframe insertion
         try {
-            for (let actionAttempt = 0; actionAttempt < 3; actionAttempt++) {
-                let actionClicked = false;
-                let btnText = '';
-
-                // Try native Puppeteer element handle first (CDP hardware-level mouse event)
-                const handle = await page.$('.chat-input.chat-input-main button, .chat-input-control-button, .chat-input-plate-button, button.btn-primary');
-                if (handle) {
-                    const info = await page.evaluate((el) => {
-                        if (el.classList.contains('hide')) {
-                            el.classList.remove('hide');
-                            el.style.display = 'inline-flex';
-                            el.style.visibility = 'visible';
-                            el.style.pointerEvents = 'auto';
-                            el.style.opacity = '1';
-                        }
-                        const raw = (el.innerText || el.textContent || '').trim();
-                        const t = raw.toLowerCase();
-                        const isMatch = (
-                            t.includes('open chat') ||
-                            t === 'open' ||
-                            t.includes('open') ||
-                            t.includes('start') ||
-                            t.includes('restart') ||
-                            t.includes('unblock') ||
-                            t.includes('join') ||
-                            el.classList.contains('chat-input-control-button') ||
-                            el.classList.contains('chat-input-plate-button')
-                        );
-                        return { isMatch, raw };
-                    }, handle);
-
-                    if (info && info.isMatch && info.raw.length > 0) {
-                        btnText = info.raw;
-                        try {
-                            await page.evaluate(el => el.scrollIntoView({ behavior: 'instant', block: 'center' }), handle);
-                            await sleep(300);
-                            await handle.click({ delay: 100 });
-                            actionClicked = true;
-                        } catch (_) {}
-                    }
-                }
-
-                // Also execute synthetic click event sequence
-                const synResult = await page.evaluate(() => {
-                    const candidates = Array.from(document.querySelectorAll(
-                        '.chat-input.chat-input-main button, .chat-input-control-button, .chat-input-plate-button, .chat-input-main button, .chat-input button, .bot-menu-button, button.btn-primary'
-                    ));
-                    for (const btn of candidates) {
-                        const rawText = (btn.innerText || btn.textContent || '').trim();
-                        const text = rawText.toLowerCase();
-                        const isMatch = (
-                            text.includes('open chat') ||
-                            text === 'open' ||
-                            text.includes('open') ||
-                            text.includes('start') ||
-                            text.includes('restart') ||
-                            text.includes('unblock') ||
-                            text.includes('join') ||
-                            btn.classList.contains('chat-input-control-button') ||
-                            btn.classList.contains('chat-input-plate-button')
-                        );
-                        if (isMatch && rawText.length > 0) {
-                            if (btn.classList.contains('hide')) {
-                                btn.classList.remove('hide');
-                                btn.style.display = 'inline-flex';
-                                btn.style.visibility = 'visible';
-                                btn.style.pointerEvents = 'auto';
-                                btn.style.opacity = '1';
+            await page.evaluate(() => {
+                window.__capturedSignedMiniAppUrl = null;
+                const observer = new MutationObserver((mutations) => {
+                    for (const m of mutations) {
+                        for (const node of m.addedNodes) {
+                            if (node.nodeType === 1) {
+                                if (node.tagName === 'IFRAME') {
+                                    const src = node.src || node.getAttribute('src') || '';
+                                    if (src.includes('tgWebAppData=')) {
+                                        window.__capturedSignedMiniAppUrl = src;
+                                    }
+                                }
+                                if (node.querySelectorAll) {
+                                    const iframes = node.querySelectorAll('iframe');
+                                    for (const ifr of iframes) {
+                                        const src = ifr.src || ifr.getAttribute('src') || '';
+                                        if (src.includes('tgWebAppData=')) {
+                                            window.__capturedSignedMiniAppUrl = src;
+                                        }
+                                    }
+                                }
                             }
-                            btn.scrollIntoView({ behavior: 'instant', block: 'center' });
-                            const evOpts = { bubbles: true, cancelable: true, view: window };
-                            btn.dispatchEvent(new PointerEvent('pointerdown', evOpts));
-                            btn.dispatchEvent(new MouseEvent('mousedown', evOpts));
-                            btn.dispatchEvent(new PointerEvent('pointerup', evOpts));
-                            btn.dispatchEvent(new MouseEvent('mouseup', evOpts));
-                            btn.dispatchEvent(new MouseEvent('click', evOpts));
-                            if (typeof btn.click === 'function') btn.click();
-                            return { clicked: true, text: rawText };
                         }
                     }
-                    return { clicked: false };
                 });
+                observer.observe(document.body || document.documentElement, { childList: true, subtree: true });
+            });
+        } catch (_) {}
 
-                if (synResult && synResult.clicked) {
-                    actionClicked = true;
-                    btnText = btnText || synResult.text;
-                }
-
-                if (actionClicked) {
-                    logStatus(`Clicked context action button (attempt ${actionAttempt + 1}): "${btnText}"`);
-                    await sleep(3000);
-                    // Check if confirmation modal immediately opened
-                    await handleLaunchConfirmationModal(page);
-                    break;
-                } else {
-                    break;
-                }
-            }
+        // Execute the ONLY automated mouse click: the Open button at coordinates (X: 794, Y: 1008)
+        logStatus(`Executing the single hardware click on Open button at coordinates (X: 794, Y: 1008)...`);
+        try {
+            const openCoords = await resolveAdaptiveCoords(page, DISKWALA_COORDS.openButton);
+            await humanClickCoords(page, openCoords.x, openCoords.y, 'Open button');
+            logStatus('🛑 First click executed. All further automated mouse clicks stopped.');
         } catch (e) {
-            logStatus(`Context action button check: ${e.message}`);
+            logStatus(`Open button click notice: ${e.message}`);
         }
 
-        // Check again if clicking action button triggered launch confirmation modal
         await sleep(2000);
         await handleLaunchConfirmationModal(page);
 
-        // 6. Look for MiniApp trigger buttons (up to 35 attempts ~ 70s on slow EC2)
-        logStatus('Searching for MiniApp launch button...');
-        let appTriggerClicked = false;
-
-        for (let attempt = 0; attempt < 35; attempt++) {
-            if (tokenCaptured) break;
-
-            // Check if confirmation modal already appeared
-            await handleLaunchConfirmationModal(page);
-
-            appTriggerClicked = await page.evaluate((plat) => {
-                function clickWithEvents(el) {
-                    if (!el) return false;
-                    if (el.classList.contains('hide')) {
-                        el.classList.remove('hide');
-                        el.style.display = 'inline-flex';
-                        el.style.visibility = 'visible';
-                        el.style.pointerEvents = 'auto';
-                        el.style.opacity = '1';
-                    }
-                    el.scrollIntoView({ behavior: 'instant', block: 'center' });
-                    const evOpts = { bubbles: true, cancelable: true, view: window };
-                    btnEvents(el, evOpts);
-                    return true;
-                }
-
-                function btnEvents(el, evOpts) {
-                    el.dispatchEvent(new PointerEvent('pointerdown', evOpts));
-                    el.dispatchEvent(new MouseEvent('mousedown', evOpts));
-                    el.dispatchEvent(new PointerEvent('pointerup', evOpts));
-                    el.dispatchEvent(new MouseEvent('mouseup', evOpts));
-                    el.dispatchEvent(new MouseEvent('click', evOpts));
-                    if (typeof el.click === 'function') el.click();
-                }
-
-                // Priority A: Search inline keyboard buttons in messages
-                const inlineButtons = Array.from(document.querySelectorAll(
-                    '.reply-markup button, .inline-button, .InlineButton, button.Button, .reply-keyboard button'
-                ));
-
-                for (const btn of inlineButtons) {
-                    const rawText = (btn.innerText || btn.textContent || '').trim();
-                    const text = rawText.toLowerCase();
-                    if (
-                        text.includes('open') ||
-                        text.includes('app') ||
-                        text.includes('download') ||
-                        text.includes('mini') ||
-                        text.includes(plat) ||
-                        text.includes('start')
-                    ) {
-                        return clickWithEvents(btn);
-                    }
-                }
-
-                // Priority B: Search bottom bar web-app / bot-menu / action buttons (.chat-input.chat-input-main button)
-                const bottomButtons = Array.from(document.querySelectorAll(
-                    '.chat-input.chat-input-main button, .chat-input-control-button, .chat-input-plate-button, .bot-menu-button, button.is-web-app, .chat-secondary-action, .bot-menu, .btn-primary, button[title*="menu" i]'
-                ));
-
-                for (const btn of bottomButtons) {
-                    const rawText = (btn.innerText || btn.textContent || '').trim();
-                    const text = rawText.toLowerCase();
-                    if (
-                        text.includes('open') ||
-                        text.includes('app') ||
-                        text.includes('menu') ||
-                        text.includes('download') ||
-                        text.includes('mini') ||
-                        btn.classList.contains('bot-menu-button') ||
-                        btn.classList.contains('chat-input-control-button') ||
-                        btn.classList.contains('chat-input-plate-button')
-                    ) {
-                        return clickWithEvents(btn);
-                    }
-                }
-
-                // Priority C: Any visible button containing "Open" or "App"
-                const allButtons = Array.from(document.querySelectorAll('button, div[role="button"], a[role="button"]'));
-                const candidate = allButtons.find(b => {
-                    const t = (b.innerText || b.textContent || '').toLowerCase().trim();
-                    return (t.includes('open chat') || t.includes('open app') || t.includes('open diskwala') || t.includes('open terabox') || t === 'open');
-                });
-
-                if (candidate) {
-                    return clickWithEvents(candidate);
-                }
-
-                return false;
-            }, PLATFORM);
-
-            if (appTriggerClicked) {
-                logStatus('MiniApp trigger button clicked! Checking for confirmation modal...');
-                // Also trigger native CDP click if matching button exists
-                try {
-                    const btnHandle = await page.$('.reply-markup button, .chat-input.chat-input-main button, .chat-input-control-button');
-                    if (btnHandle) {
-                        await btnHandle.click({ delay: 100 });
-                    }
-                } catch (_) {}
-
-                await sleep(2500);
-                await handleLaunchConfirmationModal(page);
-                break;
-            }
-
-            await sleep(2000);
-        }
-
-        await sleep(3000);
-
-        // 7. Handle Telegram Web confirmation modal ("DiskWala Video Downloader would like to open its web app...", "Confirm")
-        logStatus('Checking for Telegram Web launch confirmation modal...');
-        for (let i = 0; i < 10; i++) {
-            const confirmed = await handleLaunchConfirmationModal(page);
-            if (confirmed) {
-                await sleep(2500);
-                break;
-            }
-            await sleep(1000);
-        }
-
-        // 8. Locate the MiniApp iframe (waiting up to 90s for slow EC2)
-        logStatus('Locating MiniApp iframe (waiting up to 90s for slow EC2)...');
+        // 8. Locate and isolate the SIGNED MiniApp iframe URL (must contain tgWebAppData=)
+        logStatus(`Locating and isolating signed ${targetName} MiniApp URL with tgWebAppData (waiting up to 90s for slow EC2)...`);
         let targetFrame = null;
         const frameWaitStart = Date.now();
 
-        while ((Date.now() - frameWaitStart) < 90000) {
+        while (!miniappUrl && (Date.now() - frameWaitStart) < 90000) {
             if (tokenCaptured) break;
 
             // Continuously check for and click the confirmation popup if it appears delayed
             await handleLaunchConfirmationModal(page);
 
-            const frames = page.frames();
-            for (const f of frames) {
-                const frameUrl = f.url().toLowerCase();
-                if (
-                    frameUrl.includes('twa.') ||
-                    frameUrl.includes('diskwala') ||
-                    frameUrl.includes('teradownloader') ||
-                    frameUrl.includes('terabox') ||
-                    frameUrl.includes('miniapp') ||
-                    frameUrl.includes('app')
-                ) {
-                    targetFrame = f;
+            // Check MutationObserver immediate capture
+            try {
+                const obsUrl = await page.evaluate(() => window.__capturedSignedMiniAppUrl);
+                if (obsUrl && isSignedMiniAppUrl(obsUrl, PLATFORM)) {
+                    logStatus(`🎯 Captured signed MiniApp URL from MutationObserver: ${obsUrl.slice(0, 80)}...`);
+                    miniappUrl = obsUrl;
                     break;
                 }
-            }
+            } catch (_) {}
 
-            if (targetFrame) break;
-
-            // Also inspect frames with input elements
+            // Check active frames
+            const frames = page.frames();
             for (const f of frames) {
                 try {
-                    const hasInput = await f.evaluate(() => Boolean(document.querySelector('input')));
-                    if (hasInput) {
+                    const u = f.url();
+                    if (isSignedMiniAppUrl(u, PLATFORM)) {
+                        miniappUrl = u;
+                        targetFrame = f;
+                        break;
+                    }
+                    const href = await f.evaluate(() => window.location.href);
+                    if (isSignedMiniAppUrl(href, PLATFORM)) {
+                        miniappUrl = href;
                         targetFrame = f;
                         break;
                     }
                 } catch (_) {}
             }
 
-            if (targetFrame) break;
+            if (miniappUrl) break;
 
-            const elapsedSec = Math.round((Date.now() - frameWaitStart) / 1000);
-            if (elapsedSec > 0 && elapsedSec % 15 === 0) {
-                logStatus(`Scanning for MiniApp iframe (${elapsedSec}s elapsed)...`);
-            }
-
-            await sleep(2500);
-        }
-
-        if (!targetFrame) {
-            logStatus('Primary iframe not isolated; scanning all frames directly...');
-            targetFrame = page.mainFrame();
-        } else {
-            logStatus(`MiniApp iframe located: ${targetFrame.url().slice(0, 60)}...`);
-        }
-
-        // Give the iframe DOM 3.5 seconds to settle on slow EC2
-        await sleep(3500);
-
-        // 9. Enter dummy link into input field (relaxed typing & verification for EC2)
-        const dummyUrl = DUMMY_LINKS[PLATFORM] || DUMMY_LINKS['diskwala'];
-        logStatus(`Preparing to enter dummy link for ${PLATFORM}...`);
-
-        let inputFoundAndFilled = false;
-        const allFramesToTry = [targetFrame, ...page.frames().filter(f => f !== targetFrame)];
-
-        for (const frame of allFramesToTry) {
-            if (inputFoundAndFilled || tokenCaptured) break;
-
+            // Also check iframe src directly in DOM (including shadow roots and links)
             try {
-                const inputSelectors = [
-                    'input[placeholder*="link" i]',
-                    'input[placeholder*="url" i]',
-                    'input[placeholder*="diskwala" i]',
-                    'input[placeholder*="terabox" i]',
-                    'input[type="text"]',
-                    'input[type="url"]',
-                    'input',
-                    'textarea',
-                ];
+                const domSignedUrl = await page.evaluate((plat) => {
+                    function getIframes(root) {
+                        let list = Array.from(root.querySelectorAll('iframe'));
+                        try {
+                            const allEls = root.querySelectorAll('*');
+                            for (const el of allEls) {
+                                if (el.shadowRoot) {
+                                    list = list.concat(getIframes(el.shadowRoot));
+                                }
+                            }
+                        } catch (_) {}
+                        return list;
+                    }
 
-                let inputHandle = null;
-                for (const sel of inputSelectors) {
-                    try {
-                        const el = await frame.$(sel);
-                        if (el) {
-                            inputHandle = el;
-                            break;
+                    const iframes = getIframes(document);
+                    for (const iframe of iframes) {
+                        const src = iframe.src || iframe.getAttribute('src') || iframe.dataset.src || '';
+                        if (src && src.includes('tgWebAppData=')) {
+                            const lower = src.toLowerCase();
+                            const isMatch = (plat === 'diskwala')
+                                ? (lower.includes('diskwala') || lower.includes('miniapp') || !lower.includes('teradownloader'))
+                                : (lower.includes('teradownloader') || lower.includes('twa.') || lower.includes('terabox') || lower.includes('apiwala') || !lower.includes('diskwala'));
+                            if (isMatch) return src;
                         }
-                    } catch (_) {}
+                    }
+
+                    // Check links or buttons with signed URL
+                    const links = Array.from(document.querySelectorAll('a[href*="tgWebAppData="]'));
+                    for (const a of links) {
+                        const h = a.href || a.getAttribute('href') || '';
+                        if (h && h.includes('tgWebAppData=')) return h;
+                    }
+
+                    return null;
+                }, PLATFORM);
+
+                if (domSignedUrl) {
+                    miniappUrl = domSignedUrl;
+                    break;
                 }
+            } catch (_) {}
 
-                if (inputHandle) {
-                    logStatus('Found link input field in MiniApp. Registering input at relaxed EC2 speed...');
-                    try {
-                        await frame.evaluate((el) => {
-                            el.scrollIntoView({ behavior: 'instant', block: 'center' });
-                        }, inputHandle);
-                    } catch (_) {}
-                    await sleep(600);
-
-                    // Focus & clear field thoroughly
-                    try {
-                        await inputHandle.click({ clickCount: 3, delay: 60 });
-                    } catch (_) {}
-                    await sleep(300);
-
-                    await frame.evaluate((el) => {
-                        el.focus();
-                        el.value = '';
-                        el.dispatchEvent(new Event('input', { bubbles: true }));
-                        el.dispatchEvent(new Event('change', { bubbles: true }));
-                    }, inputHandle);
-                    await sleep(400);
-
-                    // Type slowly and deliberately (60-100ms per character) so EC2 doesn't drop keystrokes
-                    logStatus(`Typing link at relaxed EC2 speed: ${dummyUrl}...`);
-                    for (const char of dummyUrl) {
-                        if (tokenCaptured) break;
-                        await inputHandle.type(char, { delay: Math.floor(Math.random() * 40) + 60 });
-                    }
-                    await sleep(800);
-
-                    // Verification: check if the value was completely registered
-                    const currentVal = await frame.evaluate(el => el.value, inputHandle);
-                    if (currentVal !== dummyUrl) {
-                        logStatus(`Input value was incomplete ("${currentVal}"). Direct injection fallback applied...`);
-                        await frame.evaluate((el, val) => {
-                            el.value = val;
-                            el.dispatchEvent(new Event('input', { bubbles: true }));
-                            el.dispatchEvent(new Event('change', { bubbles: true }));
-                        }, inputHandle, dummyUrl);
-                        await sleep(500);
-                    }
-
-                    // Trigger blur to ensure React/Vue field validation commits
-                    await frame.evaluate((el) => {
-                        el.dispatchEvent(new Event('input', { bubbles: true }));
-                        el.dispatchEvent(new Event('change', { bubbles: true }));
-                        el.blur();
-                    }, inputHandle);
-                    await sleep(800);
-
-                    // Multi-click retry loop for the Download button (up to 4 attempts on EC2)
-                    logStatus('Locating and clicking Download button (with multi-click retry)...');
-                    for (let clickAttempt = 0; clickAttempt < 4; clickAttempt++) {
-                        if (tokenCaptured) break;
-
-                        // Try native Puppeteer element handle click first
-                        let btnHandle = null;
-                        const btnHandles = await frame.$$('button, div[role="button"], a[role="button"], .btn');
-                        for (const bh of btnHandles) {
-                            const isDl = await frame.evaluate((b) => {
-                                const t = (b.innerText || b.textContent || '').toLowerCase().trim();
-                                return (
-                                    t.includes('download') ||
-                                    t.includes('get') ||
-                                    t.includes('submit') ||
-                                    t.includes('fetch') ||
-                                    t.includes('play')
-                                );
-                            }, bh);
-                            if (isDl) {
-                                btnHandle = bh;
+            // Fallback: If 8 seconds elapsed after first click and no modal/signed URL appeared,
+            // trigger the WebApp button via clean non-intrusive DOM click
+            const elapsedSec = Math.round((Date.now() - frameWaitStart) / 1000);
+            if (elapsedSec >= 8 && elapsedSec % 8 === 0 && !miniappUrl) {
+                try {
+                    await page.evaluate((plat) => {
+                        const candidateButtons = Array.from(document.querySelectorAll(
+                            '.chat-input.chat-input-main button, .chat-input-control-button, .chat-input-plate-button, .bot-menu-button, .reply-markup button, button.is-web-app'
+                        ));
+                        for (const btn of candidateButtons) {
+                            const t = (btn.innerText || btn.textContent || '').toLowerCase();
+                            if (
+                                btn.classList.contains('is-web-app') || t.includes('open') || t.includes('app') ||
+                                t.includes('download') || t.includes(plat) || btn.classList.contains('bot-menu-button')
+                            ) {
+                                btn.click();
                                 break;
                             }
                         }
+                    }, PLATFORM);
+                } catch (_) {}
+            }
 
-                        if (btnHandle) {
-                            try {
-                                await frame.evaluate(el => el.scrollIntoView({ behavior: 'instant', block: 'center' }), btnHandle);
-                                await sleep(200);
-                                await btnHandle.click({ delay: 100 });
-                            } catch (_) {}
-                        }
+            if (elapsedSec > 0 && elapsedSec % 15 === 0) {
+                logStatus(`Waiting for signed MiniApp URL with tgWebAppData= (${elapsedSec}s elapsed)...`);
+            }
 
-                        // Also trigger synthetic event chain
-                        const clicked = await frame.evaluate(() => {
-                            const candidates = Array.from(document.querySelectorAll('button, div[role="button"], a[role="button"], .btn'));
-                            const btn = candidates.find(b => {
-                                const t = (b.innerText || '').toLowerCase().trim();
-                                return (
-                                    t.includes('download') ||
-                                    t.includes('get') ||
-                                    t.includes('submit') ||
-                                    t.includes('fetch') ||
-                                    t.includes('play')
-                                );
-                            });
+            await sleep(1500);
+        }
 
-                            if (btn) {
-                                btn.scrollIntoView({ behavior: 'instant', block: 'center' });
-                                const evOpts = { bubbles: true, cancelable: true, view: window };
-                                btn.dispatchEvent(new PointerEvent('pointerdown', evOpts));
-                                btn.dispatchEvent(new MouseEvent('mousedown', evOpts));
-                                btn.dispatchEvent(new PointerEvent('pointerup', evOpts));
-                                btn.dispatchEvent(new MouseEvent('mouseup', evOpts));
-                                btn.dispatchEvent(new MouseEvent('click', evOpts));
-                                if (typeof btn.click === 'function') btn.click();
-                                return true;
-                            }
+        // 9. Navigate directly to isolated MiniApp URL and fill the download form
+        const dummyUrl = DUMMY_LINKS[PLATFORM] || DUMMY_LINKS['diskwala'];
+        let formSubmitted = false;
 
-                            // Try button adjacent to input
-                            const inputEl = document.querySelector('input');
-                            if (inputEl && inputEl.parentElement) {
-                                const siblingBtn = inputEl.parentElement.querySelector('button');
-                                if (siblingBtn) {
-                                    siblingBtn.scrollIntoView({ behavior: 'instant', block: 'center' });
-                                    siblingBtn.click();
-                                    return true;
-                                }
-                            }
-                            return false;
-                        });
+        if (miniappUrl) {
+            logStatus(`🎯 Isolated MiniApp URL: ${miniappUrl.slice(0, 80)}...`);
+            logStatus('Navigating directly to isolated MiniApp URL...');
+            try {
+                await page.goto(miniappUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+            } catch (navErr) {
+                logStatus(`Direct navigation notice: ${navErr.message}. Continuing...`);
+            }
+            await sleep(3000);
 
-                        if (clicked || btnHandle) {
-                            inputFoundAndFilled = true;
-                            logStatus(`Download button clicked (attempt ${clickAttempt + 1}). Awaiting API token...`);
-                            await sleep(2500);
-                            if (tokenCaptured) break;
-                        }
+            // Locate the input field on the isolated MiniApp page
+            logStatus('Searching for download form input on isolated MiniApp page...');
+            let inputHandle = null;
+            for (let waitAttempt = 0; waitAttempt < 20; waitAttempt++) {
+                if (tokenCaptured) break;
+                try {
+                    inputHandle = await page.$(
+                        'input[placeholder*="Enter Diskwala Link" i], input[placeholder*="Diskwala" i], input[placeholder*="TeraBox" i], input[placeholder*="terabox" i], input[placeholder*="link" i], input[placeholder*="url" i], form.flex input[type="text"], form input[type="text"], form input[type="url"], input[type="text"], input[type="url"], input'
+                    );
+                    if (inputHandle) {
+                        const isVis = await page.evaluate(el => {
+                            const r = el.getBoundingClientRect();
+                            return r.width > 0 && r.height > 0;
+                        }, inputHandle);
+                        if (isVis) break;
                     }
+                } catch (_) {}
+                await sleep(1000);
+            }
+
+            if (inputHandle) {
+                logStatus('Found download link form input. Focusing and entering dummy link...');
+                await inputHandle.focus();
+                await page.evaluate(el => el.focus(), inputHandle);
+                await sleep(350);
+
+                // Clear input via CDP keyboard
+                await page.keyboard.down('Control');
+                await page.keyboard.press('KeyA');
+                await page.keyboard.up('Control');
+                await sleep(100);
+                await page.keyboard.press('Backspace');
+                await sleep(150);
+
+                logStatus(`Entering dummy link via realistic keystrokes: ${dummyUrl}...`);
+                for (const char of dummyUrl) {
+                    await page.keyboard.type(char, { delay: Math.floor(Math.random() * 35) + 40 });
                 }
-            } catch (_) {}
+                await sleep(400);
+
+                // Ensure value is set in DOM
+                const val = await page.evaluate(el => el.value, inputHandle);
+                if (!val || val !== dummyUrl) {
+                    logStatus('Syncing dummy link value into DOM as safety...');
+                    await page.evaluate((el, v) => {
+                        el.value = v;
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                    }, inputHandle, dummyUrl);
+                }
+                await sleep(300);
+
+                // Hit Enter to submit form
+                logStatus('Submitting form: hitting ENTER...');
+                await page.keyboard.press('Enter');
+                formSubmitted = true;
+                await sleep(1000);
+
+                // Also click Download submit button via direct DOM click (no mouse movement)
+                try {
+                    const clickedBtn = await page.evaluate(() => {
+                        const formBtn = document.querySelector('form button[type="submit"], button[type="submit"], form.flex button, form button');
+                        if (formBtn) {
+                            formBtn.click();
+                            return (formBtn.innerText || 'submit').trim();
+                        }
+                        const allBtns = Array.from(document.querySelectorAll('button, div[role="button"], a[role="button"], input[type="submit"]'));
+                        for (const b of allBtns) {
+                            const t = (b.innerText || b.value || b.textContent || '').trim().toLowerCase();
+                            const rect = b.getBoundingClientRect();
+                            if (rect.width > 0 && rect.height > 0 && (t.includes('download') || t.includes('get link') || t.includes('fetch') || t.includes('submit'))) {
+                                b.click();
+                                return t;
+                            }
+                        }
+                        return null;
+                    });
+                    if (clickedBtn) {
+                        logStatus(`Triggered Download submit button via direct DOM click ("${clickedBtn}").`);
+                    }
+                } catch (_) {}
+            }
+        }
+
+        // Fallback: If direct navigation was not used, scan frames as safety net
+        if (!formSubmitted && !tokenCaptured) {
+            logStatus('Direct navigation not used; scanning frames as fallback...');
+            const allFramesToTry = [targetFrame, ...page.frames().filter(f => f && f !== targetFrame)].filter(Boolean);
+
+            for (const frame of allFramesToTry) {
+                if (formSubmitted || tokenCaptured) break;
+
+                try {
+                    const inputSelectors = [
+                        'input[placeholder*="Enter Diskwala Link" i]',
+                        'input[placeholder*="Diskwala" i]',
+                        'input[placeholder*="TeraBox" i]',
+                        'input[placeholder*="terabox" i]',
+                        'input[placeholder*="link" i]',
+                        'input[type="text"]',
+                        'input',
+                    ];
+
+                    let inEl = null;
+                    for (const sel of inputSelectors) {
+                        try {
+                            const el = await frame.$(sel);
+                            if (el) { inEl = el; break; }
+                        } catch (_) {}
+                    }
+
+                    if (inEl) {
+                        logStatus('Found link input field in frame. Entering link...');
+                        await inEl.focus();
+                        await frame.evaluate(el => el.focus(), inEl);
+                        await page.keyboard.type(dummyUrl);
+                        await sleep(500);
+                        await page.keyboard.press('Enter');
+
+                        try {
+                            await frame.evaluate(() => {
+                                const b = document.querySelector('button[type="submit"], form button, button');
+                                if (b) b.click();
+                            });
+                        } catch (_) {}
+                        formSubmitted = true;
+                        break;
+                    }
+                } catch (_) {}
+            }
         }
 
         // 10. Wait up to 60 seconds for the token to be intercepted (with periodic re-click fallback)
@@ -935,27 +1002,45 @@ if (watchdog.unref) watchdog.unref();
                 logStatus(`Waiting for Bearer token on network (${elapsed}s elapsed)...`);
             }
 
-            // Fallback re-click at 10s and 20s if the token has not arrived (safeguard against laggy network)
-            if (elapsed >= 10 && !reclickDone1 && !tokenCaptured && targetFrame) {
+            // Fallback re-press Enter and DOM click at 10s and 20s if the token has not arrived
+            if (elapsed >= 10 && !reclickDone1 && !tokenCaptured) {
                 reclickDone1 = true;
-                logStatus('Token not yet received at 10s. Re-triggering Download button click...');
+                logStatus('Token not yet received at 10s. Re-triggering Enter & Download button via DOM...');
                 try {
-                    await targetFrame.evaluate(() => {
-                        const b = document.querySelector('button');
-                        if (b) b.click();
+                    await page.keyboard.press('Enter');
+                    await page.evaluate(() => {
+                        const btn = document.querySelector('form.flex button[type="submit"], form button[type="submit"], button[type="submit"], form button');
+                        if (btn) btn.click();
                     });
                 } catch (_) {}
+                if (targetFrame) {
+                    try {
+                        await targetFrame.evaluate(() => {
+                            const btn = document.querySelector('button[type="submit"], button');
+                            if (btn) btn.click();
+                        });
+                    } catch (_) {}
+                }
             }
 
-            if (elapsed >= 20 && !reclickDone2 && !tokenCaptured && targetFrame) {
+            if (elapsed >= 20 && !reclickDone2 && !tokenCaptured) {
                 reclickDone2 = true;
-                logStatus('Token not yet received at 20s. Second re-trigger of Download button click...');
+                logStatus('Token not yet received at 20s. Second re-trigger of Enter & Download button via DOM...');
                 try {
-                    await targetFrame.evaluate(() => {
-                        const b = document.querySelector('button');
-                        if (b) b.click();
+                    await page.keyboard.press('Enter');
+                    await page.evaluate(() => {
+                        const btn = document.querySelector('form.flex button[type="submit"], form button[type="submit"], button[type="submit"], form button');
+                        if (btn) btn.click();
                     });
                 } catch (_) {}
+                if (targetFrame) {
+                    try {
+                        await targetFrame.evaluate(() => {
+                            const btn = document.querySelector('button[type="submit"], button');
+                            if (btn) btn.click();
+                        });
+                    } catch (_) {}
+                }
             }
 
             await sleep(1000);

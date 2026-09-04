@@ -58,5 +58,17 @@ DISKWALA_BEARER_TOKEN = os.getenv("DISKWALA_BEARER_TOKEN", "").strip()
 # TeraBox MiniApp Direct API Configuration (teradownloader.pro)
 TERABOX_BEARER_TOKEN = os.getenv("TERABOX_BEARER_TOKEN", "").strip()
 
+# Telethon MiniApp Bearer token max age in hours before on-demand refresh (default: 2 hours)
+_raw_max_age = (
+    os.getenv("TOKEN_MAX_AGE_HOURS", "")
+    or os.getenv("TOKEN_REFRESH_INTERVAL_HOURS", "")
+    or os.getenv("TOKEN_REFRESH_HOURS", "2")
+).strip()
+try:
+    TOKEN_MAX_AGE_HOURS = float(_raw_max_age) if _raw_max_age else 2.0
+except ValueError:
+    TOKEN_MAX_AGE_HOURS = 2.0
+TOKEN_REFRESH_INTERVAL_HOURS = TOKEN_MAX_AGE_HOURS
+
 
 

@@ -99,9 +99,20 @@ async def _resolve_via_miniapp_api(terabox_url: str) -> Tuple[bool, Optional[Dic
     """
     Directly resolves TeraBox links via the high-speed MiniApp API (apiwala.teradownloader.pro).
     """
-    token = get_terabox_token()
+    # Ensure token is valid (auto-refreshes via Telethon if missing or older than TOKEN_MAX_AGE_HOURS)
+    try:
+        from telethon_extractor import ensure_valid_token
+        ok, valid_token, _ = await ensure_valid_token("terabox")
+        if ok and valid_token:
+            token = valid_token
+        else:
+            token = get_terabox_token()
+    except Exception as e:
+        logger.debug(f"[TeraBox] ensure_valid_token notice: {e}")
+        token = get_terabox_token()
+
     if not token:
-        return False, None, "TeraBox MiniApp token is not set."
+        return False, None, "TeraBox MiniApp token is not set. Use `/eztera` or `/setterabox <token>` in chat to configure it."
 
     logger.info(f"[TeraBox] Querying MiniApp Direct API for {terabox_url[:80]}...")
 
@@ -136,8 +147,19 @@ async def _resolve_via_miniapp_api(terabox_url: str) -> Tuple[bool, Optional[Dic
     try:
         resp = await asyncio.to_thread(_post)
         if resp.status_code == 401:
-            logger.warning("[TeraBox] MiniApp token unauthorized or expired (HTTP 401).")
-            return False, None, "TeraBox MiniApp token is unauthorized or expired."
+            logger.warning("[TeraBox] MiniApp token expired (HTTP 401). Triggering on-demand Telethon refresh...")
+            try:
+                from telethon_extractor import ensure_valid_token
+                ok_ref, new_tok, _ = await ensure_valid_token("terabox", force_refresh=True)
+                if ok_ref and new_tok:
+                    headers["authorization"] = new_tok
+                    resp = await asyncio.to_thread(_post)
+            except Exception as ref_err:
+                logger.error(f"[TeraBox] Auto-refresh on 401 failed: {ref_err}")
+
+        if resp.status_code == 401:
+            logger.warning("[TeraBox] MiniApp token unauthorized or expired after retry.")
+            return False, None, "TeraBox MiniApp token is unauthorized or expired. Auto-refresh failed; please run `/eztera`."
 
         if resp.status_code != 200:
             logger.warning(f"[TeraBox] MiniApp API returned HTTP {resp.status_code}")

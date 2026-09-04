@@ -7,3 +7,5 @@ aiofiles>=23.2.0
 pyrogram>=2.0.106
 cryptography>=42.0.0
 requests>=2.31.0
+telethon>=1.36.0
+cryptg>=0.5.0

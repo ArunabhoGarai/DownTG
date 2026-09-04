@@ -184,9 +184,20 @@ async def _resolve_via_miniapp_api(diskwala_url: str) -> Tuple[bool, Optional[Di
     Directly resolves Diskwala links via Telegram MiniApp backend (api2.diskwala.net)
     with instant AES-GCM decryption.
     """
-    token = get_diskwala_token()
+    # Ensure token is valid (auto-refreshes via Telethon if missing or older than TOKEN_MAX_AGE_HOURS)
+    try:
+        from telethon_extractor import ensure_valid_token
+        ok, valid_token, _ = await ensure_valid_token("diskwala")
+        if ok and valid_token:
+            token = valid_token
+        else:
+            token = get_diskwala_token()
+    except Exception as e:
+        logger.debug(f"[Diskwala] ensure_valid_token notice: {e}")
+        token = get_diskwala_token()
+
     if not token:
-        return False, None, "Diskwala Bearer Token is not set. Use `/setdiskwala <token>` in chat to configure it."
+        return False, None, "Diskwala Bearer Token is not set. Use `/ezdisk` or `/setdiskwala <token>` in chat to configure it."
 
     logger.info(f"[Diskwala] Querying MiniApp Direct API for {diskwala_url[:80]}...")
 
@@ -212,8 +223,20 @@ async def _resolve_via_miniapp_api(diskwala_url: str) -> Tuple[bool, Optional[Di
     try:
         t_res = await asyncio.to_thread(_trigger)
         if t_res.status_code == 401:
-            logger.warning("[Diskwala] MiniApp token unauthorized/expired (HTTP 401).")
-            return False, None, "Diskwala Bearer Token is unauthorized or expired. Please update it with `/setdiskwala <token>`."
+            logger.warning("[Diskwala] MiniApp token expired (HTTP 401). Triggering on-demand Telethon refresh...")
+            try:
+                from telethon_extractor import ensure_valid_token
+                ok_ref, new_tok, _ = await ensure_valid_token("diskwala", force_refresh=True)
+                if ok_ref and new_tok:
+                    headers["authorization"] = new_tok
+                    t_res = await asyncio.to_thread(_trigger)
+            except Exception as ref_err:
+                logger.error(f"[Diskwala] Auto-refresh on 401 failed: {ref_err}")
+
+        if t_res.status_code == 401:
+            logger.warning("[Diskwala] MiniApp token unauthorized/expired after retry.")
+            return False, None, "Diskwala Bearer Token is unauthorized or expired. Auto-refresh failed; please run `/ezdisk`."
+
         t_data = t_res.json()
         if not t_data.get("ok"):
             err_msg = t_data.get("error") or "API rejected link."

@@ -28,6 +28,7 @@ from config import (
     MAX_CONCURRENT_DOWNLOADS,
     ADMIN_USER_ID,
     BASE_DIR,
+    TOKEN_REFRESH_INTERVAL_HOURS,
 )
 from downloader import (
     extract_media_info,
@@ -80,6 +81,7 @@ from link_protection import (
     clear_link_cooldowns,
     COOLDOWN_ERROR_MESSAGE,
 )
+from telethon_extractor import fetch_telethon_bearer
 
 logger = logging.getLogger(__name__)
 
@@ -595,6 +597,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/setcookie <platform> <cookie_text>` — Save raw cookie text directly in chat (e.g. `/setcookie terabox ndus=...`).\n"
         "• `/clearcookie <platform>` — Delete cookies for `youtube`, `instagram`, `facebook`, `terabox`, or `generic`.\n"
         "• *Tip:* Drag & drop any `cookies.txt` document with caption `youtube`, `instagram`, `facebook`, or `terabox` to update automatically!\n\n"
+        "⚡ **Instant Telethon Token Fetchers (Headless MTProto):**\n"
+        "• `/ezdisk` — Instantly fetch & save DiskWala Bearer token via native Telethon (~0.3s).\n"
+        "• `/eztera` — Instantly fetch & save TeraBox Bearer token via native Telethon (~0.3s).\n\n"
         "💿 **Diskwala MiniApp Controls:**\n"
         "• `/setdiskwala <bearer_token>` — Update or refresh Diskwala MiniApp Authorization token.\n"
         "• `/diskwalastatus` — Check Diskwala API & resolver status.\n\n"
@@ -1863,8 +1868,9 @@ async def diskwalastatus_command(update: Update, context: ContextTypes.DEFAULT_T
         "━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"⚡ **MiniApp Direct API**: {token_status}\n"
         "🔐 **Decryption**: AES-GCM (Hardware-Accelerated)\n"
-        "📁 **Storage**: Saved directly in `.env` (`DISKWALA_BEARER_TOKEN`)\n\n"
-        "💡 *Use `/vnc` to auto-capture or `/setdiskwala <token>` to paste manually.*"
+        "📁 **Storage**: Saved directly in `.env` (`DISKWALA_BEARER_TOKEN`)\n"
+        f"🔄 **Telethon Auto-Refresh**: ⚡ On-Demand (Triggers if expired >{TOKEN_MAX_AGE_HOURS}h or on HTTP 401)\n\n"
+        "💡 *Use `/ezdisk` for instant Telethon refresh or `/setdiskwala <token>`.*"
     )
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.MARKDOWN, reply_to_message_id=update.message.message_id)
 
@@ -1915,8 +1921,9 @@ async def teraboxstatus_command(update: Update, context: ContextTypes.DEFAULT_TY
         f"⚡ **Priority 1 (MiniApp API)**: {token_status}\n"
         "🕷️ **Priority 2 (Headless Crawler)**: 🟢 Available (Fallback)\n"
         "🍪 **Priority 3 (Gateway / Cookies)**: 🟢 Available (Fallback)\n"
-        "📁 **Storage**: Saved directly in `.env` (`TERABOX_BEARER_TOKEN`)\n\n"
-        "💡 *Use `/vnc` to auto-capture or `/setterabox <token>` to paste manually.*"
+        "📁 **Storage**: Saved directly in `.env` (`TERABOX_BEARER_TOKEN`)\n"
+        f"🔄 **Telethon Auto-Refresh**: ⚡ On-Demand (Triggers if expired >{TOKEN_MAX_AGE_HOURS}h or on HTTP 401)\n\n"
+        "💡 *Use `/eztera` for instant Telethon refresh or `/setterabox <token>`.*"
     )
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.MARKDOWN, reply_to_message_id=update.message.message_id)
 
@@ -2128,6 +2135,76 @@ async def autovnc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def ezdisk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to instantly fetch & save DiskWala Bearer token via native Telethon MTProto."""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text(DEV_RESTRICTED_MESSAGE)
+        return
+
+    status_msg = await update.message.reply_text(
+        "⚡ **Fetching DiskWala Bearer Token via Telethon MTProto...**\n"
+        "Connecting to Telegram Data Center and requesting MiniApp...",
+        parse_mode=constants.ParseMode.MARKDOWN,
+        reply_to_message_id=update.message.message_id,
+    )
+
+    success, token, err = await fetch_telethon_bearer("diskwala")
+    if success and token:
+        excerpt = f"{token[:40]}...{token[-25:]}"
+        await status_msg.edit_text(
+            "🎉 **DiskWala Bearer Token Auto-Captured!**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "• **Method:** Native MTProto Query (~0.3s)\n"
+            "• **Target Bot:** `@sky577bot` (`#7802633228`)\n"
+            "• **Saved to:** `.env` (`DISKWALA_BEARER_TOKEN`)\n"
+            f"• **Token:** `{excerpt}`\n"
+            "• **Status:** Diskwala Direct API is now active & ready for downloads!",
+            parse_mode=constants.ParseMode.MARKDOWN,
+        )
+    else:
+        await status_msg.edit_text(
+            f"❌ **Failed to fetch DiskWala token via Telethon:**\n`{err}`\n\n"
+            "💡 *Tip: Ensure the user session file exists on the server or use `/autovnc diskwala` as fallback.*",
+            parse_mode=constants.ParseMode.MARKDOWN,
+        )
+
+
+async def eztera_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command to instantly fetch & save TeraBox Bearer token via native Telethon MTProto."""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text(DEV_RESTRICTED_MESSAGE)
+        return
+
+    status_msg = await update.message.reply_text(
+        "⚡ **Fetching TeraBox Bearer Token via Telethon MTProto...**\n"
+        "Connecting to Telegram Data Center and requesting MiniApp...",
+        parse_mode=constants.ParseMode.MARKDOWN,
+        reply_to_message_id=update.message.message_id,
+    )
+
+    success, token, err = await fetch_telethon_bearer("terabox")
+    if success and token:
+        excerpt = f"{token[:40]}...{token[-25:]}"
+        await status_msg.edit_text(
+            "🎉 **TeraBox Bearer Token Auto-Captured!**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "• **Method:** Native MTProto Query (~0.3s)\n"
+            "• **Target Bot:** `@terabox_downloader_new_bot` (`#7802009139`)\n"
+            "• **Saved to:** `.env` (`TERABOX_BEARER_TOKEN`)\n"
+            f"• **Token:** `{excerpt}`\n"
+            "• **Status:** TeraBox Direct API is now active & ready for downloads!",
+            parse_mode=constants.ParseMode.MARKDOWN,
+        )
+    else:
+        await status_msg.edit_text(
+            f"❌ **Failed to fetch TeraBox token via Telethon:**\n`{err}`\n\n"
+            "💡 *Tip: Ensure the user session file exists on the server or use `/autovnc tera` as fallback.*",
+            parse_mode=constants.ParseMode.MARKDOWN,
+        )
+
+
 def register_handlers(application):
     """Register all bot command and message handlers."""
     application.add_handler(CommandHandler("start", start_command))
@@ -2154,6 +2231,8 @@ def register_handlers(application):
     application.add_handler(CommandHandler("diskwalastatus", diskwalastatus_command))
     application.add_handler(CommandHandler("setterabox", setterabox_command))
     application.add_handler(CommandHandler("teraboxstatus", teraboxstatus_command))
+    application.add_handler(CommandHandler("ezdisk", ezdisk_command))
+    application.add_handler(CommandHandler("eztera", eztera_command))
     application.add_handler(CommandHandler("vnc", vnc_command))
     application.add_handler(CommandHandler("autovnc", autovnc_command))
     application.add_handler(CommandHandler("stopvnc", stopvnc_command))
