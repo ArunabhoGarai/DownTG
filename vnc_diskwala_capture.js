@@ -8,11 +8,17 @@
 const path = require('path');
 const fs = require('fs');
 
-const TARGET_URL = process.argv[2] || 'https://web.telegram.org/a/';
+const TARGET_URL = process.argv[2] || 'https://web.telegram.org/a/#7802633228';
 const USER_DATA_DIR = process.argv[3] || path.join(__dirname, 'data', 'tg_browser_profile');
 
 if (!fs.existsSync(USER_DATA_DIR)) {
     fs.mkdirSync(USER_DATA_DIR, { recursive: true });
+}
+
+// Clean up stale lock/port files if any
+const devtoolsPortFile = path.join(USER_DATA_DIR, 'DevToolsActivePort');
+if (fs.existsSync(devtoolsPortFile)) {
+    try { fs.unlinkSync(devtoolsPortFile); } catch (_) {}
 }
 
 function logStatus(msg) {
@@ -46,10 +52,10 @@ function logStatus(msg) {
         userDataDir: USER_DATA_DIR,
         defaultViewport: null,
         args: [
-            TARGET_URL,
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--start-maximized',
+            '--window-position=0,0',
             '--window-size=1920,1080',
             '--disable-dev-shm-usage',
             '--disable-infobars',
@@ -85,8 +91,25 @@ function logStatus(msg) {
         }
     }
 
-    await page.setViewport({ width: 1920, height: 1080 });
+    // DO NOT force setViewport(1920, 1080) because fixed 1080 height causes the bottom of Telegram to be cut off!
     await page.bringToFront();
+
+    try {
+        const dims = await page.evaluate(() => {
+            return {
+                innerWidth: window.innerWidth,
+                innerHeight: window.innerHeight,
+            };
+        });
+        logStatus(`Viewport client area: ${dims.innerWidth}x${dims.innerHeight}`);
+
+        if (dims.innerHeight < 820) {
+            logStatus('Compact vertical space detected (<820px). Applying 90% zoom...');
+            await page.evaluate(() => {
+                document.documentElement.style.zoom = '90%';
+            });
+        }
+    } catch (_) {}
 
     let tokenCaptured = false;
 
@@ -131,13 +154,21 @@ function logStatus(msg) {
         }
     });
 
-    if (!page.url().includes('telegram.org')) {
-        logStatus(`Navigating to ${TARGET_URL}...`);
-        try {
-            await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
-        } catch (e) {
-            logStatus(`Navigation notice: ${e.message}`);
-        }
+    logStatus(`Navigating directly to ${TARGET_URL}...`);
+    try {
+        await page.goto(TARGET_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    } catch (e) {
+        logStatus(`Navigation notice: ${e.message}`);
+    }
+
+    const targetHash = TARGET_URL.includes('#') ? ('#' + TARGET_URL.split('#')[1]) : '';
+    if (targetHash) {
+        await new Promise(r => setTimeout(r, 1500));
+        await page.evaluate((h) => {
+            if (window.location.hash !== h) {
+                window.location.hash = h;
+            }
+        }, targetHash);
     }
     await page.bringToFront();
 

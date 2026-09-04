@@ -72,6 +72,14 @@ from vnc_manager import (
     start_autovnc_session,
     stop_vnc_session,
 )
+from link_protection import (
+    is_link_on_cooldown,
+    mark_link_in_progress,
+    mark_link_completed,
+    mark_link_failed,
+    clear_link_cooldowns,
+    COOLDOWN_ERROR_MESSAGE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -849,6 +857,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = match.group(0)
     user_id = update.effective_user.id
 
+    # Anti-Bot Protection: Enforce 5-minute cooldown on duplicate link downloads
+    on_cooldown, remaining_sec = is_link_on_cooldown(url)
+    if on_cooldown:
+        logger.info(f"[handle_message] Link {url} blocked by 5-min anti-bot cooldown ({int(remaining_sec)}s remaining)")
+        await update.message.reply_text(
+            f"⚠️ {COOLDOWN_ERROR_MESSAGE}",
+            reply_to_message_id=update.message.message_id,
+        )
+        return
+
     # Check concurrent download capacity before analyzing link
     if get_active_downloads_count() >= MAX_CONCURRENT_DOWNLOADS:
         await update.message.reply_text(
@@ -874,6 +892,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         ACTIVE_TASKS[task_id] = asyncio.current_task()
+        mark_link_in_progress(url)
 
         # For TeraBox links: Run unified Crawler download directly
         if is_terabox_url(url):
@@ -906,12 +925,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         info=dl_info,
                         progress_status_updater=lambda txt: edit_status_msg_safe(status_msg, txt),
                     )
+                    mark_link_completed(url)
                     try:
                         await status_msg.delete()
                     except Exception:
                         pass
                     return
                 else:
+                    mark_link_failed(url)
                     err = error_msg or "TeraBox download failed."
                     # Log 100% full raw technical error to terminal
                     logger.error(f"[handle_message] TeraBox failed: {err}")
@@ -958,12 +979,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         info=dl_info,
                         progress_status_updater=lambda txt: edit_status_msg_safe(status_msg, txt),
                     )
+                    mark_link_completed(url)
                     try:
                         await status_msg.delete()
                     except Exception:
                         pass
                     return
                 else:
+                    mark_link_failed(url)
                     err = error_msg or "Diskwala download failed."
                     # Log 100% full raw technical error to terminal
                     logger.error(f"[handle_message] Diskwala failed: {err}")
@@ -990,6 +1013,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if not success or not info:
+            mark_link_failed(url)
             err = error_msg or "Unable to retrieve video information."
             await edit_status_msg_safe(status_msg, err)
             return
@@ -1069,6 +1093,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         pass
 
                     default_succeeded = True
+                    mark_link_completed(url)
                     URL_CACHE.pop(cache_key, None)
                 else:
                     fail_reason = f"480p file is {format_bytes(file_size)}, exceeding Telegram's {MAX_FILE_SIZE_MB}MB limit"
@@ -1088,6 +1113,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         ACTIVE_TASKS.pop(task_id, None)
         TASK_REQUESTERS.pop(task_id, None)
+        if not default_succeeded:
+            mark_link_failed(url)
         if downloaded_file:
             remove_file_safely(downloaded_file)
 
@@ -1342,6 +1369,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             except Exception:
                 pass
             completed = True
+            mark_link_completed(url)
 
     except Exception as e:
         logger.error(f"Error during download or upload: {e}", exc_info=True)
@@ -1583,6 +1611,10 @@ async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         killed_processes.append("VNC Browser Session")
     except Exception:
         pass
+
+    # Clear anti-bot link cooldown cache
+    clear_link_cooldowns()
+    killed_processes.append("Anti-Bot Cooldown Cache")
 
     # Clean orphaned files in downloads folder
     from config import DOWNLOAD_DIR
@@ -1986,11 +2018,13 @@ async def autovnc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not context.args or len(context.args) < 1:
         await update.message.reply_text(
-            "📝 **Usage:** `/autovnc <diskwala|tera> [@botusername]`\n\n"
-            "💡 *Examples:*\n"
-            "• `/autovnc diskwala @DiskwalaBot`\n"
-            "• `/autovnc tera @terabox_player`\n\n"
-            "🤖 *The bot will launch Chrome on VNC, open the chat, click Open MiniApp, type a dummy link with human delays, click Download, and auto-capture the token into `.env`!*",
+            "📝 **Usage:** `/autovnc <diskwala|tera> [link_or_bot]`\n\n"
+            "💡 *Defaults (no link needed):*\n"
+            "• `/autovnc diskwala` → opens `https://web.telegram.org/a/#7802633228`\n"
+            "• `/autovnc tera` → opens `https://web.telegram.org/a/#7802009139`\n\n"
+            "🔗 *You can also pass a custom link or peer ID:*\n"
+            "• `/autovnc diskwala https://web.telegram.org/a/#7802633228`\n\n"
+            "🤖 *The bot will launch Chrome on VNC, focus the active chat tab directly, click Open MiniApp, type a dummy link, click Download, and auto-capture the token into `.env`!*",
             parse_mode=constants.ParseMode.MARKDOWN,
             reply_to_message_id=update.message.message_id,
         )
@@ -2006,17 +2040,19 @@ async def autovnc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(
             "❌ Unknown platform. Please specify either `diskwala` or `tera`.\n"
-            "Usage: `/autovnc <diskwala|tera> [@botusername]`",
+            "Usage: `/autovnc <diskwala|tera> [link_or_bot]`",
             parse_mode=constants.ParseMode.MARKDOWN,
             reply_to_message_id=update.message.message_id,
         )
         return
 
     target_bot = context.args[1] if len(context.args) > 1 else None
+    display_target = target_bot or ("https://web.telegram.org/a/#7802633228" if platform == "diskwala" else "https://web.telegram.org/a/#7802009139")
 
     status_msg = await update.message.reply_text(
         f"🤖 **Starting Auto-VNC for {plat_title}...**\n"
-        "Initializing virtual display, stealth browser, and Telegram Web...",
+        f"🎯 Target: `{display_target}`\n"
+        "Initializing virtual display, stealth browser, and focusing Telegram chat...",
         parse_mode=constants.ParseMode.MARKDOWN,
         reply_to_message_id=update.message.message_id,
     )

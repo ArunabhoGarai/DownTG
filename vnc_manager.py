@@ -60,7 +60,7 @@ def ensure_vnc_running() -> Tuple[bool, str]:
     """
     if sys.platform != "linux":
         # On Windows development environments, Chrome opens in normal desktop window
-        return True, "http://localhost:6080/vnc.html?autoconnect=true"
+        return True, "http://localhost:6080/vnc.html?autoconnect=true&resize=scale"
 
     display = ":99"
     xvfb_running = is_process_running("Xvfb :99")
@@ -109,17 +109,27 @@ def ensure_vnc_running() -> Tuple[bool, str]:
             logger.warning(f"websockify start warning: {e}")
 
     public_ip = get_public_ip()
-    vnc_url = f"http://{public_ip}:6080/vnc.html?autoconnect=true"
+    vnc_url = f"http://{public_ip}:6080/vnc.html?autoconnect=true&resize=scale"
     return True, vnc_url
 
 
-def format_telegram_web_url(target_input: Optional[str]) -> str:
+DEFAULT_BOT_URLS = {
+    "diskwala": "https://web.telegram.org/a/#7802633228",
+    "tera": "https://web.telegram.org/a/#7802009139",
+    "terabox": "https://web.telegram.org/a/#7802009139",
+}
+
+
+def format_telegram_web_url(target_input: Optional[str], platform: str = "diskwala") -> str:
     """
-    Formats a bot username or t.me link into a direct Telegram Web URL.
+    Formats a target link, peer ID, or bot username into a direct Telegram Web URL.
+    Defaults:
+      - Diskwala: https://web.telegram.org/a/#7802633228
+      - TeraBox: https://web.telegram.org/a/#7802009139
     """
+    default_url = DEFAULT_BOT_URLS.get(platform.lower(), "https://web.telegram.org/a/#7802633228")
     if not target_input:
-        # Default to Telegram Web
-        return "https://web.telegram.org/a/"
+        return default_url
 
     t = target_input.strip()
     if t.startswith("http://") or t.startswith("https://"):
@@ -128,12 +138,17 @@ def format_telegram_web_url(target_input: Optional[str]) -> str:
             return f"https://web.telegram.org/a/#?tgaddr=tg%3A%2F%2Fresolve%3Fdomain%3D{username}"
         return t
 
-    # Assume bare bot username (e.g. "terabox_downloader_new_bot" or "@terabox_downloader_new_bot")
+    # If user provided a raw peer ID like "7802633228" or "#7802633228"
+    if t.startswith("#"):
+        return f"https://web.telegram.org/a/{t}"
+    if t.isdigit():
+        return f"https://web.telegram.org/a/#{t}"
+
     clean_username = t.lstrip("@").strip()
     if clean_username:
         return f"https://web.telegram.org/a/#?tgaddr=tg%3A%2F%2Fresolve%3Fdomain%3D{clean_username}"
 
-    return "https://web.telegram.org/a/"
+    return default_url
 
 
 async def start_vnc_capture_session(
@@ -243,7 +258,7 @@ async def start_autovnc_session(
     if not script_path.exists():
         return False, "", "vnc_auto_capture.js not found."
 
-    target_url = format_telegram_web_url(target_bot)
+    target_url = format_telegram_web_url(target_bot, platform=platform)
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
     env = os.environ.copy()
