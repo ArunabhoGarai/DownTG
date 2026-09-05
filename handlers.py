@@ -82,6 +82,17 @@ from link_protection import (
     COOLDOWN_ERROR_MESSAGE,
 )
 from telethon_extractor import fetch_telethon_bearer
+from stats_manager import (
+    record_resolved_link,
+    format_overview_text,
+    format_top_users_text,
+    format_platform_breakdown_text,
+    format_recent_activity_text,
+    format_user_detail_text,
+    format_personal_stats_text,
+    build_stats_keyboard,
+    get_user_stats,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -616,6 +627,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/gchelp` — Show member command guide in group chat.\n\n"
         "⚙️ **Maintenance & Server Controls:**\n"
         "• `/refresh` (or `/killtasks` / `/reset`) — Kill all running download tasks, purge temporary files from `downloads/`, and reset concurrency slots.\n\n"
+        "📊 **Statistics & Link Analytics:**\n"
+        "• `/stats` (or `/analytics`, `/stat`) — Interactive statistics dashboard (top users leaderboard, platform classification breakdown, recent link activity audit).\n"
+        "• `/userstats <user_id>` (or `/stats <user_id>`) — Drill down into a specific user's resolved links and bandwidth history.\n\n"
         "📥 **Manual Download Commands:**\n"
         "• `/dl <video_url>` (or `/download <url>`) — Manually trigger video download.\n\n"
         "📊 **Current Configuration:**\n"
@@ -932,6 +946,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                     mark_link_completed(url)
                     try:
+                        await record_resolved_link(
+                            user_id=update.effective_user.id,
+                            username=update.effective_user.username,
+                            first_name=update.effective_user.first_name,
+                            last_name=update.effective_user.last_name,
+                            url=url,
+                            title=tb_title,
+                            file_size=file_size,
+                            chat_id=update.effective_chat.id,
+                            is_group=is_group,
+                        )
+                    except Exception as st_err:
+                        logger.error(f"Failed to record TeraBox stats: {st_err}")
+                    try:
                         await status_msg.delete()
                     except Exception:
                         pass
@@ -985,6 +1013,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         progress_status_updater=lambda txt: edit_status_msg_safe(status_msg, txt),
                     )
                     mark_link_completed(url)
+                    try:
+                        await record_resolved_link(
+                            user_id=update.effective_user.id,
+                            username=update.effective_user.username,
+                            first_name=update.effective_user.first_name,
+                            last_name=update.effective_user.last_name,
+                            url=url,
+                            title=dw_title,
+                            file_size=file_size,
+                            chat_id=update.effective_chat.id,
+                            is_group=is_group,
+                        )
+                    except Exception as st_err:
+                        logger.error(f"Failed to record DiskWala stats: {st_err}")
                     try:
                         await status_msg.delete()
                     except Exception:
@@ -1099,6 +1141,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                     default_succeeded = True
                     mark_link_completed(url)
+                    try:
+                        await record_resolved_link(
+                            user_id=update.effective_user.id,
+                            username=update.effective_user.username,
+                            first_name=update.effective_user.first_name,
+                            last_name=update.effective_user.last_name,
+                            url=url,
+                            title=title,
+                            file_size=file_size,
+                            chat_id=update.effective_chat.id,
+                            is_group=is_group,
+                        )
+                    except Exception as st_err:
+                        logger.error(f"Failed to record 480p stats: {st_err}")
                     URL_CACHE.pop(cache_key, None)
                 else:
                     fail_reason = f"480p file is {format_bytes(file_size)}, exceeding Telegram's {MAX_FILE_SIZE_MB}MB limit"
@@ -1175,6 +1231,51 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     await query.answer()
+
+    # ── Stats Dashboard Interactions ──
+    if action == "stats_close":
+        try:
+            await query.message.delete()
+        except Exception:
+            await edit_query_message(query, "📊 *Stats dashboard closed.*")
+        return
+
+    if action == "stats_view":
+        if not is_admin(user_id):
+            await query.answer("⚠️ Only the bot administrator can view the full analytics dashboard.", show_alert=True)
+            return
+
+        view_name = parts[1] if len(parts) > 1 else "overview"
+        if view_name == "top_users":
+            text = format_top_users_text(limit=10)
+        elif view_name == "platforms":
+            text = format_platform_breakdown_text()
+        elif view_name == "recent":
+            text = format_recent_activity_text(limit=10)
+        else:
+            text = format_overview_text()
+            view_name = "overview"
+
+        keyboard = build_stats_keyboard(view_name)
+        await edit_query_message(query, text, reply_markup=keyboard)
+        return
+
+    if action == "stats_user":
+        if not is_admin(user_id):
+            await query.answer("⚠️ Only the bot administrator can view user analytics.", show_alert=True)
+            return
+
+        target_id_str = parts[1] if len(parts) > 1 else ""
+        try:
+            target_id = int(target_id_str)
+            text = format_user_detail_text(target_id)
+            keyboard = build_stats_keyboard("user_detail", target_user_id=target_id)
+            await edit_query_message(query, text, reply_markup=keyboard)
+        except Exception as e:
+            logger.error(f"[Stats Callback] Failed to fetch user detail for {target_id_str}: {e}")
+            await query.answer("❌ User not found or invalid ID.", show_alert=True)
+            return
+        return
 
     if action == "stop":
         task_id = parts[1] if len(parts) > 1 else ""
@@ -1375,6 +1476,20 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 pass
             completed = True
             mark_link_completed(url)
+            try:
+                await record_resolved_link(
+                    user_id=query.from_user.id,
+                    username=query.from_user.username,
+                    first_name=query.from_user.first_name,
+                    last_name=query.from_user.last_name,
+                    url=url,
+                    title=title,
+                    file_size=file_size,
+                    chat_id=update.effective_chat.id,
+                    is_group=is_group,
+                )
+            except Exception as st_err:
+                logger.error(f"Failed to record callback download stats: {st_err}")
 
     except Exception as e:
         logger.error(f"Error during download or upload: {e}", exc_info=True)
@@ -2205,6 +2320,98 @@ async def eztera_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Shows analytics dashboard for Admins or personal statistics card for regular users.
+    Usage: /stats or /stats <user_id>
+    """
+    user = update.effective_user
+    chat = update.effective_chat
+    if not user or not chat:
+        return
+
+    user_id = user.id
+    is_group = chat.type in ("group", "supergroup")
+
+    if not is_group and not is_user_allowed(user_id):
+        await update.message.reply_text(UNAUTHORIZED_DM_MESSAGE)
+        return
+
+    # If regular user: show personal download statistics
+    if not is_admin(user_id):
+        personal_text = format_personal_stats_text(
+            user_id=user_id,
+            username=user.username,
+            first_name=user.first_name,
+        )
+        await update.message.reply_text(
+            personal_text,
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_to_message_id=update.message.message_id,
+        )
+        return
+
+    # If Admin passed a specific user ID: /stats <user_id>
+    if context.args and len(context.args) >= 1:
+        target_arg = context.args[0].replace("@", "").strip()
+        try:
+            target_id = int(target_arg)
+            user_detail_text = format_user_detail_text(target_id)
+            keyboard = build_stats_keyboard("user_detail", target_user_id=target_id)
+            await update.message.reply_text(
+                user_detail_text,
+                reply_markup=keyboard,
+                parse_mode=constants.ParseMode.MARKDOWN,
+                reply_to_message_id=update.message.message_id,
+            )
+            return
+        except ValueError:
+            pass
+
+    # Admin full overview dashboard
+    overview_text = format_overview_text()
+    keyboard = build_stats_keyboard("overview")
+    await update.message.reply_text(
+        overview_text,
+        reply_markup=keyboard,
+        parse_mode=constants.ParseMode.MARKDOWN,
+        reply_to_message_id=update.message.message_id,
+    )
+
+
+async def userstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Admin command to inspect a specific user's link history and stats.
+    Usage: /userstats <user_id>
+    """
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text(DEV_RESTRICTED_MESSAGE)
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "📝 **Usage:** `/userstats <user_id>`\n\n"
+            "💡 *Tip: You can find user IDs from `/stats` -> 🏆 Top Users.*",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_to_message_id=update.message.message_id,
+        )
+        return
+
+    try:
+        target_id = int(context.args[0].replace("@", "").strip())
+        user_detail_text = format_user_detail_text(target_id)
+        keyboard = build_stats_keyboard("user_detail", target_user_id=target_id)
+        await update.message.reply_text(
+            user_detail_text,
+            reply_markup=keyboard,
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_to_message_id=update.message.message_id,
+        )
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user ID. Please provide a numeric Telegram user ID.")
+
+
 def register_handlers(application):
     """Register all bot command and message handlers."""
     application.add_handler(CommandHandler("start", start_command))
@@ -2218,6 +2425,11 @@ def register_handlers(application):
     application.add_handler(CommandHandler("allowedusers", listusers_command))
     application.add_handler(CommandHandler("listusers", listusers_command))
     application.add_handler(CommandHandler("allowed", listusers_command))
+    application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("stat", stats_command))
+    application.add_handler(CommandHandler("analytics", stats_command))
+    application.add_handler(CommandHandler("mystats", stats_command))
+    application.add_handler(CommandHandler("userstats", userstats_command))
     application.add_handler(CommandHandler("dl", download_command))
     application.add_handler(CommandHandler("download", download_command))
     application.add_handler(CommandHandler("d", download_command))
