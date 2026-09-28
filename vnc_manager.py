@@ -132,6 +132,15 @@ def format_telegram_web_url(target_input: Optional[str], platform: str = "diskwa
         return default_url
 
     t = target_input.strip()
+    if t.lower() in ("gauth", "google", "photos", "gphotos"):
+        try:
+            from google_photos_manager import get_authorization_url
+            ok, auth_url = get_authorization_url()
+            if ok:
+                return auth_url
+        except Exception:
+            pass
+
     if t.startswith("http://") or t.startswith("https://"):
         if "t.me/" in t:
             username = t.split("t.me/")[1].split("/")[0].split("?")[0].lstrip("@")
@@ -216,6 +225,31 @@ async def start_vnc_capture_session(
                             await on_token_captured("terabox", captured_token)
                         except Exception as cb_err:
                             logger.error(f"[VNC Manager] Callback error: {cb_err}")
+
+                elif line.startswith("[TERABOX_COOKIE_CAPTURED]"):
+                    captured_cookie = line.replace("[TERABOX_COOKIE_CAPTURED]", "").strip()
+                    logger.info("[VNC Manager] 🎉 Captured TeraBox Account Cookie from Browser!")
+                    try:
+                        from terabox_account_manager import save_account_cookie
+                        save_account_cookie(captured_cookie)
+                    except Exception as sce:
+                        logger.error(f"[VNC Manager] Failed to save cookie: {sce}")
+                    if on_token_captured:
+                        try:
+                            await on_token_captured("terabox_cookie", captured_cookie)
+                        except Exception as cb_err:
+                            logger.error(f"[VNC Manager] Callback error: {cb_err}")
+
+                elif line.startswith("[GOOGLE_OAUTH_CODE_CAPTURED]"):
+                    captured_code = line.replace("[GOOGLE_OAUTH_CODE_CAPTURED]", "").strip()
+                    logger.info(f"[VNC Manager] 🎉 Captured Google OAuth code from browser: {captured_code[:15]}...")
+                    try:
+                        from google_photos_manager import exchange_code_for_tokens
+                        ok, err = await exchange_code_for_tokens(captured_code)
+                        if on_token_captured:
+                            await on_token_captured("google_oauth", "success" if ok else f"error: {err}")
+                    except Exception as g_err:
+                        logger.error(f"[VNC Manager] Google token exchange error: {g_err}")
 
                 elif line.startswith("[DISKWALA_TOKEN_CAPTURED]") or line.startswith("[TOKEN_CAPTURED]"):
                     captured_token = line.replace("[DISKWALA_TOKEN_CAPTURED]", "").replace("[TOKEN_CAPTURED]", "").strip()

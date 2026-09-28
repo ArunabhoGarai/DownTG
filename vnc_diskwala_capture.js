@@ -113,10 +113,32 @@ function logStatus(msg) {
 
     let tokenCaptured = false;
 
+    let lastGoogleCode = '';
+    function checkUrlForGoogleCode(u) {
+        if (!u) return;
+        if (u.includes('code=') && (u.includes('oauth') || u.includes('callback') || u.includes('localhost') || u.includes('127.0.0.1') || u.includes('google'))) {
+            try {
+                const parsed = new URL(u);
+                const code = parsed.searchParams.get('code');
+                if (code && !code.startsWith('undefined') && code !== lastGoogleCode) {
+                    lastGoogleCode = code;
+                    console.log(`[GOOGLE_OAUTH_CODE_CAPTURED] ${code}`);
+                    logStatus("🎉 Automatically captured Google OAuth code from browser redirect!");
+                }
+            } catch (_) {}
+        }
+    }
+
     async function setupInterception(p) {
         try {
+            p.on('framenavigated', (frame) => {
+                checkUrlForGoogleCode(frame.url());
+            });
+
             p.on('request', async (req) => {
                 const url = req.url();
+                checkUrlForGoogleCode(url);
+
                 const headers = req.headers();
                 if (url.includes('api2.diskwala.net') || url.includes('/api/diskwala/')) {
                     const auth = headers['authorization'];
@@ -173,6 +195,28 @@ function logStatus(msg) {
     await page.bringToFront();
 
     logStatus("Chrome is active on VNC display. Waiting for Telegram Web interaction & MiniApp token...");
+
+    // Periodic auto-cookie grabber for TeraBox account login
+    let lastSavedNdus = '';
+    const cookieInterval = setInterval(async () => {
+        try {
+            const currentPages = await browser.pages();
+            for (const p of currentPages) {
+                const u = p.url();
+                checkUrlForGoogleCode(u);
+                if (u.includes('terabox') || u.includes('1024tera') || u.includes('4funbox') || u.includes('mirrobox')) {
+                    const cookies = await p.cookies();
+                    const ndusCookie = cookies.find(c => c.name === 'ndus');
+                    if (ndusCookie && ndusCookie.value && ndusCookie.value.length > 5 && ndusCookie.value !== lastSavedNdus) {
+                        lastSavedNdus = ndusCookie.value;
+                        const rawCookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+                        console.log(`[TERABOX_COOKIE_CAPTURED] ${rawCookieStr}`);
+                        logStatus("🎉 Captured TeraBox session cookies with active ndus!");
+                    }
+                }
+            }
+        } catch (_) {}
+    }, 2500);
 
     const cleanup = async () => {
         try { await browser.close(); } catch (_) {}

@@ -2208,15 +2208,35 @@ async def vnc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     async def on_token_captured(platform: str, captured_tok: str):
-        plat_title = "TeraBox" if platform == "terabox" else "Diskwala"
-        env_key = "TERABOX_BEARER_TOKEN" if platform == "terabox" else "DISKWALA_BEARER_TOKEN"
-        msg = (
-            f"🎉 **{plat_title} Bearer Token Captured Automatically!**\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"• **Saved to:** `.env` (`{env_key}`)\n"
-            f"• **Engine:** {plat_title} MiniApp API is now active!\n"
-            "• **Action:** You can now close your VNC viewer tab or click Stop below."
-        )
+        if platform == "google_oauth":
+            if captured_tok == "success":
+                msg = (
+                    "🎉 **Google Photos Connected Automatically via VNC!**\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    "• **Tokens:** Saved securely to `data/google_photos_token.json`\n"
+                    "• **Offline Access:** Refresh token configured (auto-renews)\n"
+                    "• **Action:** You can now run `/teratransfer` to start uploading!"
+                )
+            else:
+                msg = f"❌ **Google Photos Auto-Connection Failed:**\n`{captured_tok}`"
+        elif platform == "terabox_cookie":
+            msg = (
+                "🎉 **TeraBox Account Cookie Captured Automatically!**\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                "• **Saved to:** `cooky/terabox/cookies.txt`\n"
+                "• **Status:** Active & Ready for `/terafetch` and `/teratransfer`!\n"
+                "• **Action:** You can now close your VNC viewer tab or click Stop below."
+            )
+        else:
+            plat_title = "TeraBox" if platform == "terabox" else "Diskwala"
+            env_key = "TERABOX_BEARER_TOKEN" if platform == "terabox" else "DISKWALA_BEARER_TOKEN"
+            msg = (
+                f"🎉 **{plat_title} Bearer Token Captured Automatically!**\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"• **Saved to:** `.env` (`{env_key}`)\n"
+                f"• **Engine:** {plat_title} MiniApp API is now active!\n"
+                "• **Action:** You can now close your VNC viewer tab or click Stop below."
+            )
         try:
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🛑 Stop VNC Browser", callback_data="stop_vnc_session")],
@@ -2692,6 +2712,96 @@ async def canceltransfer_command(update: Update, context: ContextTypes.DEFAULT_T
     )
 
 
+_OAUTH_HTTP_SERVER = None
+
+
+async def _start_temp_oauth_listener(port: int, expected_path: str, bot, chat_id: int):
+    """
+    Lightweight temporary background asyncio server to catch Google OAuth redirect.
+    Automatically grabs the code, saves tokens, and informs user in Telegram.
+    """
+    global _OAUTH_HTTP_SERVER
+    if _OAUTH_HTTP_SERVER:
+        try:
+            _OAUTH_HTTP_SERVER.close()
+        except Exception:
+            pass
+
+    expected_path_clean = expected_path.rstrip("/")
+
+    async def handle_client(reader, writer):
+        try:
+            data = await reader.read(4096)
+            req_text = data.decode("utf-8", errors="ignore")
+            first_line = req_text.split("\r\n")[0]
+            parts = first_line.split(" ")
+            if len(parts) >= 2:
+                req_url = parts[1]
+                parsed = urllib.parse.urlparse(req_url)
+                req_p = parsed.path.rstrip("/")
+                if req_p == expected_path_clean or req_p == "":
+                    qs = urllib.parse.parse_qs(parsed.query)
+                    if "code" in qs:
+                        code = qs["code"][0]
+                        html = (
+                            "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Linked</title></head>"
+                            "<body style='font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,sans-serif;"
+                            "text-align:center;padding:50px;background:#f0fdf4;'>"
+                            "<div style='background:#ffffff;padding:40px 50px;border-radius:16px;box-shadow:0 10px 25px rgba(0,0,0,0.08);text-align:center;max-width:480px;margin:0 auto;'>"
+                            "<div style='font-size:55px;margin-bottom:15px;'>🎉</div>"
+                            "<h2 style='color:#166534;margin:0 0 10px 0;'>Google Photos Linked!</h2>"
+                            "<p style='color:#374151;font-size:16px;line-height:1.5;margin:0 0 20px 0;'>Your authorization was automatically captured. You can now close this tab and return to Telegram.</p>"
+                            "<span style='background:#dcfce7;color:#15803d;padding:6px 14px;border-radius:20px;font-size:13px;font-weight:600;'>Return to Telegram</span>"
+                            "</div></body></html>"
+                        )
+                        resp_bytes = html.encode("utf-8")
+                        header = (
+                            f"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
+                            f"Content-Length: {len(resp_bytes)}\r\nConnection: close\r\n\r\n"
+                        )
+                        writer.write(header.encode("utf-8") + resp_bytes)
+                        await writer.drain()
+                        writer.close()
+
+                        ok, err = await exchange_code_for_tokens(code)
+                        if ok:
+                            await bot.send_message(
+                                chat_id=chat_id,
+                                text=(
+                                    "🎉 **Google Photos Connected Automatically via Web Redirect!**\n"
+                                    "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                                    "• **Status:** Active & Ready\n"
+                                    "• **Tokens:** Saved securely to `data/google_photos_token.json`\n"
+                                    "• **Offline Access:** Auto-refresh active\n\n"
+                                    "👉 You can now run `/teratransfer` to start uploading!"
+                                ),
+                                parse_mode=constants.ParseMode.MARKDOWN,
+                            )
+                        else:
+                            await bot.send_message(
+                                chat_id=chat_id,
+                                text=f"❌ **Auto-Exchange Failed:** `{err}`",
+                            )
+                        return
+            writer.write(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            await writer.drain()
+            writer.close()
+        except Exception:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+    try:
+        server = await asyncio.start_server(handle_client, "0.0.0.0", port)
+        _OAUTH_HTTP_SERVER = server
+        await asyncio.sleep(300)
+        server.close()
+        await server.wait_closed()
+    except Exception as e:
+        logger.debug(f"[OAuth Server] Background listener note: {e}")
+
+
 async def gphotos_auth_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Initiates Google Photos OAuth 2.0 authorization.
@@ -2719,7 +2829,10 @@ async def gphotos_auth_command(update: Update, context: ContextTypes.DEFAULT_TYP
         [InlineKeyboardButton("🔗 Authorize with Google", url=auth_url)],
     ])
 
-    from config import GOOGLE_REDIRECT_URI
+    try:
+        from config import GOOGLE_REDIRECT_URI
+    except ImportError:
+        GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8080/oauth2callback").strip()
 
     ruri = GOOGLE_REDIRECT_URI or "http://localhost:8080/oauth2callback"
     instructions = (
@@ -2730,10 +2843,20 @@ async def gphotos_auth_command(update: Update, context: ContextTypes.DEFAULT_TYP
         "📋 **How to Connect:**\n"
         "1. Tap the **[ 🔗 Authorize with Google ]** button below.\n"
         "2. Log in and allow Google Photos library access.\n"
-        "3. Once authorized, copy the `code=...` parameter (or redirected URL) and send it here:\n"
+        "3. **Automatic:** If using VNC (`/vnc gauth`) or if your browser can reach the callback port, authorization completes automatically!\n"
+        "4. **Manual Fallback:** Or copy the `code=...` parameter and send it here:\n"
         "   👉 `/gphotos_code <paste_your_code_here>`\n\n"
         "⚠️ *Note: If you get Error 400 redirect_uri_mismatch, ensure the Redirect URI above is added under Authorized redirect URIs in Google Cloud Console.*"
     )
+
+    # Launch background auto-capture listener on the configured port
+    try:
+        parsed_ruri = urllib.parse.urlparse(ruri)
+        port = parsed_ruri.port or 8080
+        path = parsed_ruri.path or "/oauth2callback"
+        asyncio.create_task(_start_temp_oauth_listener(port, path, context.bot, update.effective_chat.id))
+    except Exception as le:
+        logger.debug(f"[OAuth] Could not start background listener: {le}")
 
     await update.message.reply_text(
         instructions,
