@@ -70,5 +70,10 @@ except ValueError:
     TOKEN_MAX_AGE_HOURS = 2.0
 TOKEN_REFRESH_INTERVAL_HOURS = TOKEN_MAX_AGE_HOURS
 
+# Google Photos OAuth 2.0 Configuration
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
+GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8080/oauth2callback").strip()
 
-
+# Delay in seconds between sequential transfers (user requirement: 10s timeout)
+TRANSFER_DELAY_SEC = int(os.getenv("TRANSFER_DELAY_SEC", "10"))
