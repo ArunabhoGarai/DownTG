@@ -29,12 +29,16 @@ logger = logging.getLogger(__name__)
 
 COOKIE_FILE = BASE_DIR / "cooky" / "terabox" / "cookies.txt"
 
-# Preferred TeraBox API domain endpoints (with fallback)
+# Preferred TeraBox API domain endpoints (with fallback and regional routing)
 TERABOX_API_DOMAINS = [
-    "www.1024tera.com",
+    "dm.terabox.app",
+    "dm.terabox.com",
     "www.terabox.app",
+    "terabox.app",
     "www.terabox.com",
+    "www.1024tera.com",
     "1024tera.com",
+    "www.1024terabox.com",
 ]
 
 # Supported video extensions for account file matching
@@ -63,7 +67,7 @@ def save_account_cookie(cookie_content: str) -> bool:
         return False
 
 
-def _get_api_headers(cookie_header: str) -> Dict[str, str]:
+def _get_api_headers(cookie_header: str, domain: str = "www.terabox.app") -> Dict[str, str]:
     return {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -71,8 +75,8 @@ def _get_api_headers(cookie_header: str) -> Dict[str, str]:
         ),
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.terabox.app/main?category=all",
-        "Origin": "https://www.terabox.app",
+        "Referer": f"https://{domain}/main?category=all",
+        "Origin": f"https://{domain}",
         "Cookie": cookie_header,
     }
 
@@ -93,36 +97,64 @@ def fetch_account_videos_sync(max_pages: int = 50) -> Dict[str, Any]:
             "error": "No TeraBox cookie found. Please save cookies in cooky/terabox/cookies.txt or use /setteracookie.",
         }
 
-    headers = _get_api_headers(cookie_header)
     all_videos = []
     seen_fs_ids = set()
 
     working_domain = None
-    # 1. Identify working domain from candidates
-    for domain in TERABOX_API_DOMAINS:
-        test_url = f"https://{domain}/api/categorylist?category=1&page=1&num=1&app_id=250528&web=1"
+    headers = None
+    last_errno = None
+
+    # 1. Identify working domain from candidates (with dynamic regional prefix routing)
+    domains_to_try = list(TERABOX_API_DOMAINS)
+    tested_domains = set()
+
+    idx = 0
+    while idx < len(domains_to_try):
+        domain = domains_to_try[idx]
+        idx += 1
+        if domain in tested_domains:
+            continue
+        tested_domains.add(domain)
+
+        domain_headers = _get_api_headers(cookie_header, domain=domain)
+        test_url = f"https://{domain}/api/categorylist?category=1&page=1&num=1&app_id=250528&web=1&channel=dubox&clienttype=0"
         try:
-            r = requests.get(test_url, headers=headers, timeout=10)
+            r = requests.get(test_url, headers=domain_headers, timeout=10)
+            # TeraBox returns regional cluster prefix in response headers when misdirected
+            prefix = r.headers.get("Url-Domain-Prefix") or r.headers.get("Region-Domain-Prefix")
+            if prefix and prefix.strip():
+                p = prefix.strip()
+                for suff in ["terabox.app", "terabox.com"]:
+                    prefixed_domain = f"{p}.{suff}"
+                    if prefixed_domain not in tested_domains and prefixed_domain not in domains_to_try:
+                        domains_to_try.insert(idx, prefixed_domain)
+
             if r.status_code == 200:
                 data = r.json()
-                if data.get("errno") == 0:
+                errno = data.get("errno")
+                if errno == 0:
                     working_domain = domain
+                    headers = domain_headers
                     logger.info(f"[TeraBox Account] Connected using domain: {domain}")
                     break
-                elif data.get("errno") in (105, -6):
-                    return {
-                        "success": False,
-                        "total_count": 0,
-                        "total_size": 0,
-                        "total_size_formatted": "0 B",
-                        "videos": [],
-                        "error": "TeraBox cookie is expired or unauthorized (errno 105). Please provide a fresh cookie.",
-                    }
+                else:
+                    last_errno = errno
+                    logger.warning(f"[TeraBox Account] Domain {domain} returned errno {errno}")
         except Exception as e:
             logger.debug(f"[TeraBox Account] Domain {domain} failed: {e}")
 
     if not working_domain:
+        if last_errno in (105, -6):
+            return {
+                "success": False,
+                "total_count": 0,
+                "total_size": 0,
+                "total_size_formatted": "0 B",
+                "videos": [],
+                "error": f"TeraBox cookie is unauthorized or expired (errno {last_errno}). Please re-login on www.terabox.app or update cookie with /setteracookie.",
+            }
         working_domain = TERABOX_API_DOMAINS[0]
+        headers = _get_api_headers(cookie_header, domain=working_domain)
 
     # 2. Paginate category=1 (Videos)
     page = 1
