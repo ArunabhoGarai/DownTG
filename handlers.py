@@ -93,6 +93,20 @@ from stats_manager import (
     build_stats_keyboard,
     get_user_stats,
 )
+from terabox_account_manager import (
+    fetch_account_videos,
+    save_account_cookie,
+)
+from google_photos_manager import (
+    get_authorization_url,
+    exchange_code_for_tokens,
+    is_photos_authenticated,
+)
+from terabox_to_gphotos_service import (
+    execute_transfer_job,
+    is_transfer_in_progress,
+    cancel_current_transfer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -524,6 +538,70 @@ def build_cancel_keyboard(task_id: str) -> InlineKeyboardMarkup:
     ])
 
 
+TERA_ACCOUNT_VIDEOS_CACHE: Dict[int, List[Dict[str, Any]]] = {}
+
+
+def build_terafetch_keyboard(page: int = 0, total_videos: int = 0, page_size: int = 5) -> InlineKeyboardMarkup:
+    """Builds interactive inline keyboard for TeraBox fetched videos."""
+    buttons = []
+    # Row 1: Start transfer button if videos exist
+    if total_videos > 0:
+        buttons.append([
+            InlineKeyboardButton("🚀 Transfer All to Google Photos", callback_data="teragphotos_transfer")
+        ])
+
+    # Row 2: Pagination buttons
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("◀️ Previous", callback_data=f"terafetch_page:{page - 1}"))
+    if (page + 1) * page_size < total_videos:
+        nav_row.append(InlineKeyboardButton("Next ▶️", callback_data=f"terafetch_page:{page + 1}"))
+    if nav_row:
+        buttons.append(nav_row)
+
+    # Row 3: Refresh and Cancel/Close
+    buttons.append([
+        InlineKeyboardButton("🔄 Refresh List", callback_data="terafetch_refresh"),
+        InlineKeyboardButton("❌ Close", callback_data="stats_close"),
+    ])
+    return InlineKeyboardMarkup(buttons)
+
+
+def format_terafetch_page_text(videos: List[Dict[str, Any]], page: int = 0, page_size: int = 5) -> str:
+    """Renders paginated video listing text."""
+    total_count = len(videos)
+    total_size = sum(v.get("size", 0) for v in videos)
+    start_idx = page * page_size
+    page_items = videos[start_idx : start_idx + page_size]
+
+    text = (
+        f"📦 **TeraBox Account Video Library**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🎥 **Total Video Files Fetched:** `{total_count}`\n"
+        f"💾 **Total Video Size:** `{format_bytes(total_size)}`\n"
+    )
+
+    if not videos:
+        text += (
+            "\n⚠️ *No video files found in this TeraBox account.*\n"
+            "💡 Upload videos to your TeraBox account or update cookies with `/setteracookie`."
+        )
+        return text
+
+    max_pages = max(1, (total_count + page_size - 1) // page_size)
+    text += f"\n📑 **Video Files (Page {page + 1} of {max_pages}):**\n"
+    for i, it in enumerate(page_items, start_idx + 1):
+        fn = it.get("filename", "unknown.mp4")
+        sz = it.get("size_formatted", format_bytes(it.get("size", 0)))
+        path = it.get("path", "")
+        text += f"**{i}.** 🎬 `{fn}`\n   ↳ 💾 `{sz}` | 📁 `{path[:35]}`\n"
+
+    text += (
+        f"\n💡 *Tap [🚀 Transfer All to Google Photos] below to transfer all {total_count} videos with a 10s cooldown between transfers.*"
+    )
+    return text
+
+
 async def edit_query_message(
     query,
     text: str,
@@ -630,6 +708,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📊 **Statistics & Link Analytics:**\n"
         "• `/stats` (or `/analytics`, `/stat`) — Interactive statistics dashboard (top users leaderboard, platform classification breakdown, recent link activity audit).\n"
         "• `/userstats <user_id>` (or `/stats <user_id>`) — Drill down into a specific user's resolved links and bandwidth history.\n\n"
+        "☁️ **TeraBox Account & Google Photos Transfer:**\n"
+        "• `/terafetch` (or `/teravideos`) — Fetch & count all video files from your TeraBox account using cookies.\n"
+        "• `/teratransfer` (or `/gtransfer`) — Transfer TeraBox account videos to Google Photos (10s delay between transfers + failed files report at the end).\n"
+        "• `/canceltransfer` — Stop the currently active transfer job.\n"
+        "• `/gphotos_auth` (or `/gauth`) — Connect to Google Photos via OAuth 2.0.\n"
+        "• `/gphotos_code <code>` — Submit authorization code manually after OAuth login.\n"
+        "• `/gphotos_status` — Check Google Photos authentication status.\n"
+        "• `/setteracookie <cookie>` — Update TeraBox account cookie text directly in chat.\n\n"
         "📥 **Manual Download Commands:**\n"
         "• `/dl <video_url>` (or `/download <url>`) — Manually trigger video download.\n\n"
         "📊 **Current Configuration:**\n"
@@ -1275,6 +1361,70 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             logger.error(f"[Stats Callback] Failed to fetch user detail for {target_id_str}: {e}")
             await query.answer("❌ User not found or invalid ID.", show_alert=True)
             return
+        return
+
+    # ── TeraBox Account & Google Photos Transfer Callbacks (STRICT DEV ONLY) ──
+    if action in ("terafetch_page", "terafetch_refresh", "teragphotos_transfer", "teragphotos_cancel"):
+        if not is_admin(user_id):
+            await query.answer("⛔ This action is restricted to the bot developer.", show_alert=True)
+            return
+
+    if action == "terafetch_page":
+        page = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+        videos = TERA_ACCOUNT_VIDEOS_CACHE.get(user_id, [])
+        if not videos:
+            res = await fetch_account_videos()
+            videos = res.get("videos", [])
+            TERA_ACCOUNT_VIDEOS_CACHE[user_id] = videos
+        text = format_terafetch_page_text(videos, page=page)
+        kb = build_terafetch_keyboard(page=page, total_videos=len(videos))
+        await edit_query_message(query, text, reply_markup=kb)
+        return
+
+    if action == "terafetch_refresh":
+        await edit_query_message(query, "⏳ **Refreshing TeraBox video list via cookie...**")
+        res = await fetch_account_videos()
+        if not res.get("success"):
+            await edit_query_message(query, f"❌ **Failed to fetch videos:** {res.get('error')}")
+            return
+        videos = res.get("videos", [])
+        TERA_ACCOUNT_VIDEOS_CACHE[user_id] = videos
+        text = format_terafetch_page_text(videos, page=0)
+        kb = build_terafetch_keyboard(page=0, total_videos=len(videos))
+        await edit_query_message(query, text, reply_markup=kb)
+        return
+
+    if action == "teragphotos_transfer":
+        if is_transfer_in_progress():
+            await query.answer("⚠️ A transfer is already in progress. Use /canceltransfer to stop it.", show_alert=True)
+            return
+        auth_ok, auth_msg = is_photos_authenticated()
+        if not auth_ok:
+            await query.answer("⚠️ Google Photos is not connected. Use /gphotos_auth first.", show_alert=True)
+            return
+        videos = TERA_ACCOUNT_VIDEOS_CACHE.get(user_id, [])
+        if not videos:
+            res = await fetch_account_videos()
+            videos = res.get("videos", [])
+            TERA_ACCOUNT_VIDEOS_CACHE[user_id] = videos
+        if not videos:
+            await query.answer("❌ No video files found in TeraBox account to transfer.", show_alert=True)
+            return
+        await query.answer("🚀 Starting transfer to Google Photos...")
+        status_msg = await query.message.reply_text(
+            f"🚀 **Transfer Pipeline Initialized**\n"
+            f"Queue: `{len(videos)}` videos\n"
+            "Cooldown: `10s` between transfers\n"
+            "Starting..."
+        )
+        async def _update_status(txt: str):
+            await edit_status_msg_safe(status_msg, txt)
+        asyncio.create_task(execute_transfer_job(videos, status_updater=_update_status))
+        return
+
+    if action == "teragphotos_cancel":
+        cancel_current_transfer()
+        await query.answer("🛑 Transfer cancellation requested.", show_alert=True)
         return
 
     if action == "stop":
@@ -2412,6 +2562,292 @@ async def userstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Invalid user ID. Please provide a numeric Telegram user ID.")
 
 
+async def terafetch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Fetches and displays the count and list of all video files in the TeraBox account using cookies.
+    Usage: /terafetch or /teravideos
+    """
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text(DEV_RESTRICTED_MESSAGE)
+        return
+
+    status_msg = await update.message.reply_text(
+        "🔍 **Connecting to TeraBox account using cookies...**\n"
+        "Fetching all video files and calculating sizes...",
+        parse_mode=constants.ParseMode.MARKDOWN,
+        reply_to_message_id=update.message.message_id,
+    )
+
+    result = await fetch_account_videos()
+    if not result.get("success"):
+        err = result.get("error") or "Unknown error while fetching videos."
+        await status_msg.edit_text(
+            f"❌ **Failed to fetch TeraBox videos:**\n`{err}`\n\n"
+            "💡 *Tip: Ensure valid cookies are in `cooky/terabox/cookies.txt` or set via `/setteracookie <cookie>`.*",
+            parse_mode=constants.ParseMode.MARKDOWN,
+        )
+        return
+
+    videos = result.get("videos", [])
+    TERA_ACCOUNT_VIDEOS_CACHE[user_id] = videos
+
+    text = format_terafetch_page_text(videos, page=0)
+    keyboard = build_terafetch_keyboard(page=0, total_videos=len(videos))
+
+    await status_msg.edit_text(
+        text,
+        reply_markup=keyboard,
+        parse_mode=constants.ParseMode.MARKDOWN,
+    )
+
+
+async def teratransfer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Starts sequential transfer of TeraBox account videos to Google Photos with a 10s cooldown.
+    Usage: /teratransfer or /gtransfer
+    """
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text(DEV_RESTRICTED_MESSAGE)
+        return
+
+    if is_transfer_in_progress():
+        await update.message.reply_text(
+            "⚠️ **A transfer job is already currently running!**\n"
+            "Use `/canceltransfer` if you wish to abort the current job.",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_to_message_id=update.message.message_id,
+        )
+        return
+
+    # Check Google Photos authorization
+    auth_ok, auth_msg = is_photos_authenticated()
+    if not auth_ok:
+        await update.message.reply_text(
+            f"⚠️ **Google Photos is not authenticated!**\n\n"
+            f"Status: `{auth_msg}`\n\n"
+            "👉 Please run `/gphotos_auth` to link your Google Photos account first.",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_to_message_id=update.message.message_id,
+        )
+        return
+
+    # Get cached videos or fetch fresh
+    videos = TERA_ACCOUNT_VIDEOS_CACHE.get(user_id, [])
+    if not videos:
+        fetch_msg = await update.message.reply_text(
+            "⏳ **Fetching video library from TeraBox account first...**",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_to_message_id=update.message.message_id,
+        )
+        res = await fetch_account_videos()
+        if not res.get("success") or not res.get("videos"):
+            err = res.get("error") or "No video files found in account."
+            await fetch_msg.edit_text(f"❌ **Transfer Aborted:** {err}")
+            return
+        videos = res.get("videos", [])
+        TERA_ACCOUNT_VIDEOS_CACHE[user_id] = videos
+        try:
+            await fetch_msg.delete()
+        except Exception:
+            pass
+
+    status_msg = await update.message.reply_text(
+        f"🚀 **Starting Transfer to Google Photos**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📦 **Queue:** `{len(videos)}` videos\n"
+        f"⏱️ **Cooldown:** `10s` between each transfer\n"
+        "Initializing pipeline...",
+        parse_mode=constants.ParseMode.MARKDOWN,
+        reply_to_message_id=update.message.message_id,
+    )
+
+    async def _update_status(txt: str):
+        await edit_status_msg_safe(status_msg, txt)
+
+    asyncio.create_task(execute_transfer_job(videos, status_updater=_update_status))
+
+
+async def canceltransfer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Aborts any running TeraBox -> Google Photos transfer job.
+    Usage: /canceltransfer
+    """
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text(DEV_RESTRICTED_MESSAGE)
+        return
+
+    if not is_transfer_in_progress():
+        await update.message.reply_text("ℹ️ No active transfer job is currently running.")
+        return
+
+    cancel_current_transfer()
+    await update.message.reply_text(
+        "🛑 **Transfer cancellation requested!**\n"
+        "The active transfer will abort cleanly after completing any in-flight step.",
+        parse_mode=constants.ParseMode.MARKDOWN,
+        reply_to_message_id=update.message.message_id,
+    )
+
+
+async def gphotos_auth_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Initiates Google Photos OAuth 2.0 authorization.
+    Usage: /gphotos_auth or /gauth
+    """
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text(DEV_RESTRICTED_MESSAGE)
+        return
+
+    ok, auth_url = get_authorization_url()
+    if not ok:
+        await update.message.reply_text(
+            f"❌ **Google OAuth Configuration Error:**\n`{auth_url}`\n\n"
+            "Please ensure `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` are set in `.env`.",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_to_message_id=update.message.message_id,
+        )
+        return
+
+    auth_status_ok, status_desc = is_photos_authenticated()
+    current_status = "🟢 Already Linked" if auth_status_ok else "🔴 Not Connected"
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔗 Authorize with Google", url=auth_url)],
+    ])
+
+    from config import GOOGLE_REDIRECT_URI
+
+    ruri = GOOGLE_REDIRECT_URI or "http://localhost:8080/oauth2callback"
+    instructions = (
+        "🔐 **Google Photos OAuth 2.0 Authorization**\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"• **Current Status:** {current_status} (`{status_desc}`)\n"
+        f"• **Redirect URI:** `{ruri}`\n\n"
+        "📋 **How to Connect:**\n"
+        "1. Tap the **[ 🔗 Authorize with Google ]** button below.\n"
+        "2. Log in and allow Google Photos library access.\n"
+        "3. Once authorized, copy the `code=...` parameter (or redirected URL) and send it here:\n"
+        "   👉 `/gphotos_code <paste_your_code_here>`\n\n"
+        "⚠️ *Note: If you get Error 400 redirect_uri_mismatch, ensure the Redirect URI above is added under Authorized redirect URIs in Google Cloud Console.*"
+    )
+
+    await update.message.reply_text(
+        instructions,
+        reply_markup=keyboard,
+        parse_mode=constants.ParseMode.MARKDOWN,
+        reply_to_message_id=update.message.message_id,
+    )
+
+
+async def gphotos_code_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Submits Google OAuth authorization code to acquire tokens.
+    Usage: /gphotos_code <code>
+    """
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text(DEV_RESTRICTED_MESSAGE)
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "📝 **Usage:** `/gphotos_code <authorization_code_or_url>`\n\n"
+            "Paste the authorization code received from the Google OAuth consent page.",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_to_message_id=update.message.message_id,
+        )
+        return
+
+    code_input = context.args[0].strip()
+    status_msg = await update.message.reply_text(
+        "⏳ **Exchanging authorization code with Google OAuth...**",
+        reply_to_message_id=update.message.message_id,
+    )
+
+    ok, err = await exchange_code_for_tokens(code_input)
+    if ok:
+        await status_msg.edit_text(
+            "🎉 **Google Photos Connected Successfully!**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "• **Status:** Active & Ready\n"
+            "• **Tokens:** Saved securely to `data/google_photos_token.json`\n"
+            "• **Offline Access:** Refresh token configured (auto-renews)\n\n"
+            "👉 You can now run `/teratransfer` to start uploading TeraBox videos!",
+            parse_mode=constants.ParseMode.MARKDOWN,
+        )
+    else:
+        await status_msg.edit_text(
+            f"❌ **Failed to connect Google Photos:**\n`{err}`\n\n"
+            "💡 *Tip: Authorization codes expire within a few minutes. Try generating a new link via `/gphotos_auth`.*",
+            parse_mode=constants.ParseMode.MARKDOWN,
+        )
+
+
+async def gphotos_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Checks the connection status of Google Photos.
+    Usage: /gphotos_status
+    """
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text(DEV_RESTRICTED_MESSAGE)
+        return
+
+    is_ok, desc = is_photos_authenticated()
+    icon = "🟢" if is_ok else "🔴"
+    status_str = "Connected & Active" if is_ok else "Disconnected"
+
+    msg = (
+        "📸 **Google Photos Integration Status**\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"• **Connection:** {icon} {status_str}\n"
+        f"• **Details:** `{desc}`\n"
+        f"• **Storage:** `data/google_photos_token.json`\n\n"
+        "💡 *Use `/gphotos_auth` to re-authorize or connect a different account.*"
+    )
+    await update.message.reply_text(msg, parse_mode=constants.ParseMode.MARKDOWN, reply_to_message_id=update.message.message_id)
+
+
+async def setteracookie_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Saves raw TeraBox cookie or ndus value into cooky/terabox/cookies.txt.
+    Usage: /setteracookie <cookie_content>
+    """
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text(DEV_RESTRICTED_MESSAGE)
+        return
+
+    raw_text = update.message.text or ""
+    parts = raw_text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await update.message.reply_text(
+            "📝 **Usage:** `/setteracookie <cookie_content_or_ndus>`\n\n"
+            "💡 *Paste your Netscape cookie format or `ndus=...` string directly.*",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_to_message_id=update.message.message_id,
+        )
+        return
+
+    content = parts[1].strip()
+    if save_account_cookie(content):
+        # Invalidate cached videos to force re-fetch with new cookie
+        TERA_ACCOUNT_VIDEOS_CACHE.pop(user_id, None)
+        await update.message.reply_text(
+            "✅ **TeraBox Account Cookie Saved!**\n\n"
+            "📁 Saved to: `cooky/terabox/cookies.txt`\n"
+            "👉 Run `/terafetch` to view your video library.",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_to_message_id=update.message.message_id,
+        )
+    else:
+        await update.message.reply_text("❌ Failed to save TeraBox cookie.")
+
+
 def register_handlers(application):
     """Register all bot command and message handlers."""
     application.add_handler(CommandHandler("start", start_command))
@@ -2430,6 +2866,16 @@ def register_handlers(application):
     application.add_handler(CommandHandler("analytics", stats_command))
     application.add_handler(CommandHandler("mystats", stats_command))
     application.add_handler(CommandHandler("userstats", userstats_command))
+    application.add_handler(CommandHandler("terafetch", terafetch_command))
+    application.add_handler(CommandHandler("teravideos", terafetch_command))
+    application.add_handler(CommandHandler("teratransfer", teratransfer_command))
+    application.add_handler(CommandHandler("gtransfer", teratransfer_command))
+    application.add_handler(CommandHandler("canceltransfer", canceltransfer_command))
+    application.add_handler(CommandHandler("gphotos_auth", gphotos_auth_command))
+    application.add_handler(CommandHandler("gauth", gphotos_auth_command))
+    application.add_handler(CommandHandler("gphotos_code", gphotos_code_command))
+    application.add_handler(CommandHandler("gphotos_status", gphotos_status_command))
+    application.add_handler(CommandHandler("setteracookie", setteracookie_command))
     application.add_handler(CommandHandler("dl", download_command))
     application.add_handler(CommandHandler("download", download_command))
     application.add_handler(CommandHandler("d", download_command))
