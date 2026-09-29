@@ -12,12 +12,17 @@ import asyncio
 import logging
 from typing import Dict, Any, List, Optional, Tuple, Callable, Awaitable
 
-from config import TRANSFER_DELAY_SEC
+try:
+    from config import TRANSFER_DELAY_SEC
+except ImportError:
+    TRANSFER_DELAY_SEC = int(os.getenv("TRANSFER_DELAY_SEC", "10"))
 from downloader import format_bytes, remove_file_safely
-from terabox_account_manager import resolve_and_download_account_video
+from terabox_account_manager import resolve_and_download_account_video, fetch_account_videos
 from google_photos_manager import (
     is_photos_authenticated,
     upload_video_to_google_photos,
+    record_transferred_video,
+    get_known_google_photos_files,
 )
 
 logger = logging.getLogger(__name__)
@@ -164,12 +169,29 @@ async def execute_transfer_job(
                 )
             else:
                 total_transferred_bytes += actual_size
+                item_fs_id = item.get("fs_id")
+                photo_id = up_res.get("id")
+                prod_url = up_res.get("product_url")
+
                 successful.append({
                     "filename": fname,
                     "size": actual_size,
-                    "id": up_res.get("id"),
-                    "product_url": up_res.get("product_url"),
+                    "id": photo_id,
+                    "product_url": prod_url,
                 })
+
+                # Record to persistent registry
+                try:
+                    record_transferred_video(
+                        fs_id=item_fs_id,
+                        filename=fname,
+                        size=actual_size,
+                        google_id=photo_id,
+                        product_url=prod_url,
+                    )
+                except Exception as reg_err:
+                    logger.debug(f"[Transfer Service] Registry save error: {reg_err}")
+
                 # Step 3: Immediately delete local file from server right after successful transfer
                 if downloaded_file:
                     remove_file_safely(downloaded_file)
@@ -285,3 +307,84 @@ def build_transfer_summary_text(
         report += "🎉 **100% of video files transferred with zero failures!**"
 
     return report
+
+
+async def check_terabox_vs_google_photos(
+    videos: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """
+    Cross-references videos from TeraBox account against Google Photos (API + local registry).
+    Returns:
+      {
+        "success": bool,
+        "error": Optional[str],
+        "total_terabox": int,
+        "total_terabox_size": int,
+        "total_terabox_size_formatted": str,
+        "present_count": int,
+        "present_size": int,
+        "present_size_formatted": str,
+        "missing_count": int,
+        "missing_size": int,
+        "missing_size_formatted": str,
+        "missing_videos": List[Dict[str, Any]],
+        "present_videos": List[Dict[str, Any]],
+        "all_videos": List[Dict[str, Any]],
+      }
+    """
+    if videos is None:
+        fetch_res = await fetch_account_videos()
+        if not fetch_res.get("success"):
+            return {
+                "success": False,
+                "error": fetch_res.get("error") or "Failed to fetch videos from TeraBox.",
+                "total_terabox": 0,
+                "total_terabox_size": 0,
+                "total_terabox_size_formatted": "0 B",
+                "present_count": 0,
+                "present_size": 0,
+                "present_size_formatted": "0 B",
+                "missing_count": 0,
+                "missing_size": 0,
+                "missing_size_formatted": "0 B",
+                "missing_videos": [],
+                "present_videos": [],
+                "all_videos": [],
+            }
+        videos = fetch_res.get("videos", [])
+
+    known_fs_ids, known_filenames = await get_known_google_photos_files()
+
+    present_videos = []
+    missing_videos = []
+
+    for v in videos:
+        fs_id_str = str(v.get("fs_id", "")).strip()
+        fname_clean = (v.get("filename") or "").strip().lower()
+
+        # Match either by TeraBox fs_id or by clean normalized filename
+        if (fs_id_str and fs_id_str in known_fs_ids) or (fname_clean and fname_clean in known_filenames):
+            present_videos.append(v)
+        else:
+            missing_videos.append(v)
+
+    total_size = sum(int(v.get("size") or 0) for v in videos)
+    present_size = sum(int(v.get("size") or 0) for v in present_videos)
+    missing_size = sum(int(v.get("size") or 0) for v in missing_videos)
+
+    return {
+        "success": True,
+        "error": None,
+        "total_terabox": len(videos),
+        "total_terabox_size": total_size,
+        "total_terabox_size_formatted": format_bytes(total_size) if total_size > 0 else "0 B",
+        "present_count": len(present_videos),
+        "present_size": present_size,
+        "present_size_formatted": format_bytes(present_size) if present_size > 0 else "0 B",
+        "missing_count": len(missing_videos),
+        "missing_size": missing_size,
+        "missing_size_formatted": format_bytes(missing_size) if missing_size > 0 else "0 B",
+        "missing_videos": missing_videos,
+        "present_videos": present_videos,
+        "all_videos": videos,
+    }

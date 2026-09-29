@@ -12,17 +12,23 @@ import mimetypes
 import asyncio
 import logging
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple, Callable
+from typing import Dict, Any, Optional, Tuple, Callable, List, Set
 import urllib.parse
 import aiohttp
 import requests
 
-from config import (
-    BASE_DIR,
-    GOOGLE_CLIENT_ID,
-    GOOGLE_CLIENT_SECRET,
-    GOOGLE_REDIRECT_URI,
-)
+from config import BASE_DIR
+
+try:
+    from config import (
+        GOOGLE_CLIENT_ID,
+        GOOGLE_CLIENT_SECRET,
+        GOOGLE_REDIRECT_URI,
+    )
+except ImportError:
+    GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+    GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
+    GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8080/oauth2callback").strip()
 from downloader import format_bytes
 
 logger = logging.getLogger(__name__)
@@ -37,8 +43,198 @@ PHOTOS_BATCH_CREATE_ENDPOINT = "https://photoslibrary.googleapis.com/v1/mediaIte
 
 SCOPES = [
     "https://www.googleapis.com/auth/photoslibrary.appendonly",
+    "https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata",
+    "https://www.googleapis.com/auth/photoslibrary.edit.appcreateddata",
     "https://www.googleapis.com/auth/photoslibrary",
 ]
+
+TRANSFERRED_REGISTRY_FILE = DATA_DIR / "transferred_videos.json"
+
+
+def load_transferred_registry() -> Dict[str, Any]:
+    """Loads persistent record of videos transferred to Google Photos."""
+    if not TRANSFERRED_REGISTRY_FILE.exists():
+        return {"items": {}, "filenames": {}, "manual_marked": []}
+    try:
+        with open(TRANSFERRED_REGISTRY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if not isinstance(data, dict):
+                return {"items": {}, "filenames": {}, "manual_marked": []}
+            data.setdefault("items", {})
+            data.setdefault("filenames", {})
+            data.setdefault("manual_marked", [])
+            return data
+    except Exception as e:
+        logger.error(f"[Google Photos] Error reading transferred registry: {e}")
+        return {"items": {}, "filenames": {}, "manual_marked": []}
+
+
+def save_transferred_registry(data: Dict[str, Any]) -> bool:
+    """Saves persistent record of videos transferred to Google Photos."""
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with open(TRANSFERRED_REGISTRY_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        return True
+    except Exception as e:
+        logger.error(f"[Google Photos] Error writing transferred registry: {e}")
+        return False
+
+
+def record_transferred_video(
+    fs_id: Any,
+    filename: str,
+    size: int = 0,
+    google_id: Optional[str] = None,
+    product_url: Optional[str] = None,
+) -> bool:
+    """Records a successfully transferred video into the persistent registry."""
+    data = load_transferred_registry()
+    str_id = str(fs_id).strip() if fs_id is not None else ""
+    clean_name = filename.strip().lower()
+
+    record = {
+        "fs_id": str_id,
+        "filename": filename.strip(),
+        "clean_name": clean_name,
+        "size": size,
+        "google_id": google_id or "",
+        "product_url": product_url or "",
+        "transferred_at": int(time.time()),
+    }
+
+    if str_id:
+        data["items"][str_id] = record
+    if clean_name:
+        data["filenames"][clean_name] = str_id
+
+    return save_transferred_registry(data)
+
+
+def mark_as_transferred(identifiers: List[str]) -> int:
+    """Manually marks a list of filenames or fs_ids as already present in Google Photos."""
+    data = load_transferred_registry()
+    count = 0
+    for ident in identifiers:
+        s = ident.strip()
+        if not s:
+            continue
+        clean = s.lower()
+        if clean not in data.get("manual_marked", []):
+            data["manual_marked"].append(clean)
+            data["filenames"][clean] = clean
+            count += 1
+    if count > 0:
+        save_transferred_registry(data)
+    return count
+
+
+async def fetch_app_created_media_items(max_pages: int = 20) -> Tuple[bool, List[Dict[str, Any]], Optional[str]]:
+    """
+    Queries Google Photos Library API for media items created by this application.
+    Returns: (success, media_items_list, error_msg)
+    """
+    ok, access_token, err = await get_valid_access_token()
+    if not ok or not access_token:
+        return False, [], err or "Not authenticated."
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+    }
+
+    items_list = []
+    page_token = None
+    page = 1
+
+    try:
+        while page <= max_pages:
+            url = f"https://photoslibrary.googleapis.com/v1/mediaItems?pageSize=100"
+            if page_token:
+                url += f"&pageToken={urllib.parse.quote(page_token)}"
+
+            def _get():
+                return requests.get(url, headers=headers, timeout=20)
+
+            resp = await asyncio.to_thread(_get)
+            if resp.status_code == 403:
+                # Scope may lack readonly.appcreateddata on older tokens
+                logger.warning(f"[Google Photos] mediaItems.list returned 403 (insufficient scopes): {resp.text[:120]}")
+                return False, items_list, "Insufficient scopes for mediaItems.list (requires re-auth with appcreateddata)."
+
+            if resp.status_code != 200:
+                logger.warning(f"[Google Photos] mediaItems.list returned HTTP {resp.status_code}")
+                return False, items_list, f"HTTP {resp.status_code}: {resp.text[:120]}"
+
+            data = resp.json()
+            batch = data.get("mediaItems", [])
+            for it in batch:
+                fname = it.get("filename", "")
+                i_id = it.get("id", "")
+                if fname:
+                    items_list.append({
+                        "id": i_id,
+                        "filename": fname,
+                        "product_url": it.get("productUrl", ""),
+                        "mime_type": it.get("mimeType", ""),
+                    })
+                    # Sync into local catalog
+                    record_transferred_video(fs_id=i_id, filename=fname, google_id=i_id, product_url=it.get("productUrl", ""))
+
+            page_token = data.get("nextPageToken")
+            if not page_token or len(batch) < 100:
+                break
+            page += 1
+
+        logger.info(f"[Google Photos] Fetched {len(items_list)} app-created items from Google Photos API.")
+        return True, items_list, None
+
+    except Exception as e:
+        logger.error(f"[Google Photos] Error fetching media items: {e}")
+        return False, items_list, str(e)
+
+
+async def get_known_google_photos_files() -> Tuple[Set[str], Set[str]]:
+    """
+    Returns two sets: (known_fs_ids, known_filenames) representing all videos
+    already present in Google Photos (from persistent registry + API scan).
+    All filenames are lowercased and stripped for fuzzy/exact matching.
+    """
+    reg = load_transferred_registry()
+    known_fs_ids = set()
+    known_filenames = set()
+
+    for fs_id, item in reg.get("items", {}).items():
+        if fs_id:
+            known_fs_ids.add(str(fs_id).strip())
+        fname = item.get("clean_name") or item.get("filename", "")
+        if fname:
+            known_filenames.add(fname.strip().lower())
+
+    for fname, fs_id in reg.get("filenames", {}).items():
+        if fname:
+            known_filenames.add(fname.strip().lower())
+        if fs_id:
+            known_fs_ids.add(str(fs_id).strip())
+
+    for m in reg.get("manual_marked", []):
+        if m:
+            known_filenames.add(m.strip().lower())
+
+    # Opportunistically attempt API fetch for newly synced items if authenticated
+    try:
+        auth_ok, _ = is_photos_authenticated()
+        if auth_ok:
+            api_ok, api_items, _ = await fetch_app_created_media_items(max_pages=5)
+            if api_ok and api_items:
+                for it in api_items:
+                    fn = (it.get("filename") or "").strip().lower()
+                    if fn:
+                        known_filenames.add(fn)
+    except Exception as e:
+        logger.debug(f"[Google Photos] Optional API fetch notice: {e}")
+
+    return known_fs_ids, known_filenames
 
 
 def load_token_data() -> Optional[Dict[str, Any]]:

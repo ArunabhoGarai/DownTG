@@ -106,6 +106,7 @@ from terabox_to_gphotos_service import (
     execute_transfer_job,
     is_transfer_in_progress,
     cancel_current_transfer,
+    check_terabox_vs_google_photos,
 )
 
 logger = logging.getLogger(__name__)
@@ -539,15 +540,18 @@ def build_cancel_keyboard(task_id: str) -> InlineKeyboardMarkup:
 
 
 TERA_ACCOUNT_VIDEOS_CACHE: Dict[int, List[Dict[str, Any]]] = {}
+TERA_MISSING_VIDEOS_CACHE: Dict[int, List[Dict[str, Any]]] = {}
+TERA_CHECK_STATS_CACHE: Dict[int, Dict[str, Any]] = {}
 
 
 def build_terafetch_keyboard(page: int = 0, total_videos: int = 0, page_size: int = 5) -> InlineKeyboardMarkup:
     """Builds interactive inline keyboard for TeraBox fetched videos."""
     buttons = []
-    # Row 1: Start transfer button if videos exist
+    # Row 1: Quick actions if videos exist
     if total_videos > 0:
         buttons.append([
-            InlineKeyboardButton("🚀 Transfer All to Google Photos", callback_data="teragphotos_transfer")
+            InlineKeyboardButton("🔍 Check Missing in Photos", callback_data="teracheck_refresh"),
+            InlineKeyboardButton("🚀 Transfer All", callback_data="teragphotos_transfer"),
         ])
 
     # Row 2: Pagination buttons
@@ -597,7 +601,83 @@ def format_terafetch_page_text(videos: List[Dict[str, Any]], page: int = 0, page
         text += f"**{i}.** 🎬 `{fn}`\n   ↳ 💾 `{sz}` | 📁 `{path[:35]}`\n"
 
     text += (
-        f"\n💡 *Tap [🚀 Transfer All to Google Photos] below to transfer all {total_count} videos with a 10s cooldown between transfers.*"
+        f"\n💡 *Tap [🔍 Check Missing in Photos] to see what's not uploaded, or [🚀 Transfer All] to transfer all {total_count} videos.*"
+    )
+    return text
+
+
+def build_teracheck_keyboard(page: int = 0, total_missing: int = 0, page_size: int = 5) -> InlineKeyboardMarkup:
+    """Builds interactive inline keyboard for TeraBox vs Google Photos checker."""
+    buttons = []
+    # Row 1: Transfer missing button if missing items exist
+    if total_missing > 0:
+        buttons.append([
+            InlineKeyboardButton(f"🚀 Transfer Missing ({total_missing}) to Photos", callback_data="teragphotos_transfer_missing")
+        ])
+
+    # Row 2: Navigation buttons
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("◀️ Previous", callback_data=f"teracheck_page:{page - 1}"))
+    if (page + 1) * page_size < total_missing:
+        nav_row.append(InlineKeyboardButton("Next ▶️", callback_data=f"teracheck_page:{page + 1}"))
+    if nav_row:
+        buttons.append(nav_row)
+
+    # Row 3: Re-Check, View All, and Close
+    buttons.append([
+        InlineKeyboardButton("🔄 Re-Check", callback_data="teracheck_refresh"),
+        InlineKeyboardButton("📦 View All Videos", callback_data="terafetch_refresh"),
+        InlineKeyboardButton("❌ Close", callback_data="stats_close"),
+    ])
+    return InlineKeyboardMarkup(buttons)
+
+
+def format_teracheck_page_text(check_result: Dict[str, Any], page: int = 0, page_size: int = 5) -> str:
+    """Renders formatted checker status and paginated missing videos."""
+    total_tb = check_result.get("total_terabox", 0)
+    total_tb_size = check_result.get("total_terabox_size_formatted", "0 B")
+    present_cnt = check_result.get("present_count", 0)
+    present_sz = check_result.get("present_size_formatted", "0 B")
+    missing_cnt = check_result.get("missing_count", 0)
+    missing_sz = check_result.get("missing_size_formatted", "0 B")
+    missing_videos = check_result.get("missing_videos", [])
+
+    text = (
+        "🔍 **TeraBox ➔ Google Photos Sync Checker**\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📦 **TeraBox Account Total:** `{total_tb}` videos (`{total_tb_size}`)\n"
+        f"✅ **Already in Google Photos:** `{present_cnt}` videos (`{present_sz}`)\n"
+        f"⚠️ **Missing from Google Photos:** `{missing_cnt}` videos (`{missing_sz}`)\n"
+    )
+
+    if total_tb == 0:
+        text += (
+            "\n⚠️ *No videos found in your TeraBox account.*\n"
+            "💡 Upload videos to TeraBox or refresh cookies with `/setteracookie`."
+        )
+        return text
+
+    if missing_cnt == 0:
+        text += (
+            "\n🎉 **Everything is 100% in Sync!**\n"
+            f"All `{total_tb}` video files from your TeraBox account are already present in your Google Photos library."
+        )
+        return text
+
+    start_idx = page * page_size
+    page_items = missing_videos[start_idx : start_idx + page_size]
+    max_pages = max(1, (missing_cnt + page_size - 1) // page_size)
+
+    text += f"\n📋 **Missing Videos Queue (Page {page + 1} of {max_pages}):**\n"
+    for i, it in enumerate(page_items, start_idx + 1):
+        fn = it.get("filename", "unknown.mp4")
+        sz = it.get("size_formatted", format_bytes(it.get("size", 0)))
+        path = it.get("path", "")
+        text += f"**{i}.** 🎬 `{fn}`\n   ↳ 💾 `{sz}` | 📁 `{path[:35]}`\n"
+
+    text += (
+        f"\n💡 *Tap [🚀 Transfer Missing ({missing_cnt})] below or use `/teratransfer missing` to transfer only these unsynced videos (with 10s cooldown)!*"
     )
     return text
 
@@ -1364,7 +1444,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     # ── TeraBox Account & Google Photos Transfer Callbacks (STRICT DEV ONLY) ──
-    if action in ("terafetch_page", "terafetch_refresh", "teragphotos_transfer", "teragphotos_cancel"):
+    if action in (
+        "terafetch_page", "terafetch_refresh", "teragphotos_transfer", "teragphotos_cancel",
+        "teracheck_page", "teracheck_refresh", "teragphotos_transfer_missing",
+    ):
         if not is_admin(user_id):
             await query.answer("⛔ This action is restricted to the bot developer.", show_alert=True)
             return
@@ -1392,6 +1475,65 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         text = format_terafetch_page_text(videos, page=0)
         kb = build_terafetch_keyboard(page=0, total_videos=len(videos))
         await edit_query_message(query, text, reply_markup=kb)
+        return
+
+    if action == "teracheck_page":
+        page = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+        check_res = TERA_CHECK_STATS_CACHE.get(user_id)
+        if not check_res:
+            check_res = await check_terabox_vs_google_photos()
+            TERA_CHECK_STATS_CACHE[user_id] = check_res
+            TERA_MISSING_VIDEOS_CACHE[user_id] = check_res.get("missing_videos", [])
+        text = format_teracheck_page_text(check_res, page=page)
+        kb = build_teracheck_keyboard(page=page, total_missing=check_res.get("missing_count", 0))
+        await edit_query_message(query, text, reply_markup=kb)
+        return
+
+    if action == "teracheck_refresh":
+        await edit_query_message(query, "⏳ **Checking TeraBox vs Google Photos Library...**\nCross-referencing video library and checking upload history...")
+        check_res = await check_terabox_vs_google_photos()
+        if not check_res.get("success"):
+            await edit_query_message(query, f"❌ **Sync Check Failed:**\n`{check_res.get('error')}`")
+            return
+        TERA_CHECK_STATS_CACHE[user_id] = check_res
+        TERA_MISSING_VIDEOS_CACHE[user_id] = check_res.get("missing_videos", [])
+        TERA_ACCOUNT_VIDEOS_CACHE[user_id] = check_res.get("all_videos", [])
+        text = format_teracheck_page_text(check_res, page=0)
+        kb = build_teracheck_keyboard(page=0, total_missing=check_res.get("missing_count", 0))
+        await edit_query_message(query, text, reply_markup=kb)
+        return
+
+    if action == "teragphotos_transfer_missing":
+        if is_transfer_in_progress():
+            await query.answer("⚠️ A transfer is already in progress. Use /canceltransfer to stop it.", show_alert=True)
+            return
+        auth_ok, auth_msg = is_photos_authenticated()
+        if not auth_ok:
+            await query.answer("⚠️ Google Photos is not connected. Use /gphotos_auth first.", show_alert=True)
+            return
+        missing_videos = TERA_MISSING_VIDEOS_CACHE.get(user_id, [])
+        if not missing_videos:
+            check_res = await check_terabox_vs_google_photos()
+            TERA_CHECK_STATS_CACHE[user_id] = check_res
+            missing_videos = check_res.get("missing_videos", [])
+            TERA_MISSING_VIDEOS_CACHE[user_id] = missing_videos
+
+        if not missing_videos:
+            await query.answer("🎉 All TeraBox videos are already in Google Photos! Nothing to transfer.", show_alert=True)
+            return
+
+        await query.answer(f"🚀 Starting transfer of {len(missing_videos)} missing videos...")
+        status_msg = await query.message.reply_text(
+            f"🚀 **Starting Transfer of Missing Videos to Google Photos**\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📦 **Queue:** `{len(missing_videos)}` missing videos\n"
+            f"⏱️ **Cooldown:** `10s` between each transfer\n"
+            "Initializing pipeline...",
+            parse_mode=constants.ParseMode.MARKDOWN,
+        )
+        async def _update_status(txt: str):
+            await edit_status_msg_safe(status_msg, txt)
+        asyncio.create_task(execute_transfer_job(missing_videos, status_updater=_update_status))
         return
 
     if action == "teragphotos_transfer":
@@ -2625,7 +2767,9 @@ async def terafetch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def teratransfer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Starts sequential transfer of TeraBox account videos to Google Photos with a 10s cooldown.
-    Usage: /teratransfer or /gtransfer
+    Usage:
+      • /teratransfer -> transfers all TeraBox videos
+      • /teratransfer missing -> transfers ONLY videos not yet in Google Photos
     """
     user_id = update.effective_user.id
     if not is_admin(user_id):
@@ -2653,28 +2797,65 @@ async def teratransfer_command(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    # Get cached videos or fetch fresh
-    videos = TERA_ACCOUNT_VIDEOS_CACHE.get(user_id, [])
-    if not videos:
-        fetch_msg = await update.message.reply_text(
-            "⏳ **Fetching video library from TeraBox account first...**",
-            parse_mode=constants.ParseMode.MARKDOWN,
-            reply_to_message_id=update.message.message_id,
-        )
-        res = await fetch_account_videos()
-        if not res.get("success") or not res.get("videos"):
-            err = res.get("error") or "No video files found in account."
-            await fetch_msg.edit_text(f"❌ **Transfer Aborted:** {err}")
+    transfer_only_missing = False
+    if context.args and context.args[0].lower() in ("missing", "diff", "unsynced", "new"):
+        transfer_only_missing = True
+
+    if transfer_only_missing:
+        videos = TERA_MISSING_VIDEOS_CACHE.get(user_id, [])
+        if not videos:
+            fetch_msg = await update.message.reply_text(
+                "⏳ **Checking missing videos against Google Photos first...**",
+                parse_mode=constants.ParseMode.MARKDOWN,
+                reply_to_message_id=update.message.message_id,
+            )
+            check_res = await check_terabox_vs_google_photos()
+            if not check_res.get("success"):
+                err = check_res.get("error") or "Failed to cross-reference videos."
+                await fetch_msg.edit_text(f"❌ **Transfer Aborted:** {err}")
+                return
+            TERA_CHECK_STATS_CACHE[user_id] = check_res
+            videos = check_res.get("missing_videos", [])
+            TERA_MISSING_VIDEOS_CACHE[user_id] = videos
+            TERA_ACCOUNT_VIDEOS_CACHE[user_id] = check_res.get("all_videos", [])
+            try:
+                await fetch_msg.delete()
+            except Exception:
+                pass
+
+        if not videos:
+            await update.message.reply_text(
+                "🎉 **All TeraBox videos are already in Google Photos!**\nThere are no missing videos to transfer.",
+                parse_mode=constants.ParseMode.MARKDOWN,
+                reply_to_message_id=update.message.message_id,
+            )
             return
-        videos = res.get("videos", [])
-        TERA_ACCOUNT_VIDEOS_CACHE[user_id] = videos
-        try:
-            await fetch_msg.delete()
-        except Exception:
-            pass
+
+        label_type = "Missing Videos"
+    else:
+        # Get cached videos or fetch fresh
+        videos = TERA_ACCOUNT_VIDEOS_CACHE.get(user_id, [])
+        if not videos:
+            fetch_msg = await update.message.reply_text(
+                "⏳ **Fetching video library from TeraBox account first...**",
+                parse_mode=constants.ParseMode.MARKDOWN,
+                reply_to_message_id=update.message.message_id,
+            )
+            res = await fetch_account_videos()
+            if not res.get("success") or not res.get("videos"):
+                err = res.get("error") or "No video files found in account."
+                await fetch_msg.edit_text(f"❌ **Transfer Aborted:** {err}")
+                return
+            videos = res.get("videos", [])
+            TERA_ACCOUNT_VIDEOS_CACHE[user_id] = videos
+            try:
+                await fetch_msg.delete()
+            except Exception:
+                pass
+        label_type = "All Videos"
 
     status_msg = await update.message.reply_text(
-        f"🚀 **Starting Transfer to Google Photos**\n"
+        f"🚀 **Starting Transfer ({label_type}) to Google Photos**\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📦 **Queue:** `{len(videos)}` videos\n"
         f"⏱️ **Cooldown:** `10s` between each transfer\n"
@@ -2687,6 +2868,48 @@ async def teratransfer_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await edit_status_msg_safe(status_msg, txt)
 
     asyncio.create_task(execute_transfer_job(videos, status_updater=_update_status))
+
+
+async def teracheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Checks which videos from the TeraBox account are not yet present in Google Photos,
+    and provides an option to transfer only the missing ones.
+    Usage: /teracheck or /checkphotos or /terasync
+    """
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text(DEV_RESTRICTED_MESSAGE)
+        return
+
+    status_msg = await update.message.reply_text(
+        "🔍 **Cross-Referencing TeraBox vs Google Photos Library...**\n"
+        "Connecting to TeraBox account and checking against Google Photos upload records...",
+        parse_mode=constants.ParseMode.MARKDOWN,
+        reply_to_message_id=update.message.message_id,
+    )
+
+    check_res = await check_terabox_vs_google_photos()
+    if not check_res.get("success"):
+        err = check_res.get("error") or "Unknown error checking videos."
+        await status_msg.edit_text(
+            f"❌ **Sync Check Failed:**\n`{err}`\n\n"
+            "💡 *Tip: Ensure valid cookies in `cooky/terabox/cookies.txt` and Google Photos is linked via `/gphotos_auth`.*",
+            parse_mode=constants.ParseMode.MARKDOWN,
+        )
+        return
+
+    TERA_CHECK_STATS_CACHE[user_id] = check_res
+    TERA_MISSING_VIDEOS_CACHE[user_id] = check_res.get("missing_videos", [])
+    TERA_ACCOUNT_VIDEOS_CACHE[user_id] = check_res.get("all_videos", [])
+
+    text = format_teracheck_page_text(check_res, page=0)
+    keyboard = build_teracheck_keyboard(page=0, total_missing=check_res.get("missing_count", 0))
+
+    await status_msg.edit_text(
+        text,
+        reply_markup=keyboard,
+        parse_mode=constants.ParseMode.MARKDOWN,
+    )
 
 
 async def canceltransfer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2991,6 +3214,10 @@ def register_handlers(application):
     application.add_handler(CommandHandler("userstats", userstats_command))
     application.add_handler(CommandHandler("terafetch", terafetch_command))
     application.add_handler(CommandHandler("teravideos", terafetch_command))
+    application.add_handler(CommandHandler("teracheck", teracheck_command))
+    application.add_handler(CommandHandler("checkphotos", teracheck_command))
+    application.add_handler(CommandHandler("terasync", teracheck_command))
+    application.add_handler(CommandHandler("photoscheck", teracheck_command))
     application.add_handler(CommandHandler("teratransfer", teratransfer_command))
     application.add_handler(CommandHandler("gtransfer", teratransfer_command))
     application.add_handler(CommandHandler("canceltransfer", canceltransfer_command))
