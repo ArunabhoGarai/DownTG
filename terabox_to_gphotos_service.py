@@ -23,6 +23,7 @@ from google_photos_manager import (
     upload_video_to_google_photos,
     record_transferred_video,
     get_known_google_photos_files,
+    get_video_match_keys,
 )
 
 logger = logging.getLogger(__name__)
@@ -353,17 +354,23 @@ async def check_terabox_vs_google_photos(
             }
         videos = fetch_res.get("videos", [])
 
-    known_fs_ids, known_filenames = await get_known_google_photos_files()
+    known_fs_ids, known_match_keys, scope_warning = await get_known_google_photos_files()
 
     present_videos = []
     missing_videos = []
 
     for v in videos:
         fs_id_str = str(v.get("fs_id", "")).strip()
-        fname_clean = (v.get("filename") or "").strip().lower()
+        fname = (v.get("filename") or "").strip()
+        path = (v.get("path") or "").strip()
 
-        # Match either by TeraBox fs_id or by clean normalized filename
-        if (fs_id_str and fs_id_str in known_fs_ids) or (fname_clean and fname_clean in known_filenames):
+        # Resilient match keys for TeraBox video
+        v_keys = get_video_match_keys(fname)
+        if path:
+            v_keys |= get_video_match_keys(path)
+
+        # Match either by TeraBox fs_id or by intersection with known match keys
+        if (fs_id_str and fs_id_str in known_fs_ids) or (v_keys and bool(v_keys & known_match_keys)):
             present_videos.append(v)
         else:
             missing_videos.append(v)
@@ -375,6 +382,7 @@ async def check_terabox_vs_google_photos(
     return {
         "success": True,
         "error": None,
+        "warning": scope_warning,
         "total_terabox": len(videos),
         "total_terabox_size": total_size,
         "total_terabox_size_formatted": format_bytes(total_size) if total_size > 0 else "0 B",

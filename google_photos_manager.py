@@ -6,6 +6,7 @@ and uploading videos directly into Google Photos library.
 """
 
 import os
+import re
 import json
 import time
 import mimetypes
@@ -45,7 +46,6 @@ SCOPES = [
     "https://www.googleapis.com/auth/photoslibrary.appendonly",
     "https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata",
     "https://www.googleapis.com/auth/photoslibrary.edit.appcreateddata",
-    "https://www.googleapis.com/auth/photoslibrary",
 ]
 
 TRANSFERRED_REGISTRY_FILE = DATA_DIR / "transferred_videos.json"
@@ -81,12 +81,64 @@ def save_transferred_registry(data: Dict[str, Any]) -> bool:
         return False
 
 
+def get_video_match_keys(name: str) -> Set[str]:
+    """
+    Extracts all possible match keys for a video filename to ensure robust
+    cross-platform matching between TeraBox and Google Photos regardless of:
+    - URL encoding (%20 vs space)
+    - Sanitized characters (: / \\ replaced by _)
+    - Extension differences (.mkv vs .mp4 vs .avi)
+    - Separator differences (. vs _ vs - vs space)
+    - Alphanumeric stems
+    """
+    if not name or not isinstance(name, str):
+        return set()
+
+    keys = set()
+    raw = name.strip()
+    if not raw:
+        return keys
+
+    # 1. URL unquote
+    try:
+        unquoted = urllib.parse.unquote(raw).strip()
+    except Exception:
+        unquoted = raw
+
+    for variant in (raw, unquoted):
+        base = Path(variant).name.strip()
+        lower = base.lower()
+        keys.add(lower)
+
+        stem = Path(lower).stem.strip()
+        if stem:
+            keys.add(stem)
+
+            # Spaced normalization: replace underscores, dots, hyphens with space
+            norm_space = re.sub(r'[\s_\.\-]+', ' ', stem).strip()
+            if norm_space:
+                keys.add(norm_space)
+
+            # Alphanumeric only (strips all punctuation/spaces)
+            alpha_only = re.sub(r'[^a-z0-9]', '', stem)
+            if len(alpha_only) >= 3:
+                keys.add(alpha_only)
+
+            # Clean filename variant (safe characters)
+            cleaned = re.sub(r'[\\/*?:"<>|]', "_", variant).strip().lower()
+            keys.add(cleaned)
+            keys.add(Path(cleaned).stem.strip())
+
+    return keys
+
+
 def record_transferred_video(
     fs_id: Any,
     filename: str,
     size: int = 0,
     google_id: Optional[str] = None,
     product_url: Optional[str] = None,
+    description: Optional[str] = None,
 ) -> bool:
     """Records a successfully transferred video into the persistent registry."""
     data = load_transferred_registry()
@@ -108,6 +160,16 @@ def record_transferred_video(
     if clean_name:
         data["filenames"][clean_name] = str_id
 
+    # Register all resilient match keys
+    match_keys = get_video_match_keys(filename)
+    if description:
+        clean_desc = description.replace("Transferred from TeraBox:", "").strip()
+        match_keys |= get_video_match_keys(clean_desc)
+
+    for k in match_keys:
+        if k:
+            data["filenames"][k] = str_id or clean_name
+
     return save_transferred_registry(data)
 
 
@@ -122,16 +184,21 @@ def mark_as_transferred(identifiers: List[str]) -> int:
         clean = s.lower()
         if clean not in data.get("manual_marked", []):
             data["manual_marked"].append(clean)
-            data["filenames"][clean] = clean
             count += 1
+        for k in get_video_match_keys(s):
+            if k:
+                data["filenames"][k] = clean
     if count > 0:
         save_transferred_registry(data)
     return count
 
 
-async def fetch_app_created_media_items(max_pages: int = 20) -> Tuple[bool, List[Dict[str, Any]], Optional[str]]:
+async def fetch_app_created_media_items(
+    max_pages: int = 200,
+) -> Tuple[bool, List[Dict[str, Any]], Optional[str]]:
     """
     Queries Google Photos Library API for media items created by this application.
+    Traverses all library pages across all creation dates until nextPageToken is exhausted.
     Returns: (success, media_items_list, error_msg)
     """
     ok, access_token, err = await get_valid_access_token()
@@ -149,12 +216,12 @@ async def fetch_app_created_media_items(max_pages: int = 20) -> Tuple[bool, List
 
     try:
         while page <= max_pages:
-            url = f"https://photoslibrary.googleapis.com/v1/mediaItems?pageSize=100"
+            url = "https://photoslibrary.googleapis.com/v1/mediaItems?pageSize=100"
             if page_token:
                 url += f"&pageToken={urllib.parse.quote(page_token)}"
 
             def _get():
-                return requests.get(url, headers=headers, timeout=20)
+                return requests.get(url, headers=headers, timeout=25)
 
             resp = await asyncio.to_thread(_get)
             if resp.status_code == 403:
@@ -171,22 +238,40 @@ async def fetch_app_created_media_items(max_pages: int = 20) -> Tuple[bool, List
             for it in batch:
                 fname = it.get("filename", "")
                 i_id = it.get("id", "")
-                if fname:
+                desc = it.get("description", "")
+                if fname or desc:
                     items_list.append({
                         "id": i_id,
                         "filename": fname,
+                        "description": desc,
                         "product_url": it.get("productUrl", ""),
                         "mime_type": it.get("mimeType", ""),
                     })
-                    # Sync into local catalog
-                    record_transferred_video(fs_id=i_id, filename=fname, google_id=i_id, product_url=it.get("productUrl", ""))
+                    # Sync into local catalog with all match keys
+                    record_transferred_video(
+                        fs_id=i_id,
+                        filename=fname,
+                        google_id=i_id,
+                        product_url=it.get("productUrl", ""),
+                        description=desc,
+                    )
 
             page_token = data.get("nextPageToken")
-            if not page_token or len(batch) < 100:
-                break
-            page += 1
+            logger.info(
+                f"[Google Photos] Page {page}: fetched {len(batch)} items in this batch "
+                f"({len(items_list)} total collected). Has nextPageToken: {bool(page_token)}"
+            )
 
-        logger.info(f"[Google Photos] Fetched {len(items_list)} app-created items from Google Photos API.")
+            # CRITICAL: Google Photos returns fewer than 100 items per batch when filtering
+            # by app-created data across different dates. ONLY break when page_token is exhausted!
+            if not page_token:
+                logger.info(f"[Google Photos] All pages across library timeline retrieved. Total items: {len(items_list)}")
+                break
+
+            page += 1
+            await asyncio.sleep(0.02)
+
+        logger.info(f"[Google Photos] Fetched {len(items_list)} app-created items across {page} pages from Google Photos API.")
         return True, items_list, None
 
     except Exception as e:
@@ -194,47 +279,69 @@ async def fetch_app_created_media_items(max_pages: int = 20) -> Tuple[bool, List
         return False, items_list, str(e)
 
 
-async def get_known_google_photos_files() -> Tuple[Set[str], Set[str]]:
+def clear_transferred_registry() -> bool:
+    """Resets the persistent transferred videos registry."""
+    return save_transferred_registry({"items": {}, "filenames": {}, "manual_marked": []})
+
+
+def token_has_read_scope() -> bool:
+    """Checks if the saved Google Photos OAuth token contains read scopes."""
+    tokens = load_token_data()
+    if not tokens:
+        return False
+    granted = tokens.get("scope", "")
+    return "photoslibrary.readonly.appcreateddata" in granted
+
+
+async def get_known_google_photos_files() -> Tuple[Set[str], Set[str], Optional[str]]:
     """
-    Returns two sets: (known_fs_ids, known_filenames) representing all videos
+    Returns (known_fs_ids, known_match_keys, scope_warning) representing all videos
     already present in Google Photos (from persistent registry + API scan).
-    All filenames are lowercased and stripped for fuzzy/exact matching.
+    `known_match_keys` includes all normalized variations, stems, and alphanumeric hashes
+    to handle files scattered across dates, extension differences, and sanitizations.
     """
     reg = load_transferred_registry()
     known_fs_ids = set()
-    known_filenames = set()
+    known_match_keys = set()
+    scope_warning = None
 
     for fs_id, item in reg.get("items", {}).items():
         if fs_id:
             known_fs_ids.add(str(fs_id).strip())
         fname = item.get("clean_name") or item.get("filename", "")
         if fname:
-            known_filenames.add(fname.strip().lower())
+            known_match_keys |= get_video_match_keys(fname)
 
     for fname, fs_id in reg.get("filenames", {}).items():
         if fname:
-            known_filenames.add(fname.strip().lower())
+            known_match_keys |= get_video_match_keys(fname)
         if fs_id:
             known_fs_ids.add(str(fs_id).strip())
 
     for m in reg.get("manual_marked", []):
         if m:
-            known_filenames.add(m.strip().lower())
+            known_match_keys |= get_video_match_keys(m)
 
-    # Opportunistically attempt API fetch for newly synced items if authenticated
+    # Opportunistically attempt API fetch for newly synced items across all dates
     try:
         auth_ok, _ = is_photos_authenticated()
         if auth_ok:
-            api_ok, api_items, _ = await fetch_app_created_media_items(max_pages=5)
+            api_ok, api_items, api_err = await fetch_app_created_media_items(max_pages=200)
             if api_ok and api_items:
                 for it in api_items:
-                    fn = (it.get("filename") or "").strip().lower()
+                    fn = (it.get("filename") or "").strip()
                     if fn:
-                        known_filenames.add(fn)
+                        known_match_keys |= get_video_match_keys(fn)
+                    desc = (it.get("description") or "").strip()
+                    if desc:
+                        clean_desc = desc.replace("Transferred from TeraBox:", "").strip()
+                        known_match_keys |= get_video_match_keys(clean_desc)
+            elif not api_ok and "insufficient scopes" in str(api_err).lower():
+                scope_warning = "Google token lacks read permission (`readonly.appcreateddata`). Run /gphotos_auth to re-link."
     except Exception as e:
         logger.debug(f"[Google Photos] Optional API fetch notice: {e}")
 
-    return known_fs_ids, known_filenames
+    return known_fs_ids, known_match_keys, scope_warning
 
 
 def load_token_data() -> Optional[Dict[str, Any]]:
@@ -504,15 +611,26 @@ async def get_valid_access_token() -> Tuple[bool, Optional[str], Optional[str]]:
 
 
 def is_photos_authenticated() -> Tuple[bool, Optional[str]]:
-    """Checks if Google Photos OAuth token is configured and available."""
+    """Checks if Google Photos OAuth token is configured, active, and inspects granted scopes."""
     tokens = load_token_data()
     if not tokens or not tokens.get("access_token"):
         return False, "Not authenticated."
+
+    scope = tokens.get("scope", "")
+    has_read = "photoslibrary.readonly.appcreateddata" in scope
+
+    status_parts = []
     if tokens.get("refresh_token"):
-        return True, "Authenticated (Refresh Token active)"
-    if time.time() < float(tokens.get("expires_at", 0)):
-        return True, "Authenticated (Active Access Token)"
-    return False, "Token expired (No refresh token)."
+        status_parts.append("Refresh Token active")
+    elif time.time() < float(tokens.get("expires_at", 0)):
+        status_parts.append("Active Access Token")
+    else:
+        return False, "Token expired (No refresh token)."
+
+    if not has_read:
+        status_parts.append("⚠️ Missing read scope - re-auth with /gphotos_auth needed for checker")
+
+    return True, f"Authenticated ({'; '.join(status_parts)})"
 
 
 async def upload_video_to_google_photos(

@@ -101,6 +101,11 @@ from google_photos_manager import (
     get_authorization_url,
     exchange_code_for_tokens,
     is_photos_authenticated,
+    load_transferred_registry,
+    clear_transferred_registry,
+    mark_as_transferred,
+    fetch_app_created_media_items,
+    token_has_read_scope,
 )
 from terabox_to_gphotos_service import (
     execute_transfer_job,
@@ -650,6 +655,9 @@ def format_teracheck_page_text(check_result: Dict[str, Any], page: int = 0, page
         f"✅ **Already in Google Photos:** `{present_cnt}` videos (`{present_sz}`)\n"
         f"⚠️ **Missing from Google Photos:** `{missing_cnt}` videos (`{missing_sz}`)\n"
     )
+
+    if check_result.get("warning"):
+        text += f"\n⚠️ **Notice:** {check_result['warning']}\n"
 
     if total_tb == 0:
         text += (
@@ -3158,6 +3166,144 @@ async def gphotos_status_command(update: Update, context: ContextTypes.DEFAULT_T
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.MARKDOWN, reply_to_message_id=update.message.message_id)
 
 
+async def teramark_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Manually marks video(s) as already transferred to Google Photos, or triggers an API sync.
+    Usage:
+      /teramark 1-50          (marks videos #1 through #50 from TeraBox account list)
+      /teramark 5             (marks video #5 from TeraBox account list)
+      /teramark <filename>    (marks specific filename)
+      /teramark sync          (fetches app-created items from Google Photos API)
+      /teramark clear         (resets local transfer registry)
+      /teramark status        (displays count of registered items)
+    """
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text(DEV_RESTRICTED_MESSAGE)
+        return
+
+    if not context.args:
+        reg = load_transferred_registry()
+        reg_count = len(reg.get("items", {})) + len(reg.get("manual_marked", []))
+        await update.message.reply_text(
+            "📝 **TeraBox ➔ Google Photos Sync Marker**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"• **Registered Transferred Files:** `{reg_count}`\n\n"
+            "**Available Commands:**\n"
+            "• `/teramark 1-20` — Mark items 1 to 20 as already transferred\n"
+            "• `/teramark 5` — Mark item #5 as already transferred\n"
+            "• `/teramark video.mp4` — Mark a specific filename\n"
+            "• `/teramark sync` — Query Google Photos API to auto-import uploaded items\n"
+            "• `/teramark status` — Show registry counts\n"
+            "• `/teramark clear` — Reset registry to clean slate",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_to_message_id=update.message.message_id,
+        )
+        return
+
+    arg = " ".join(context.args).strip()
+
+    if arg.lower() == "clear":
+        clear_transferred_registry()
+        await update.message.reply_text(
+            "🗑️ **Transferred Videos Registry has been reset.**",
+            reply_to_message_id=update.message.message_id,
+        )
+        return
+
+    if arg.lower() in ("status", "info"):
+        reg = load_transferred_registry()
+        cnt_items = len(reg.get("items", {}))
+        cnt_manual = len(reg.get("manual_marked", []))
+        await update.message.reply_text(
+            f"📊 **Transfer Registry Status:**\n"
+            f"• API / Auto Recorded Items: `{cnt_items}`\n"
+            f"• Manually Marked Items: `{cnt_manual}`\n"
+            f"• Total Known Files: `{cnt_items + cnt_manual}`",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_to_message_id=update.message.message_id,
+        )
+        return
+
+    if arg.lower() == "sync":
+        status_msg = await update.message.reply_text(
+            "⏳ **Scanning all library dates from Google Photos API...**\n"
+            "Traversing all timeline pages to discover previously transferred videos...",
+            reply_to_message_id=update.message.message_id,
+        )
+        ok, items, err = await fetch_app_created_media_items(max_pages=200)
+        if ok:
+            await status_msg.edit_text(
+                f"✅ **Google Photos Synced!**\n"
+                f"Traversed entire library timeline and recorded `{len(items)}` app-created video items into the local registry.\n\n"
+                f"👉 Run `/teracheck` to view updated missing queue.",
+                parse_mode=constants.ParseMode.MARKDOWN,
+            )
+        else:
+            await status_msg.edit_text(
+                f"❌ **Sync Failed:**\n`{err}`\n\n"
+                f"💡 *Tip: If you see 'Insufficient scopes', run `/gphotos_auth` to re-authorize with read permissions.*",
+                parse_mode=constants.ParseMode.MARKDOWN,
+            )
+        return
+
+    # Check for range: e.g. "1-20" or single index "5"
+    videos = TERA_ACCOUNT_VIDEOS_CACHE.get(user_id) or []
+    if not videos:
+        fetch_res = await fetch_account_videos()
+        if fetch_res.get("success"):
+            videos = fetch_res.get("videos", [])
+            TERA_ACCOUNT_VIDEOS_CACHE[user_id] = videos
+
+    import re
+    range_match = re.match(r"^(\d+)\s*(?:-|to)\s*(\d+)$", arg, re.IGNORECASE)
+    single_num_match = re.match(r"^(\d+)$", arg)
+
+    if (range_match or single_num_match) and videos:
+        if range_match:
+            start_num = max(1, int(range_match.group(1)))
+            end_num = min(len(videos), int(range_match.group(2)))
+        else:
+            start_num = int(single_num_match.group(1))
+            end_num = start_num
+
+        if start_num > len(videos) or start_num > end_num:
+            await update.message.reply_text(
+                f"❌ Invalid index range `{arg}`. TeraBox account has `{len(videos)}` videos.",
+                reply_to_message_id=update.message.message_id,
+            )
+            return
+
+        to_mark = []
+        for i in range(start_num - 1, end_num):
+            v = videos[i]
+            fn = v.get("filename")
+            fs_id = v.get("fs_id")
+            if fn:
+                to_mark.append(fn)
+            if fs_id:
+                to_mark.append(str(fs_id))
+
+        mark_as_transferred(to_mark)
+        total_items_in_range = end_num - start_num + 1
+        await update.message.reply_text(
+            f"✅ **Marked {total_items_in_range} videos (#{start_num} to #{end_num}) as transferred!**\n"
+            f"Run `/teracheck` to view updated diff.",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_to_message_id=update.message.message_id,
+        )
+        return
+
+    # Otherwise mark by string / filename
+    marked = mark_as_transferred([arg])
+    await update.message.reply_text(
+        f"✅ Marked `{arg}` as transferred (`{marked}` new entries added).\n"
+        f"Run `/teracheck` to view updated diff.",
+        parse_mode=constants.ParseMode.MARKDOWN,
+        reply_to_message_id=update.message.message_id,
+    )
+
+
 async def setteracookie_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Saves raw TeraBox cookie or ndus value into cooky/terabox/cookies.txt.
@@ -3225,6 +3371,8 @@ def register_handlers(application):
     application.add_handler(CommandHandler("gauth", gphotos_auth_command))
     application.add_handler(CommandHandler("gphotos_code", gphotos_code_command))
     application.add_handler(CommandHandler("gphotos_status", gphotos_status_command))
+    application.add_handler(CommandHandler("teramark", teramark_command))
+    application.add_handler(CommandHandler("photosmark", teramark_command))
     application.add_handler(CommandHandler("setteracookie", setteracookie_command))
     application.add_handler(CommandHandler("dl", download_command))
     application.add_handler(CommandHandler("download", download_command))
