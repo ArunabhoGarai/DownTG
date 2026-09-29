@@ -67,7 +67,9 @@ from diskwala_downloader import (
 from mtproto_uploader import (
     is_mtproto_active,
     upload_media_mtproto,
+    download_media_mtproto,
 )
+from video_streaming_helper import prepare_video_for_telegram
 from vnc_manager import (
     start_vnc_capture_session,
     start_autovnc_session,
@@ -106,6 +108,8 @@ from google_photos_manager import (
     mark_as_transferred,
     fetch_app_created_media_items,
     token_has_read_scope,
+    upload_video_to_google_photos,
+    record_transferred_video,
 )
 from terabox_to_gphotos_service import (
     execute_transfer_job,
@@ -824,6 +828,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/gphotos_auth` (or `/gauth`) — Connect to Google Photos via OAuth 2.0.\n"
         "• `/gphotos_code <code>` — Submit authorization code manually after OAuth login.\n"
         "• `/gphotos_status` — Check Google Photos authentication status.\n"
+        "• `/gphotos_upload` (or `/gupload`, `/gpush`) — Reply to any video to upload directly to Google Photos.\n"
         "• `/setteracookie <cookie>` — Update TeraBox account cookie text directly in chat.\n\n"
         "📥 **Manual Download Commands:**\n"
         "• `/dl <video_url>` (or `/download <url>`) — Manually trigger video download.\n\n"
@@ -915,66 +920,107 @@ async def send_media_to_chat(
     is_audio = (quality == "audio")
     caption = f"🎵 **{title}**\n{platform_badge}" if is_audio else f"🎬 **{title}**\n{platform_badge}"
 
-    file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+    upload_file_path = file_path
+    thumbnail_path = None
+    width = info.get("width") if info else None
+    height = info.get("height") if info else None
+    temp_files_to_clean = []
 
-    # 1. Attempt MTProto upload (supports up to 2GB with live upload percentage)
-    if is_mtproto_active() or file_size > 50 * 1024 * 1024:
-        async def _mtproto_progress(current: int, total: int):
-            if progress_status_updater and total > 0:
-                pct = int((current / total) * 100)
-                cur_str = format_bytes(current)
-                tot_str = format_bytes(total)
-                text = f"📤 **Uploading to Telegram: {pct}%**\n`[{cur_str} / {tot_str}]`"
-                try:
-                    res = progress_status_updater(text)
-                    if asyncio.iscoroutine(res):
-                        await res
-                except Exception:
-                    pass
+    # Prepare video for progressive streaming in Telegram (FastStart + MP4 container + thumbnail + metadata)
+    if not is_audio:
+        try:
+            prep = prepare_video_for_telegram(file_path)
+            upload_file_path = prep["file_path"]
+            thumbnail_path = prep["thumbnail_path"]
+            if prep.get("duration"):
+                duration_sec = prep["duration"]
+            if prep.get("width"):
+                width = prep["width"]
+            if prep.get("height"):
+                height = prep["height"]
+            if prep.get("is_remuxed") and upload_file_path != file_path:
+                temp_files_to_clean.append(upload_file_path)
+            if thumbnail_path:
+                temp_files_to_clean.append(thumbnail_path)
+        except Exception as prep_err:
+            logger.debug(f"[Video Prep] Streaming preparation notice: {prep_err}")
 
-        mtproto_success, mtproto_err = await upload_media_mtproto(
-            chat_id=chat_id,
-            file_path=file_path,
-            title=title,
-            caption=caption,
-            duration_sec=duration_sec,
-            thumbnail_path=None,
-            is_audio=is_audio,
-            progress_callback=_mtproto_progress,
-        )
-        if mtproto_success:
-            return
-        elif file_size > 50 * 1024 * 1024:
-            err_msg = mtproto_err or "MTProto client error"
-            logger.error(f"MTProto upload failed for {format_bytes(file_size)} file: {err_msg}")
-            raise RuntimeError(f"MTProto upload failed: {err_msg}")
+    try:
+        file_size = os.path.getsize(upload_file_path) if os.path.exists(upload_file_path) else 0
 
-    # 2. Standard HTTP Bot API upload (for files <= 50MB)
-    if is_audio:
-        with open(file_path, "rb") as audio_file:
-            await bot.send_audio(
+        # 1. Attempt MTProto upload (supports up to 2GB with live upload percentage)
+        if is_mtproto_active() or file_size > 50 * 1024 * 1024:
+            async def _mtproto_progress(current: int, total: int):
+                if progress_status_updater and total > 0:
+                    pct = int((current / total) * 100)
+                    cur_str = format_bytes(current)
+                    tot_str = format_bytes(total)
+                    text = f"📤 **Uploading to Telegram: {pct}%**\n`[{cur_str} / {tot_str}]`"
+                    try:
+                        res = progress_status_updater(text)
+                        if asyncio.iscoroutine(res):
+                            await res
+                    except Exception:
+                        pass
+
+            mtproto_success, mtproto_err = await upload_media_mtproto(
                 chat_id=chat_id,
-                audio=audio_file,
+                file_path=upload_file_path,
                 title=title,
-                performer=uploader,
-                duration=duration_sec,
                 caption=caption,
-                parse_mode=constants.ParseMode.MARKDOWN,
-            )
-    else:
-        width = info.get("width") if info else None
-        height = info.get("height") if info else None
-        with open(file_path, "rb") as video_file:
-            await bot.send_video(
-                chat_id=chat_id,
-                video=video_file,
-                caption=caption,
-                duration=duration_sec,
+                duration_sec=duration_sec,
+                thumbnail_path=thumbnail_path,
                 width=width,
                 height=height,
-                supports_streaming=True,
-                parse_mode=constants.ParseMode.MARKDOWN,
+                is_audio=is_audio,
+                progress_callback=_mtproto_progress,
             )
+            if mtproto_success:
+                return
+            elif file_size > 50 * 1024 * 1024:
+                err_msg = mtproto_err or "MTProto client error"
+                logger.error(f"MTProto upload failed for {format_bytes(file_size)} file: {err_msg}")
+                raise RuntimeError(f"MTProto upload failed: {err_msg}")
+
+        # 2. Standard HTTP Bot API upload (for files <= 50MB)
+        if is_audio:
+            with open(upload_file_path, "rb") as audio_file:
+                await bot.send_audio(
+                    chat_id=chat_id,
+                    audio=audio_file,
+                    title=title,
+                    performer=uploader,
+                    duration=duration_sec,
+                    caption=caption,
+                    parse_mode=constants.ParseMode.MARKDOWN,
+                )
+        else:
+            with open(upload_file_path, "rb") as video_file:
+                thumb_f = None
+                if thumbnail_path and os.path.exists(thumbnail_path):
+                    try:
+                        thumb_f = open(thumbnail_path, "rb")
+                    except Exception:
+                        thumb_f = None
+                try:
+                    await bot.send_video(
+                        chat_id=chat_id,
+                        video=video_file,
+                        caption=caption,
+                        duration=duration_sec,
+                        width=width,
+                        height=height,
+                        thumbnail=thumb_f,
+                        supports_streaming=True,
+                        parse_mode=constants.ParseMode.MARKDOWN,
+                    )
+                finally:
+                    if thumb_f:
+                        thumb_f.close()
+    finally:
+        for tf in temp_files_to_clean:
+            if tf and tf != file_path and os.path.exists(tf):
+                remove_file_safely(tf)
 
 
 async def show_quality_panel(
@@ -3401,6 +3447,180 @@ async def skiptransfer_command(update: Update, context: ContextTypes.DEFAULT_TYP
         )
 
 
+async def gphotos_upload_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Directly uploads any video sent by the Telegram bot (or in chat) to Google Photos.
+    Usage:
+        Reply to any video or video document with: /gphotos_upload (or /gupload, /gpush)
+    """
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text(DEV_RESTRICTED_MESSAGE)
+        return
+
+    # 1. Check Google Photos authorization
+    auth_ok, auth_msg = is_photos_authenticated()
+    if not auth_ok:
+        await update.message.reply_text(
+            f"⚠️ **Google Photos is not authenticated!**\n\n"
+            f"Status: `{auth_msg}`\n\n"
+            "👉 Please run `/gphotos_auth` to link your Google Photos account first.",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_to_message_id=update.message.message_id,
+        )
+        return
+
+    # 2. Check for replied message or attached video
+    target_msg = update.message.reply_to_message
+    if not target_msg:
+        if update.message.video or update.message.document:
+            target_msg = update.message
+        else:
+            await update.message.reply_text(
+                "ℹ️ **Google Photos Direct Video Upload (Dev)**\n\n"
+                "👉 **How to use:**\n"
+                "1. Find any video or video document sent by this bot.\n"
+                "2. **Reply** to that video with `/gphotos_upload` (or `/gupload`, `/gpush`).\n\n"
+                "⚡ The bot will fetch the video directly from Telegram via MTProto and upload it straight into your Google Photos library!",
+                parse_mode=constants.ParseMode.MARKDOWN,
+                reply_to_message_id=update.message.message_id,
+            )
+            return
+
+    media_obj = target_msg.video or target_msg.document or target_msg.animation
+    if not media_obj:
+        await update.message.reply_text(
+            "⚠️ The message you replied to does not contain a video or downloadable media file.",
+            reply_to_message_id=update.message.message_id,
+        )
+        return
+
+    file_name = getattr(media_obj, "file_name", None)
+    file_unique_id = getattr(media_obj, "file_unique_id", str(int(time.time())))
+    file_size = getattr(media_obj, "file_size", 0) or 0
+
+    if not file_name:
+        file_name = f"telegram_video_{file_unique_id}.mp4"
+
+    # Ensure mp4 extension for Google Photos indexing if no extension
+    if not Path(file_name).suffix:
+        file_name = f"{file_name}.mp4"
+
+    status_msg = await update.message.reply_text(
+        f"⏳ **Processing Video for Google Photos...**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎬 **File:** `{file_name}`\n"
+        f"📦 **Size:** `{format_bytes(file_size)}`\n"
+        f"📥 **Step 1/2:** Downloading from Telegram server...",
+        parse_mode=constants.ParseMode.MARKDOWN,
+        reply_to_message_id=update.message.message_id,
+    )
+
+    temp_dest = DOWNLOAD_DIR / f"gphotos_up_{file_unique_id}_{file_name}"
+    downloaded_file = None
+
+    try:
+        # Step 1: Download from Telegram via MTProto (up to 2GB) or standard Bot API
+        async def _dl_progress(cur: int, tot: int):
+            if tot > 0:
+                pct = int((cur / tot) * 100)
+                await edit_status_msg_safe(
+                    status_msg,
+                    f"⏳ **Downloading from Telegram: {pct}%**\n"
+                    f"🎬 `{file_name}`\n"
+                    f"`[{format_bytes(cur)} / {format_bytes(tot)}]`",
+                )
+
+        if is_mtproto_active() or file_size > 20 * 1024 * 1024:
+            dl_ok, dl_res = await download_media_mtproto(
+                chat_id=target_msg.chat_id,
+                message_id=target_msg.message_id,
+                dest_path=str(temp_dest),
+                progress_callback=_dl_progress,
+            )
+            if dl_ok and dl_res and os.path.exists(dl_res):
+                downloaded_file = dl_res
+            else:
+                raise RuntimeError(f"Telegram download failed: {dl_res}")
+        else:
+            tg_file = await context.bot.get_file(media_obj.file_id)
+            await tg_file.download_to_drive(custom_path=temp_dest)
+            downloaded_file = str(temp_dest)
+
+        if not downloaded_file or not os.path.exists(downloaded_file):
+            raise RuntimeError("Downloaded file not found on disk.")
+
+        actual_size = os.path.getsize(downloaded_file)
+
+        # Step 2: Upload to Google Photos
+        await edit_status_msg_safe(
+            status_msg,
+            f"☁️ **Step 2/2:** Uploading to Google Photos ({format_bytes(actual_size)})...",
+        )
+
+        async def _up_progress(p_txt: str):
+            await edit_status_msg_safe(
+                status_msg,
+                f"☁️ **Uploading to Google Photos:**\n"
+                f"🎬 `{file_name}`\n{p_txt}",
+            )
+
+        up_ok, up_res, up_err = await upload_video_to_google_photos(
+            file_path=downloaded_file,
+            custom_filename=file_name,
+            progress_updater=lambda txt: asyncio.create_task(_up_progress(txt)),
+        )
+
+        if not up_ok or not up_res:
+            err_msg = up_err or "Unknown upload error."
+            await edit_status_msg_safe(
+                status_msg,
+                f"❌ **Google Photos Upload Failed:**\n`{err_msg}`",
+            )
+            return
+
+        photo_id = up_res.get("id", "Unknown")
+        prod_url = up_res.get("product_url", "")
+
+        # Record in registry
+        try:
+            record_transferred_video(
+                fs_id=f"tg_{file_unique_id}",
+                filename=file_name,
+                size=actual_size,
+                google_id=photo_id,
+                product_url=prod_url,
+            )
+        except Exception as reg_err:
+            logger.debug(f"[Google Photos Upload] Registry error: {reg_err}")
+
+        link_line = f"\n🔗 [View in Google Photos]({prod_url})" if prod_url else ""
+        await edit_status_msg_safe(
+            status_msg,
+            f"✅ **Uploaded to Google Photos Successfully!**\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🎬 **File:** `{file_name}`\n"
+            f"📦 **Size:** `{format_bytes(actual_size)}`\n"
+            f"🆔 **ID:** `{photo_id[:16]}...`"
+            f"{link_line}",
+        )
+
+    except Exception as e:
+        logger.error(f"[Google Photos Upload] Failed for message {target_msg.message_id}: {e}", exc_info=True)
+        await edit_status_msg_safe(
+            status_msg,
+            f"❌ **Upload Failed:**\n`{str(e)}`",
+        )
+    finally:
+        # Immediate cleanup of residual files from disk and memory
+        if downloaded_file and os.path.exists(downloaded_file):
+            remove_file_safely(downloaded_file)
+        if temp_dest.exists():
+            remove_file_safely(str(temp_dest))
+        import gc
+        gc.collect()
+
+
 _OAUTH_HTTP_SERVER = None
 
 
@@ -3831,6 +4051,10 @@ def register_handlers(application):
     application.add_handler(CommandHandler("gauth", gphotos_auth_command))
     application.add_handler(CommandHandler("gphotos_code", gphotos_code_command))
     application.add_handler(CommandHandler("gphotos_status", gphotos_status_command))
+    application.add_handler(CommandHandler("gphotos_upload", gphotos_upload_command))
+    application.add_handler(CommandHandler("gupload", gphotos_upload_command))
+    application.add_handler(CommandHandler("gpush", gphotos_upload_command))
+    application.add_handler(CommandHandler("photoupload", gphotos_upload_command))
     application.add_handler(CommandHandler("teramark", teramark_command))
     application.add_handler(CommandHandler("photosmark", teramark_command))
     application.add_handler(CommandHandler("setteracookie", setteracookie_command))

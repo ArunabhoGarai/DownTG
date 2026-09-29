@@ -257,78 +257,233 @@ async def fetch_account_videos(max_pages: int = 50) -> Dict[str, Any]:
     return await asyncio.to_thread(fetch_account_videos_sync, max_pages)
 
 
+async def _notify(progress_updater: Optional[Callable[[str], Any]], text: str):
+    """Safely dispatches progress update whether updater is sync or async."""
+    if not progress_updater:
+        return
+    try:
+        if asyncio.iscoroutinefunction(progress_updater):
+            await progress_updater(text)
+        else:
+            res = progress_updater(text)
+            if asyncio.iscoroutine(res):
+                await res
+    except Exception as e:
+        logger.debug(f"[Progress Notice] {e}")
+
+
+def create_account_share_link_sync(
+    fs_id: int,
+    cookie_header: str,
+    domain: str = "www.terabox.app",
+) -> Tuple[bool, Optional[str], Optional[str]]:
+    """
+    Creates an active TeraBox share link for an account video using cookie authentication.
+    """
+    headers = _get_api_headers(cookie_header, domain=domain)
+    headers["Content-Type"] = "application/x-www-form-urlencoded"
+
+    domains_to_try = [domain, "www.1024tera.com", "terabox.app", "www.terabox.com"]
+    for d in domains_to_try:
+        url = f"https://{d}/api/share/create?app_id=250528&web=1&channel=dubox&clienttype=0"
+        data = {
+            "fid_list": f"[{fs_id}]",
+            "schannel": "4",
+            "period": "0",
+        }
+        try:
+            r = requests.post(url, data=data, headers=headers, timeout=12)
+            if r.status_code == 200:
+                res = r.json()
+                if res.get("errno") == 0:
+                    link = res.get("link")
+                    if not link and res.get("shorturl"):
+                        link = f"https://www.terabox.app/s/{res.get('shorturl')}"
+                    if link:
+                        return True, link, None
+                logger.debug(f"[Share Create] Domain {d} returned errno {res.get('errno')}: {res.get('errmsg')}")
+        except Exception as e:
+            logger.debug(f"[Share Create] Domain {d} error: {e}")
+
+    return False, None, "Could not generate share link from TeraBox account."
+
+
+async def stream_cookie_account_download(
+    remote_path: str,
+    fs_id: Any,
+    dest_path: str,
+    filesize_expected: int,
+    cookie_header: str,
+    progress_updater: Optional[Callable[[str], Any]] = None,
+) -> Tuple[bool, Optional[str], Optional[str]]:
+    """
+    Downloads file directly via TeraBox PCS / rest API with live progress, speed, and ETA.
+    """
+    headers = _get_api_headers(cookie_header)
+    encoded_path = requests.utils.quote(remote_path) if remote_path else ""
+
+    loop = asyncio.get_running_loop()
+
+    def _do_download():
+        for domain in ["dm.terabox.app", "www.terabox.app", "www.1024tera.com", "terabox.app"]:
+            urls_to_try = []
+            if encoded_path:
+                urls_to_try.append(f"https://{domain}/rest/2.0/pcs/file?method=download&path={encoded_path}&app_id=250528")
+            if fs_id:
+                urls_to_try.append(f"https://{domain}/api/download?fid_list=[{fs_id}]&type=dlink&app_id=250528&web=1&channel=dubox&clienttype=0")
+
+            session = requests.Session()
+            for stream_url in urls_to_try:
+                try:
+                    with session.get(stream_url, headers=headers, stream=True, timeout=25, allow_redirects=True) as r:
+                        if r.status_code not in (200, 206):
+                            continue
+                        total_bytes = int(r.headers.get("content-length", filesize_expected) or 0)
+                        downloaded = 0
+                        start_time = time.time()
+                        last_update = 0
+                        chunk_size = 1024 * 1024
+
+                        with open(dest_path, "wb") as f:
+                            for chunk in r.iter_content(chunk_size=chunk_size):
+                                if not chunk:
+                                    continue
+                                f.write(chunk)
+                                downloaded += len(chunk)
+
+                                now = time.time()
+                                if progress_updater and (now - last_update > 2.0 or (total_bytes and downloaded >= total_bytes)):
+                                    last_update = now
+                                    elapsed = max(now - start_time, 0.1)
+                                    speed = downloaded / elapsed
+                                    speed_str = f"{format_bytes(speed)}/s"
+                                    if total_bytes > 0:
+                                        pct = int((downloaded / total_bytes) * 100)
+                                        rem = max(total_bytes - downloaded, 0)
+                                        eta = f"{int(rem / max(speed, 1))}s"
+                                        msg = f"📥 **Downloading (Direct Stream): {pct}%** `[{format_bytes(downloaded)} / {format_bytes(total_bytes)}]` @ `{speed_str}` | ETA: `{eta}`"
+                                    else:
+                                        msg = f"📥 **Downloading (Direct Stream):** `{format_bytes(downloaded)}` @ `{speed_str}`"
+                                    try:
+                                        if asyncio.iscoroutinefunction(progress_updater):
+                                            asyncio.run_coroutine_threadsafe(progress_updater(msg), loop)
+                                        else:
+                                            res = progress_updater(msg)
+                                            if asyncio.iscoroutine(res):
+                                                asyncio.run_coroutine_threadsafe(res, loop)
+                                    except Exception:
+                                        pass
+
+                        if os.path.exists(dest_path) and os.path.getsize(dest_path) > 50 * 1024:
+                            return True, dest_path, None
+                except Exception as ex:
+                    logger.debug(f"[Direct Stream] {stream_url} error: {ex}")
+                    if os.path.exists(dest_path):
+                        remove_file_safely(dest_path)
+
+        return False, None, "Direct account PCS streaming returned no valid data."
+
+    return await asyncio.to_thread(_do_download)
+
+
 async def resolve_and_download_account_video(
     video_item: Dict[str, Any],
-    progress_updater: Optional[Callable[[str], None]] = None,
+    progress_updater: Optional[Callable[[str], Any]] = None,
 ) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]], Optional[str]]:
     """
-    Downloads an account video file using the bot's existing TeraBox resolver
-    or direct authenticated streaming.
-    Returns: (success, downloaded_filepath, file_info, error_msg)
+    Downloads an account video file using a robust 3-stage resolver pipeline:
+      Stage 1: Telegram Bot / MiniApp Resolver (via share link)
+      Stage 2: Direct Authenticated Account Stream (Cookie / PCS)
+      Stage 3: Backup Browser Engine (Puppeteer / Xvfb GUI Crawler)
+
+    Every stage displays real-time progress, download speed, and ETA.
     """
     filename = _clean_filename(video_item.get("filename") or "terabox_video.mp4")
     dest_path = str(DOWNLOAD_DIR / filename)
-    filesize_expected = video_item.get("size", 0)
+    filesize_expected = int(video_item.get("size") or 0)
     fs_id = video_item.get("fs_id")
     remote_path = video_item.get("path", "")
-
-    # Priority 1: Check if video_item has an existing share URL
-    share_url = video_item.get("share_url")
-    if share_url:
-        logger.info(f"[TeraBox Account] Downloading via existing share URL resolver: {share_url}")
-        success, downloaded_file, dl_info, error_msg = await download_terabox_media(
-            share_url,
-            quality="best",
-            progress_updater=progress_updater,
-        )
-        if success and downloaded_file and os.path.exists(downloaded_file):
-            return True, downloaded_file, dl_info or video_item, None
-
-    # Priority 2: Direct authenticated PCS download using account cookie
     cookie_header = get_account_cookie_header()
-    if cookie_header and (remote_path or fs_id):
-        logger.info(f"[TeraBox Account] Downloading via direct authenticated cookie stream: {filename}")
-        headers = _get_api_headers(cookie_header)
 
-        # Try PCS file download URL
-        for domain in TERABOX_API_DOMAINS:
-            encoded_path = requests.utils.quote(remote_path)
-            stream_url = (
-                f"https://{domain}/rest/2.0/pcs/file"
-                f"?method=download&path={encoded_path}&app_id=250528"
-            )
-            def _stream_cookie():
-                session = requests.Session()
-                with session.get(stream_url, headers=headers, stream=True, timeout=30) as r:
-                    if r.status_code not in (200, 206):
-                        return False, f"HTTP {r.status_code}"
-                    total_bytes = int(r.headers.get("content-length", filesize_expected) or 0)
-                    downloaded = 0
-                    chunk_size = 1024 * 1024
-                    with open(dest_path, "wb") as f:
-                        for chunk in r.iter_content(chunk_size=chunk_size):
-                            if chunk:
-                                f.write(chunk)
-                                downloaded += len(chunk)
-                    return True, None
+    # ---------------------------------------------------------
+    # STAGE 1: Telegram Bot / MiniApp Resolver (via share link)
+    # ---------------------------------------------------------
+    share_url = video_item.get("share_url")
+    if not share_url and fs_id and cookie_header:
+        await _notify(progress_updater, "🤖 **[Stage 1/3] Telegram Bot Resolver:** Generating active share link from account...")
+        s_ok, s_link, s_err = await asyncio.to_thread(
+            create_account_share_link_sync,
+            fs_id=fs_id,
+            cookie_header=cookie_header,
+        )
+        if s_ok and s_link:
+            share_url = s_link
+            logger.info(f"[TeraBox Account] Created share link for {filename}: {share_url}")
+        else:
+            logger.warning(f"[TeraBox Account] Share link generation failed for {filename}: {s_err}")
 
+    if share_url:
+        await _notify(progress_updater, f"🤖 **[Stage 1/3] Telegram Bot Resolver:** Querying MiniApp API (`{share_url[:42]}...`)...")
+        from terabox_downloader import _resolve_via_miniapp_api, _stream_miniapp_download
+        ma_success, ma_info, ma_err = await _resolve_via_miniapp_api(share_url)
+        if ma_success and ma_info and ma_info.get("download_url"):
+            actual_fsize = ma_info.get("filesize", filesize_expected)
+            await _notify(progress_updater, f"📥 **[Stage 1/3] Telegram Bot Resolver:** Stream captured! Downloading {format_bytes(actual_fsize)}...")
             try:
-                ok, err = await asyncio.to_thread(_stream_cookie)
-                if ok and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
-                    logger.info(f"[TeraBox Account] Downloaded {filename} successfully ({format_bytes(os.path.getsize(dest_path))})")
-                    return True, dest_path, video_item, None
-            except Exception as e:
-                logger.debug(f"[TeraBox Account] Direct stream via {domain} failed: {e}")
+                dl_ok = await _stream_miniapp_download(
+                    download_url=ma_info["download_url"],
+                    dest_path=dest_path,
+                    filesize_expected=actual_fsize,
+                    progress_updater=progress_updater,
+                    stage_label="Bot Resolver",
+                )
+                if dl_ok and os.path.exists(dest_path) and os.path.getsize(dest_path) > 50 * 1024:
+                    logger.info(f"[TeraBox Account] Stage 1 success: {filename} downloaded via Telegram Bot Resolver.")
+                    return True, dest_path, ma_info or video_item, None
+            except Exception as dl_ex:
+                logger.warning(f"[TeraBox Account] Stage 1 stream error: {dl_ex}")
+                remove_file_safely(dest_path)
+        else:
+            logger.warning(f"[TeraBox Account] Stage 1 failed ({ma_err}). Moving to Stage 2...")
+            await _notify(progress_updater, f"⚠️ **Telegram Bot Resolver:** `{ma_err or 'Resolution failed'}`\n🔄 *Switching to Stage 2 (Direct Account Stream)...*")
 
-    # Priority 3: Fallback using existing bot download_terabox_media if a link is available
-    fallback_link = f"https://www.terabox.app/s/file?fs_id={fs_id}" if fs_id else None
-    if fallback_link:
-        success, downloaded_file, dl_info, error_msg = await download_terabox_media(
-            fallback_link,
-            quality="best",
+    # ---------------------------------------------------------
+    # STAGE 2: Direct Authenticated Account Stream (Cookie / PCS)
+    # ---------------------------------------------------------
+    if cookie_header and (remote_path or fs_id):
+        await _notify(progress_updater, "🍪 **[Stage 2/3] Direct Account Stream:** Connecting to TeraBox PCS API...")
+        pcs_ok, pcs_file, pcs_err = await stream_cookie_account_download(
+            remote_path=remote_path,
+            fs_id=fs_id,
+            dest_path=dest_path,
+            filesize_expected=filesize_expected,
+            cookie_header=cookie_header,
             progress_updater=progress_updater,
         )
-        if success and downloaded_file and os.path.exists(downloaded_file):
-            return True, downloaded_file, dl_info or video_item, None
+        if pcs_ok and pcs_file and os.path.exists(pcs_file):
+            logger.info(f"[TeraBox Account] Stage 2 success: {filename} downloaded via Direct Account Stream.")
+            return True, pcs_file, video_item, None
+        else:
+            logger.warning(f"[TeraBox Account] Stage 2 failed ({pcs_err}). Moving to Stage 3...")
+            await _notify(progress_updater, f"⚠️ **Direct Account Stream:** `{pcs_err or 'Failed'}`\n🔄 *Switching to Stage 3 (Backup Browser Crawler)...*")
 
-    return False, None, None, f"Failed to download video file '{filename}' from TeraBox account."
+    # ---------------------------------------------------------
+    # STAGE 3: Backup Browser Engine (Puppeteer / Xvfb GUI Crawler)
+    # ---------------------------------------------------------
+    if share_url:
+        await _notify(progress_updater, "🌐 **[Stage 3/3] Backup Browser Resolver:** Launching Headless Chromium in Xvfb...")
+        from terabox_downloader import _download_via_node_crawler
+        crawler_ok, crawler_file, crawler_info, crawler_err = await _download_via_node_crawler(
+            url=share_url,
+            output_dir=DOWNLOAD_DIR,
+            download_id=f"acc_{fs_id}",
+            progress_updater=progress_updater,
+        )
+        if crawler_ok and crawler_file and os.path.exists(crawler_file):
+            logger.info(f"[TeraBox Account] Stage 3 success: {filename} downloaded via Browser Crawler.")
+            return True, crawler_file, crawler_info or video_item, None
+        else:
+            logger.error(f"[TeraBox Account] Stage 3 crawler failed: {crawler_err}")
+            await _notify(progress_updater, f"❌ **Backup Browser Resolver:** `{crawler_err or 'Failed'}`")
+
+    return False, None, None, f"All 3 resolvers failed for '{filename}'."

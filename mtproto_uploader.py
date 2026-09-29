@@ -100,11 +100,14 @@ async def upload_media_mtproto(
     caption: str,
     duration_sec: Optional[int] = None,
     thumbnail_path: Optional[str] = None,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
     is_audio: bool = False,
     progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> Tuple[bool, Optional[str]]:
     """
     Uploads media files up to 2,000 MB (2 GB) directly to Telegram via MTProto.
+    Configured for progressive in-app streaming playback.
     Returns (success, error_message).
     """
     if not IS_MTPROTO_ENABLED:
@@ -182,6 +185,8 @@ async def upload_media_mtproto(
                     video=file_path,
                     caption=safe_caption,
                     duration=int(duration_sec) if duration_sec else None,
+                    width=int(width) if width else None,
+                    height=int(height) if height else None,
                     thumb=valid_thumb,
                     supports_streaming=True,
                     parse_mode=pyro_parse_mode,
@@ -206,4 +211,60 @@ async def upload_media_mtproto(
 
     except Exception as e:
         logger.error(f"MTProto upload failed for {file_path}: {e}", exc_info=True)
+        return False, str(e)
+
+
+async def download_media_mtproto(
+    chat_id: int,
+    message_id: int,
+    dest_path: str,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+) -> Tuple[bool, Optional[str]]:
+    """
+    Downloads media (up to 2,000 MB / 2 GB) from a Telegram message directly via MTProto.
+    Returns (success, downloaded_path_or_error).
+    """
+    if not IS_MTPROTO_ENABLED:
+        return False, "MTProto API credentials (TELEGRAM_API_ID & TELEGRAM_API_HASH) are missing in .env."
+
+    if not is_mtproto_active():
+        started = await start_mtproto()
+        if not started:
+            return False, "Failed to start MTProto client session."
+
+    try:
+        last_update_time = 0
+        last_percent = -1
+
+        async def _pyro_dl_progress(current: int, total: int, *args):
+            nonlocal last_update_time, last_percent
+            now = time.time()
+            current_pct = int((current / total) * 100) if total > 0 else 0
+            if progress_callback and (
+                (now - last_update_time >= 3.0 and current_pct >= last_percent + 3)
+                or current >= total
+            ):
+                last_update_time = now
+                last_percent = current_pct
+                try:
+                    res = progress_callback(current, total)
+                    if asyncio.iscoroutine(res):
+                        await res
+                except Exception:
+                    pass
+
+        msg = await _CLIENT.get_messages(chat_id, message_id)
+        if not msg or not (msg.video or msg.document or msg.audio or msg.animation):
+            return False, "No downloadable media found in specified message."
+
+        res_path = await _CLIENT.download_media(
+            message=msg,
+            file_name=dest_path,
+            progress=_pyro_dl_progress,
+        )
+        if res_path and os.path.exists(res_path):
+            return True, str(res_path)
+        return False, "Download completed but file was not found on server disk."
+    except Exception as e:
+        logger.error(f"MTProto download error for msg {message_id} in {chat_id}: {e}", exc_info=True)
         return False, str(e)

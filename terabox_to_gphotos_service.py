@@ -132,16 +132,16 @@ async def execute_transfer_job(
                 nonlocal downloaded_file, total_transferred_bytes
                 await _safe_update(
                     f"{prefix}"
-                    "⏳ **Step 1/2:** Resolving & downloading from TeraBox using bot resolver..."
+                    "⏳ **Step 1/2:** Initializing TeraBox multi-stage resolver pipeline..."
                 )
 
                 # Step 1: Download video via TeraBox resolver
                 async def _dl_progress(p_txt: str):
-                    await _safe_update(f"{prefix}📥 {p_txt}")
+                    await _safe_update(f"{prefix}{p_txt}")
 
                 dl_ok, dl_file, dl_info, dl_err = await resolve_and_download_account_video(
                     item,
-                    progress_updater=lambda txt: asyncio.create_task(_dl_progress(txt)),
+                    progress_updater=_dl_progress,
                 )
                 downloaded_file = dl_file
 

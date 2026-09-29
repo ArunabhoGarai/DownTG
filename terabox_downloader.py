@@ -215,8 +215,9 @@ async def _stream_miniapp_download(
     dest_path: str,
     filesize_expected: int,
     progress_updater: Optional[Callable[[str], None]] = None,
+    stage_label: str = "Telegram Bot Resolver",
 ) -> bool:
-    """Streams file directly to disk in 1MB chunks with progress updates."""
+    """Streams file directly to disk in 1MB chunks with real-time speed, ETA, and progress updates."""
     def _do_stream():
         session = requests.Session()
         session.headers.update({
@@ -232,6 +233,7 @@ async def _stream_miniapp_download(
             total_bytes = int(r.headers.get("content-length", filesize_expected) or 0)
 
             downloaded_bytes = 0
+            start_time = time.time()
             last_update = 0
             chunk_size = 1024 * 1024
 
@@ -243,15 +245,26 @@ async def _stream_miniapp_download(
                     downloaded_bytes += len(chunk)
 
                     now = time.time()
-                    if progress_updater and (now - last_update > 1.8):
+                    if progress_updater and (now - last_update > 2.0 or (total_bytes and downloaded_bytes >= total_bytes)):
                         last_update = now
+                        elapsed = max(now - start_time, 0.1)
+                        speed = downloaded_bytes / elapsed
+                        speed_str = f"{format_bytes(speed)}/s"
                         if total_bytes > 0:
                             pct = int((downloaded_bytes / total_bytes) * 100)
-                            msg = f"📥 **Downloading: {pct}%** ({format_bytes(downloaded_bytes)} / {format_bytes(total_bytes)})"
+                            rem_bytes = max(total_bytes - downloaded_bytes, 0)
+                            eta_sec = int(rem_bytes / max(speed, 1))
+                            eta_str = f"{eta_sec}s"
+                            msg = f"📥 **Downloading ({stage_label}): {pct}%** `[{format_bytes(downloaded_bytes)} / {format_bytes(total_bytes)}]` @ `{speed_str}` | ETA: `{eta_str}`"
                         else:
-                            msg = f"📥 **Downloading: {format_bytes(downloaded_bytes)}...**"
+                            msg = f"📥 **Downloading ({stage_label}):** `{format_bytes(downloaded_bytes)}` @ `{speed_str}`"
                         try:
-                            asyncio.run_coroutine_threadsafe(progress_updater(msg), loop)
+                            if asyncio.iscoroutinefunction(progress_updater):
+                                asyncio.run_coroutine_threadsafe(progress_updater(msg), loop)
+                            else:
+                                res = progress_updater(msg)
+                                if asyncio.iscoroutine(res):
+                                    asyncio.run_coroutine_threadsafe(res, loop)
                         except Exception:
                             pass
             return True
@@ -1197,7 +1210,9 @@ async def download_terabox_media(
     if get_terabox_token():
         if progress_updater:
             try:
-                await progress_updater("⏳ **Resolving TeraBox link...**")
+                res = progress_updater("🤖 **[1/2] Resolving via Telegram Bot Resolver (teradownloader.pro)...**")
+                if asyncio.iscoroutine(res):
+                    await res
             except Exception:
                 pass
 
@@ -1206,10 +1221,13 @@ async def download_terabox_media(
             filename = ma_info.get("filename") or f"terabox_{download_id}.mp4"
             dest_file = DOWNLOAD_DIR / f"tera_{download_id}_{filename}"
             dest_path = str(dest_file)
+            f_size = ma_info.get("filesize", 0)
 
             if progress_updater:
                 try:
-                    await progress_updater("📥 **Starting download...**")
+                    res = progress_updater(f"📥 **[1/2] Stream captured! Connecting to CDN ({format_bytes(f_size)})...**")
+                    if asyncio.iscoroutine(res):
+                        await res
                 except Exception:
                     pass
 
@@ -1217,8 +1235,9 @@ async def download_terabox_media(
                 dl_ok = await _stream_miniapp_download(
                     download_url=ma_info["download_url"],
                     dest_path=dest_path,
-                    filesize_expected=ma_info.get("filesize", 0),
+                    filesize_expected=f_size,
                     progress_updater=progress_updater,
+                    stage_label="Bot Resolver",
                 )
                 if dl_ok and os.path.exists(dest_path):
                     actual_size = os.path.getsize(dest_path)
@@ -1232,11 +1251,20 @@ async def download_terabox_media(
                 remove_file_safely(dest_path)
         else:
             logger.warning(f"[TeraBox] MiniApp API failed ({ma_err}). Falling back to browser crawler...")
+            if progress_updater:
+                try:
+                    res = progress_updater(f"⚠️ **Telegram Bot Resolver:** `{ma_err or 'Resolution failed'}`\n🔄 *Switching to Backup Browser Crawler...*")
+                    if asyncio.iscoroutine(res):
+                        await res
+                except Exception:
+                    pass
 
     # 🔄 FALLBACK: Original Node.js Puppeteer Stealth Crawler in Xvfb GUI
     if progress_updater:
         try:
-            await progress_updater("⏳ **Processing TeraBox link via browser engine...**")
+            res = progress_updater("🌐 **[2/2] Backup Resolver: Spawning Headless Browser Engine (Puppeteer/Xvfb)...**")
+            if asyncio.iscoroutine(res):
+                await res
         except Exception:
             pass
 
