@@ -132,7 +132,7 @@ async def execute_transfer_job(
                 nonlocal downloaded_file, total_transferred_bytes
                 await _safe_update(
                     f"{prefix}"
-                    "⏳ **Step 1/2:** Initializing TeraBox multi-stage resolver pipeline..."
+                    "⏳ **Step 1/2:** Resolving and downloading via Main Method..."
                 )
 
                 # Step 1: Download video via TeraBox resolver

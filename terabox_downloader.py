@@ -215,7 +215,8 @@ async def _stream_miniapp_download(
     dest_path: str,
     filesize_expected: int,
     progress_updater: Optional[Callable[[str], None]] = None,
-    stage_label: str = "Telegram Bot Resolver",
+    stage_label: str = "Main Method",
+    cancel_checker: Optional[Callable[[], bool]] = None,
 ) -> bool:
     """Streams file directly to disk in 1MB chunks with real-time speed, ETA, and progress updates."""
     def _do_stream():
@@ -239,6 +240,9 @@ async def _stream_miniapp_download(
 
             with open(dest_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=chunk_size):
+                    if cancel_checker and cancel_checker():
+                        logger.info("[TeraBox] Download stopped by cancel_checker.")
+                        return False
                     if not chunk:
                         continue
                     f.write(chunk)
@@ -1198,25 +1202,54 @@ async def download_terabox_media(
     progress_hook: Optional[Callable[[Dict[str, Any]], None]] = None,
     notify_admin_callback: Optional[Callable[[str, str], None]] = None,
     progress_updater: Optional[Callable[[str], None]] = None,
+    allow_crawler: bool = False,
 ) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]], Optional[str]]:
     """
     Downloads TeraBox media directly to disk.
-    Priority: Node.js Puppeteer Stealth Crawler in Xvfb GUI.
+    Priority 1: High-speed Telegram MiniApp Direct API (teradownloader.pro).
+    Fallback (Optional): Node.js Puppeteer Stealth Crawler in Xvfb GUI (requires allow_crawler=True).
     Returns (success, file_path, info_dict, error_message).
     """
     download_id = uuid.uuid4().hex[:8]
 
-    # 🚀 PRIORITY 1: High-Speed Telegram MiniApp API (teradownloader.pro)
+    # 🚀 METHOD 1: High-Speed MiniApp API (Main Method)
     if get_terabox_token():
         if progress_updater:
             try:
-                res = progress_updater("🤖 **[1/2] Resolving via Telegram Bot Resolver (teradownloader.pro)...**")
+                res = progress_updater("🤖 **[Main Method] Resolving video stream...**")
                 if asyncio.iscoroutine(res):
                     await res
             except Exception:
                 pass
 
-        ma_success, ma_info, ma_err = await _resolve_via_miniapp_api(url)
+        # Prepare candidate URLs with alternative TeraBox domains for the same surl
+        candidate_urls = [url]
+        surl = extract_surl(url)
+        if surl:
+            clean_surl = surl if surl.startswith("1") else f"1{surl}"
+            alt_domains = [
+                "1024terabox.com",
+                "www.terabox.app",
+                "terabox.app",
+                "teraboxlink.com",
+                "1024tera.com",
+                "www.terabox.com",
+                "freeterabox.com",
+            ]
+            for ad in alt_domains:
+                cand_u = f"https://{ad}/s/{clean_surl}"
+                if cand_u not in candidate_urls:
+                    candidate_urls.append(cand_u)
+
+        ma_success = False
+        ma_info = None
+        ma_err = None
+
+        for cand_u in candidate_urls:
+            ma_success, ma_info, ma_err = await _resolve_via_miniapp_api(cand_u)
+            if ma_success and ma_info and ma_info.get("download_url"):
+                break
+
         if ma_success and ma_info and ma_info.get("download_url"):
             filename = ma_info.get("filename") or f"terabox_{download_id}.mp4"
             dest_file = DOWNLOAD_DIR / f"tera_{download_id}_{filename}"
@@ -1225,7 +1258,7 @@ async def download_terabox_media(
 
             if progress_updater:
                 try:
-                    res = progress_updater(f"📥 **[1/2] Stream captured! Connecting to CDN ({format_bytes(f_size)})...**")
+                    res = progress_updater(f"📥 **[Main Method] Stream captured! Connecting to CDN ({format_bytes(f_size)})...**")
                     if asyncio.iscoroutine(res):
                         await res
                 except Exception:
@@ -1237,32 +1270,38 @@ async def download_terabox_media(
                     dest_path=dest_path,
                     filesize_expected=f_size,
                     progress_updater=progress_updater,
-                    stage_label="Bot Resolver",
+                    stage_label="Main Method",
                 )
                 if dl_ok and os.path.exists(dest_path):
                     actual_size = os.path.getsize(dest_path)
                     ma_info["filesize"] = actual_size
                     ma_info["filepath"] = dest_path
                     ma_info["id"] = download_id
-                    logger.info(f"[TeraBox] 🎉 Download completed via MiniApp API: {dest_path} ({format_bytes(actual_size)})")
+                    logger.info(f"[TeraBox] 🎉 Download completed via Main Method: {dest_path} ({format_bytes(actual_size)})")
                     return True, dest_path, ma_info, None
             except Exception as stream_ex:
-                logger.warning(f"[TeraBox] MiniApp streaming failed: {stream_ex}. Falling back to browser crawler...")
+                logger.warning(f"[TeraBox] Main Method streaming failed: {stream_ex}.")
                 remove_file_safely(dest_path)
+                ma_err = str(stream_ex)
         else:
-            logger.warning(f"[TeraBox] MiniApp API failed ({ma_err}). Falling back to browser crawler...")
-            if progress_updater:
-                try:
-                    res = progress_updater(f"⚠️ **Telegram Bot Resolver:** `{ma_err or 'Resolution failed'}`\n🔄 *Switching to Backup Browser Crawler...*")
-                    if asyncio.iscoroutine(res):
-                        await res
-                except Exception:
-                    pass
+            logger.warning(f"[TeraBox] Main Method resolution failed across domains: {ma_err}")
 
-    # 🔄 FALLBACK: Original Node.js Puppeteer Stealth Crawler in Xvfb GUI
+    # If crawler is not explicitly authorized by user, return with fallback option for interactive prompt
+    if not allow_crawler:
+        logger.info("[TeraBox] Main Method failed and allow_crawler is False. Asking user for backup confirmation.")
+        fallback_info = {
+            "can_fallback_vnc": True,
+            "error": ma_err or "Main Method failed to extract video stream.",
+            "url": url,
+            "quality": quality,
+        }
+        return False, None, fallback_info, ma_err or "Main Method failed."
+
+    # 🔄 METHOD 2: Backup Browser Engine (User Authorized)
+    logger.info("[TeraBox] User authorized backup browser crawler. Launching Puppeteer/Xvfb...")
     if progress_updater:
         try:
-            res = progress_updater("🌐 **[2/2] Backup Resolver: Spawning Headless Browser Engine (Puppeteer/Xvfb)...**")
+            res = progress_updater("🌐 **[Backup Method] Launching virtual browser session...**")
             if asyncio.iscoroutine(res):
                 await res
         except Exception:
@@ -1275,7 +1314,7 @@ async def download_terabox_media(
         progress_updater=progress_updater,
     )
     if crawler_success and crawler_file:
-        logger.info("TeraBox media downloaded successfully via Node.js Puppeteer Stealth Crawler!")
+        logger.info("TeraBox media downloaded successfully via Backup Method (Node.js Crawler)!")
         return True, crawler_file, crawler_info, None
 
     logger.error(f"TeraBox Crawler failed: {crawler_err}")

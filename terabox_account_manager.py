@@ -18,6 +18,7 @@ from typing import Dict, Any, List, Optional, Tuple, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
+import secrets
 
 from config import BASE_DIR, DOWNLOAD_DIR
 from downloader import format_bytes, remove_file_safely
@@ -275,40 +276,152 @@ async def _notify(progress_updater: Optional[Callable[[str], Any]], text: str):
         logger.debug(f"[Progress Notice] {e}")
 
 
-def create_account_share_link_sync(
-    fs_id: int,
-    cookie_header: str,
-    domain: str = "www.terabox.app",
-) -> Tuple[bool, Optional[str], Optional[str]]:
-    """
-    Creates an active TeraBox share link for an account video using cookie authentication.
-    """
-    headers = _get_api_headers(cookie_header, domain=domain)
-    headers["Content-Type"] = "application/x-www-form-urlencoded"
+_cached_js_token: Optional[str] = None
+_token_timestamp: float = 0.0
 
-    domains_to_try = [domain, "www.1024tera.com", "terabox.app", "www.terabox.com"]
-    for d in domains_to_try:
-        url = f"https://{d}/api/share/create?app_id=250528&web=1&channel=dubox&clienttype=0"
-        data = {
-            "fid_list": f"[{fs_id}]",
-            "schannel": "4",
-            "period": "0",
+
+def _get_js_token(cookie_header: str, force_refresh: bool = False) -> Optional[str]:
+    """
+    Fetches or returns cached jsToken needed for TeraBox share link generation.
+    Scrapes the token from the TeraBox web main HTML.
+    """
+    global _cached_js_token, _token_timestamp
+    now = time.time()
+    if not force_refresh and _cached_js_token and (now - _token_timestamp < 3600):
+        return _cached_js_token
+
+    domains = ["dm.terabox.app", "www.terabox.app", "terabox.app"]
+    for dom in domains:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+            ),
+            "Cookie": cookie_header,
+            "Referer": f"https://{dom}/main?category=all",
+            "Origin": f"https://{dom}",
         }
         try:
-            r = requests.post(url, data=data, headers=headers, timeout=12)
+            r = requests.get(f"https://{dom}/main", headers=headers, timeout=12)
             if r.status_code == 200:
-                res = r.json()
-                if res.get("errno") == 0:
-                    link = res.get("link")
-                    if not link and res.get("shorturl"):
-                        link = f"https://www.terabox.app/s/{res.get('shorturl')}"
-                    if link:
-                        return True, link, None
-                logger.debug(f"[Share Create] Domain {d} returned errno {res.get('errno')}: {res.get('errmsg')}")
+                m = re.search(r'"jsToken":\s*"([^"]+)"', r.text)
+                if m:
+                    _cached_js_token = m.group(1)
+                    _token_timestamp = now
+                    logger.info(f"[TeraBox Share] Successfully extracted jsToken from {dom}.")
+                    return _cached_js_token
         except Exception as e:
-            logger.debug(f"[Share Create] Domain {d} error: {e}")
+            logger.debug(f"[TeraBox Share] Failed to fetch jsToken from {dom}: {e}")
+
+    return _cached_js_token
+
+
+def create_account_share_link_sync(
+    fs_id: Any,
+    cookie_header: str,
+    path: Optional[str] = None,
+    filename: Optional[str] = None,
+    domain: Optional[str] = None,
+) -> Tuple[bool, Optional[str], Optional[str]]:
+    """
+    Creates an active TeraBox share link for an account video using cookie authentication
+    via the /share/pset API with jsToken and dp-logid.
+    """
+    js_token = _get_js_token(cookie_header)
+    if not js_token:
+        js_token = _get_js_token(cookie_header, force_refresh=True)
+
+    # Prepare path list parameter
+    target_path = path or (f"/{filename}" if filename else f"/video_{fs_id}.mp4")
+    path_list_json = json.dumps([target_path])
+
+    domains_to_try = []
+    if domain:
+        domains_to_try.append(domain)
+    for d in ["dm.terabox.app", "www.terabox.app", "www.1024terabox.com", "terabox.app"]:
+        if d not in domains_to_try:
+            domains_to_try.append(d)
+
+    for attempt in range(2):
+        dp_logid = secrets.token_hex(16).upper()
+
+        for d in domains_to_try:
+            url = (
+                f"https://{d}/share/pset"
+                f"?app_id=250528&web=1&channel=dubox&clienttype=0"
+                f"&jsToken={js_token or ''}&dp-logid={dp_logid}"
+            )
+            post_data = {
+                "app_id": "250528",
+                "web": "1",
+                "channel": "dubox",
+                "clienttype": "0",
+                "app": "universe",
+                "schannel": "0",
+                "channel_list": "[0]",
+                "period": "0",
+                "path_list": path_list_json,
+                "fid_list": f"[{fs_id}]",
+                "pwd": "",
+                "public": "1",
+                "scene": "",
+            }
+            req_headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+                ),
+                "Cookie": cookie_header,
+                "Referer": f"https://{d}/",
+                "Origin": f"https://{d}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            }
+
+            try:
+                r = requests.post(url, data=post_data, headers=req_headers, timeout=12)
+                if r.status_code == 200:
+                    try:
+                        res = r.json()
+                    except Exception:
+                        continue
+
+                    errno = res.get("errno")
+                    if errno == 0:
+                        link = res.get("link") or res.get("shorturl")
+                        if link:
+                            if not link.startswith("http"):
+                                link = f"https://1024terabox.com/s/{link}"
+                            logger.info(f"[TeraBox Share] Successfully created share link: {link} (fs_id: {fs_id})")
+                            return True, link, None
+                    elif errno in (-6, 105):
+                        logger.warning(f"[TeraBox Share] Domain {d} returned auth error errno {errno}")
+                        if attempt == 0:
+                            js_token = _get_js_token(cookie_header, force_refresh=True)
+                            break
+                    else:
+                        logger.debug(f"[TeraBox Share] Domain {d} returned errno {errno}: {res.get('show_msg')}")
+            except Exception as e:
+                logger.debug(f"[TeraBox Share] Domain {d} error: {e}")
 
     return False, None, "Could not generate share link from TeraBox account."
+
+
+async def create_account_share_link(
+    fs_id: Any,
+    cookie_header: str,
+    path: Optional[str] = None,
+    filename: Optional[str] = None,
+    domain: Optional[str] = None,
+) -> Tuple[bool, Optional[str], Optional[str]]:
+    """Async wrapper for create_account_share_link_sync."""
+    return await asyncio.to_thread(
+        create_account_share_link_sync,
+        fs_id,
+        cookie_header,
+        path,
+        filename,
+        domain,
+    )
 
 
 async def stream_cookie_account_download(
@@ -516,77 +629,114 @@ async def resolve_and_download_account_video(
     cancel_checker: Optional[Callable[[], bool]] = None,
 ) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]], Optional[str]]:
     """
-    Downloads an account video file using a robust 3-stage resolver pipeline:
-      Stage 1: Telegram Bot / MiniApp Resolver (via share link)
-      Stage 2: Direct Authenticated Account Stream (Cookie / PCS with 8x Multi-Stream)
-      Stage 3: Backup Browser Engine (Puppeteer / Xvfb GUI Crawler)
-
-    Every stage displays real-time progress, download speed, and ETA.
+    Downloads an account video using 2 clean methods:
+      1. Main Method: High-Speed MiniApp API via private account share link
+         (automatically tries multiple TeraBox domain variations like 1024terabox.com).
+      2. Backup Method: Virtual Browser Engine (Node.js Puppeteer Stealth Crawler in Xvfb).
     """
     filename = _clean_filename(video_item.get("filename") or "terabox_video.mp4")
     dest_path = str(DOWNLOAD_DIR / filename)
     filesize_expected = int(video_item.get("size") or 0)
     fs_id = video_item.get("fs_id")
-    remote_path = video_item.get("path", "")
     cookie_header = get_account_cookie_header()
 
-    # ---------------------------------------------------------
-    # STAGE 1: High-Speed Direct Multi-Stream (Cookie / PCS 8x Range)
-    # ---------------------------------------------------------
-    # For account videos with known path/fs_id, this is the fastest & most direct path (10-25 MB/s)
-    if cookie_header and (remote_path or fs_id):
-        await _notify(progress_updater, "⚡ **[Stage 1/2] High-Speed Storage Stream:** Connecting to TeraBox CDN...")
-        pcs_ok, pcs_file, pcs_err = await stream_cookie_account_download(
-            remote_path=remote_path,
-            fs_id=fs_id,
-            dest_path=dest_path,
-            filesize_expected=filesize_expected,
-            cookie_header=cookie_header,
-            progress_updater=progress_updater,
-            cancel_checker=cancel_checker,
-        )
-        if pcs_ok and pcs_file and os.path.exists(pcs_file):
-            logger.info(f"[TeraBox Account] Stage 1 success: {filename} downloaded via High-Speed Multi-Stream.")
-            return True, pcs_file, video_item, None
-        else:
-            logger.warning(f"[TeraBox Account] Stage 1 failed ({pcs_err}). Moving to fallback...")
-            await _notify(progress_updater, f"⚠️ **High-Speed Stream:** `{pcs_err or 'Failed'}`\n🔄 *Switching to fallback resolver...*")
+    # Step 1: Ensure an active share link exists for this private account video
+    share_url = video_item.get("share_url")
+    if not share_url and cookie_header and fs_id:
+        await _notify(progress_updater, "🔗 **[Main Method] Generating private share link...**")
+        try:
+            link_ok, created_link, link_err = await create_account_share_link(
+                fs_id=int(fs_id),
+                cookie_header=cookie_header,
+                path=video_item.get("path"),
+                filename=filename,
+            )
+            if link_ok and created_link:
+                video_item["share_url"] = created_link
+                share_url = created_link
+                logger.info(f"[TeraBox Account] Created share link for fs_id {fs_id}: {share_url}")
+            else:
+                logger.warning(f"[TeraBox Account] Share link creation failed for fs_id {fs_id}: {link_err}")
+        except Exception as ce_err:
+            logger.error(f"[TeraBox Account] Error creating share link for {fs_id}: {ce_err}")
+
+    # Build candidate URLs with alternative TeraBox domains for the same surl
+    from terabox_downloader import (
+        extract_surl,
+        _resolve_via_miniapp_api,
+        _stream_miniapp_download,
+        _download_via_node_crawler,
+    )
+
+    candidate_urls = []
+    if share_url:
+        candidate_urls.append(share_url)
+        surl = extract_surl(share_url)
+        if surl:
+            clean_surl = surl if surl.startswith("1") else f"1{surl}"
+            alt_domains = [
+                "1024terabox.com",
+                "www.terabox.app",
+                "terabox.app",
+                "teraboxlink.com",
+                "1024tera.com",
+                "www.terabox.com",
+                "freeterabox.com",
+            ]
+            for ad in alt_domains:
+                cand_u = f"https://{ad}/s/{clean_surl}"
+                if cand_u not in candidate_urls:
+                    candidate_urls.append(cand_u)
 
     # ---------------------------------------------------------
-    # STAGE 2: Telegram Bot / MiniApp Resolver (via share link)
+    # METHOD 1: Main Method (High-Speed MiniApp API)
     # ---------------------------------------------------------
-    share_url = video_item.get("share_url")
-    if share_url:
-        await _notify(progress_updater, f"🤖 **[Stage 2/2] Telegram Bot Resolver:** Querying MiniApp API (`{share_url[:42]}...`)...")
-        from terabox_downloader import _resolve_via_miniapp_api, _stream_miniapp_download
-        ma_success, ma_info, ma_err = await _resolve_via_miniapp_api(share_url)
+    if candidate_urls:
+        await _notify(progress_updater, "🤖 **[Main Method] Resolving video stream...**")
+        ma_success = False
+        ma_info = None
+        ma_err = None
+
+        for cand_u in candidate_urls:
+            if cancel_checker and cancel_checker():
+                return False, None, None, "Cancelled by user"
+            ma_success, ma_info, ma_err = await _resolve_via_miniapp_api(cand_u)
+            if ma_success and ma_info and ma_info.get("download_url"):
+                logger.info(f"[TeraBox Account] Main Method resolved using candidate: {cand_u}")
+                break
+
         if ma_success and ma_info and ma_info.get("download_url"):
             actual_fsize = ma_info.get("filesize", filesize_expected)
-            await _notify(progress_updater, f"📥 **[Stage 2/2] Telegram Bot Resolver:** Stream captured! Downloading {format_bytes(actual_fsize)}...")
+            await _notify(progress_updater, f"📥 **[Main Method] Stream captured! Connecting to CDN ({format_bytes(actual_fsize)})...**")
             try:
                 dl_ok = await _stream_miniapp_download(
                     download_url=ma_info["download_url"],
                     dest_path=dest_path,
                     filesize_expected=actual_fsize,
                     progress_updater=progress_updater,
-                    stage_label="Bot Resolver",
+                    stage_label="Main Method",
+                    cancel_checker=cancel_checker,
                 )
                 if dl_ok and os.path.exists(dest_path) and os.path.getsize(dest_path) > 50 * 1024:
-                    logger.info(f"[TeraBox Account] Stage 2 success: {filename} downloaded via Telegram Bot Resolver.")
+                    actual_size = os.path.getsize(dest_path)
+                    ma_info["filesize"] = actual_size
+                    ma_info["filepath"] = dest_path
+                    logger.info(f"[TeraBox Account] Main Method success: {filename} ({format_bytes(actual_size)})")
                     return True, dest_path, ma_info or video_item, None
             except Exception as dl_ex:
-                logger.warning(f"[TeraBox Account] Stage 2 stream error: {dl_ex}")
+                logger.warning(f"[TeraBox Account] Main Method stream error: {dl_ex}")
                 remove_file_safely(dest_path)
         else:
-            logger.warning(f"[TeraBox Account] Stage 2 failed ({ma_err}).")
-            await _notify(progress_updater, f"⚠️ **Telegram Bot Resolver:** `{ma_err or 'Resolution failed'}`")
+            logger.warning(f"[TeraBox Account] Main Method resolution failed across candidate domains: {ma_err}")
+            await _notify(progress_updater, f"⚠️ **Main Method Failed:** `{ma_err or 'Resolution failed'}`\n🔄 *Switching to Backup Method...*")
 
     # ---------------------------------------------------------
-    # STAGE 3: Backup Browser Engine (Puppeteer / Xvfb GUI Crawler)
+    # METHOD 2: Backup Method (Virtual Browser Engine / Puppeteer in Xvfb)
     # ---------------------------------------------------------
     if share_url:
-        await _notify(progress_updater, "🌐 **[Stage 3/3] Backup Browser Resolver:** Launching Headless Chromium in Xvfb...")
-        from terabox_downloader import _download_via_node_crawler
+        if cancel_checker and cancel_checker():
+            return False, None, None, "Cancelled by user"
+        await _notify(progress_updater, "🌐 **[Backup Method] Launching virtual browser session...**")
         crawler_ok, crawler_file, crawler_info, crawler_err = await _download_via_node_crawler(
             url=share_url,
             output_dir=DOWNLOAD_DIR,
@@ -594,10 +744,10 @@ async def resolve_and_download_account_video(
             progress_updater=progress_updater,
         )
         if crawler_ok and crawler_file and os.path.exists(crawler_file):
-            logger.info(f"[TeraBox Account] Stage 3 success: {filename} downloaded via Browser Crawler.")
+            logger.info(f"[TeraBox Account] Backup Method success: {filename} downloaded via browser crawler.")
             return True, crawler_file, crawler_info or video_item, None
         else:
-            logger.error(f"[TeraBox Account] Stage 3 crawler failed: {crawler_err}")
-            await _notify(progress_updater, f"❌ **Backup Browser Resolver:** `{crawler_err or 'Failed'}`")
+            logger.error(f"[TeraBox Account] Backup Method crawler failed: {crawler_err}")
+            await _notify(progress_updater, f"❌ **Backup Method Failed:** `{crawler_err or 'Failed'}`")
 
-    return False, None, None, f"All resolvers failed for '{filename}'."
+    return False, None, None, f"Both Main Method and Backup Method failed for '{filename}'."

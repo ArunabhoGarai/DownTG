@@ -218,10 +218,13 @@ async def download_media_mtproto(
     chat_id: int,
     message_id: int,
     dest_path: str,
+    file_id: Optional[str] = None,
     progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> Tuple[bool, Optional[str]]:
     """
     Downloads media (up to 2,000 MB / 2 GB) from a Telegram message directly via MTProto.
+    Supports downloading directly by `file_id` (bypassing peer lookup/PEER_ID_INVALID)
+    or by querying chat_id + message_id.
     Returns (success, downloaded_path_or_error).
     """
     if not IS_MTPROTO_ENABLED:
@@ -232,6 +235,8 @@ async def download_media_mtproto(
         if not started:
             return False, "Failed to start MTProto client session."
 
+    Path(dest_path).parent.mkdir(parents=True, exist_ok=True)
+
     try:
         last_update_time = 0
         last_percent = -1
@@ -241,7 +246,7 @@ async def download_media_mtproto(
             now = time.time()
             current_pct = int((current / total) * 100) if total > 0 else 0
             if progress_callback and (
-                (now - last_update_time >= 3.0 and current_pct >= last_percent + 3)
+                (now - last_update_time >= 2.0 and current_pct >= last_percent + 2)
                 or current >= total
             ):
                 last_update_time = now
@@ -253,9 +258,30 @@ async def download_media_mtproto(
                 except Exception:
                     pass
 
-        msg = await _CLIENT.get_messages(chat_id, message_id)
+        # Strategy 1: Direct file_id download (Fastest, zero PEER_ID_INVALID issues)
+        if file_id:
+            try:
+                logger.info(f"[MTProto] Attempting direct download via file_id ({file_id[:25]}...)...")
+                res_path = await _CLIENT.download_media(
+                    message=file_id,
+                    file_name=dest_path,
+                    progress=_pyro_dl_progress,
+                )
+                if res_path and os.path.exists(res_path):
+                    logger.info(f"[MTProto] Direct file_id download successful: {res_path}")
+                    return True, str(res_path)
+            except Exception as fid_err:
+                logger.warning(f"[MTProto] Direct file_id download failed ({fid_err}). Falling back to get_messages...")
+
+        # Strategy 2: Fetch message via get_messages
+        msg = None
+        try:
+            msg = await _CLIENT.get_messages(chat_id, message_id)
+        except Exception as gm_err:
+            logger.warning(f"[MTProto] get_messages({chat_id}, {message_id}) failed: {gm_err}")
+
         if not msg or not (msg.video or msg.document or msg.audio or msg.animation):
-            return False, "No downloadable media found in specified message."
+            return False, "Could not resolve downloadable media via MTProto."
 
         res_path = await _CLIENT.download_media(
             message=msg,
