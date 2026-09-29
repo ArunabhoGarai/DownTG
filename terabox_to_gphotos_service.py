@@ -142,6 +142,7 @@ async def execute_transfer_job(
                 dl_ok, dl_file, dl_info, dl_err = await resolve_and_download_account_video(
                     item,
                     progress_updater=_dl_progress,
+                    cancel_checker=lambda: _CANCEL_REQUESTED or _SKIP_CURRENT_ITEM,
                 )
                 downloaded_file = dl_file
 
