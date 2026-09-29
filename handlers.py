@@ -111,8 +111,10 @@ from terabox_to_gphotos_service import (
     execute_transfer_job,
     is_transfer_in_progress,
     cancel_current_transfer,
+    skip_current_transfer,
     check_terabox_vs_google_photos,
 )
+from telegraph_extractor import extract_all_download_links
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +271,14 @@ def list_allowed_groups() -> List[Dict[str, Any]]:
 _SEMAPHORE: asyncio.Semaphore = None
 ACTIVE_TASKS: Dict[str, asyncio.Task] = {}
 TASK_REQUESTERS: Dict[str, int] = {}
+ACTIVE_QUEUES: Dict[str, Dict[str, Any]] = {}
+
+
+def build_cancel_queue_keyboard(queue_id: str) -> InlineKeyboardMarkup:
+    """Builds inline keyboard with a Cancel button for multi-link queues."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛑 Cancel Queue", callback_data=f"cancel_queue:{queue_id}")],
+    ])
 
 
 def get_semaphore() -> asyncio.Semaphore:
@@ -638,6 +648,16 @@ def build_teracheck_keyboard(page: int = 0, total_missing: int = 0, page_size: i
     return InlineKeyboardMarkup(buttons)
 
 
+def build_teratransfer_keyboard() -> InlineKeyboardMarkup:
+    """Builds inline keyboard with Skip and Cancel buttons for active transfer."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⏭️ Skip Current Video", callback_data="teratransfer_skip"),
+            InlineKeyboardButton("🛑 Cancel Transfer", callback_data="teratransfer_cancel"),
+        ]
+    ])
+
+
 def format_teracheck_page_text(check_result: Dict[str, Any], page: int = 0, page_size: int = 5) -> str:
     """Renders formatted checker status and paginated missing videos."""
     total_tb = check_result.get("total_terabox", 0)
@@ -799,6 +819,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "☁️ **TeraBox Account & Google Photos Transfer:**\n"
         "• `/terafetch` (or `/teravideos`) — Fetch & count all video files from your TeraBox account using cookies.\n"
         "• `/teratransfer` (or `/gtransfer`) — Transfer TeraBox account videos to Google Photos (10s delay between transfers + failed files report at the end).\n"
+        "• `/skiptransfer` (or `/skip`) — Skip currently transferring video and advance immediately to next file.\n"
         "• `/canceltransfer` — Stop the currently active transfer job.\n"
         "• `/gphotos_auth` (or `/gauth`) — Connect to Google Photos via OAuth 2.0.\n"
         "• `/gphotos_code <code>` — Submit authorization code manually after OAuth login.\n"
@@ -861,12 +882,18 @@ async def gchelp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def edit_status_msg_safe(msg, text: str):
+_UNSET_MARKUP = object()
+
+
+async def edit_status_msg_safe(msg, text: str, reply_markup: Any = _UNSET_MARKUP):
     """Safely edit status text without crashing on transient HTTP transport errors."""
     if not msg:
         return
     try:
-        await msg.edit_text(text, parse_mode=constants.ParseMode.MARKDOWN)
+        if reply_markup is not _UNSET_MARKUP:
+            await msg.edit_text(text, reply_markup=reply_markup, parse_mode=constants.ParseMode.MARKDOWN)
+        else:
+            await msg.edit_text(text, parse_mode=constants.ParseMode.MARKDOWN)
     except Exception as e:
         logger.debug(f"Status message edit suppressed: {e}")
 
@@ -1014,8 +1041,361 @@ async def show_quality_panel(
                 pass
 
 
+async def process_multi_link_queue(
+    links: List[str],
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    is_group: bool,
+):
+    """
+    Sequentially processes a queue of multiple download links (e.g. from Telegraph or multi-link text).
+    Downloads and uploads each media file one by one, immediately cleans up local disk space,
+    allows user cancellation, and posts a final comprehensive summary report.
+    """
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    total_links = len(links)
+    queue_id = f"q_{user_id}_{int(time.time() * 1000)}"
+
+    ACTIVE_QUEUES[queue_id] = {
+        "cancelled": False,
+        "task": asyncio.current_task(),
+        "user_id": user_id,
+    }
+
+    status_msg = await update.message.reply_text(
+        f"📋 **Multi-Link Queue Started**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"• **Total Links:** `{total_links}`\n"
+        f"• **Mode:** Sequential Processing (1 by 1)\n\n"
+        f"⏳ Initializing link 1 of {total_links}...",
+        reply_markup=build_cancel_queue_keyboard(queue_id),
+        parse_mode=constants.ParseMode.MARKDOWN,
+        reply_to_message_id=update.message.message_id,
+    )
+
+    successful: List[Dict[str, Any]] = []
+    failed: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    total_downloaded_bytes = 0
+
+    for index, url in enumerate(links, 1):
+        # Check cancellation before starting next link
+        if ACTIVE_QUEUES.get(queue_id, {}).get("cancelled"):
+            logger.info(f"[Queue {queue_id}] Cancelled by user before item {index}/{total_links}.")
+            break
+
+        # Anti-Bot Cooldown Check
+        on_cooldown, rem_sec = is_link_on_cooldown(url)
+        if on_cooldown:
+            logger.info(f"[Queue {queue_id}] Link {url} skipped due to 5-min anti-bot cooldown.")
+            skipped.append({
+                "url": url,
+                "reason": f"5-min cooldown active ({int(rem_sec)}s remaining)",
+            })
+            await edit_status_msg_safe(
+                status_msg,
+                f"📋 **Queue [{index}/{total_links}]** ⚠️ *Link skipped (Cooldown active)*\n🔗 `{url}`",
+                reply_markup=build_cancel_queue_keyboard(queue_id),
+            )
+            continue
+
+        task_id = f"{user_id}_{int(time.time() * 1000)}"
+        TASK_REQUESTERS[task_id] = user_id
+        downloaded_file = None
+        item_success = False
+        item_title = None
+        item_size = 0
+        item_err = None
+
+        await edit_status_msg_safe(
+            status_msg,
+            f"📋 **Queue [{index}/{total_links}]** ⏳ *Analyzing & Downloading...*\n🔗 `{url}`",
+            reply_markup=build_cancel_queue_keyboard(queue_id),
+        )
+
+        try:
+            ACTIVE_TASKS[task_id] = asyncio.current_task()
+            mark_link_in_progress(url)
+
+            # ── 1. TeraBox Link ──
+            if is_terabox_url(url):
+                async with get_semaphore():
+                    dl_ok, downloaded_file, dl_info, dl_err = await route_download_media(
+                        url,
+                        quality="best",
+                        progress_updater=lambda txt: edit_status_msg_safe(
+                            status_msg,
+                            f"📋 **Queue [{index}/{total_links}]** 📥 {txt}\n🔗 `{url}`",
+                            reply_markup=build_cancel_queue_keyboard(queue_id),
+                        ),
+                    )
+                    if dl_ok and downloaded_file and os.path.exists(downloaded_file):
+                        item_size = os.path.getsize(downloaded_file)
+                        item_title = dl_info.get("title") if dl_info else Path(downloaded_file).name
+                        await edit_status_msg_safe(
+                            status_msg,
+                            f"📋 **Queue [{index}/{total_links}]** 📤 *Uploading {format_bytes(item_size)} to Telegram...*\n📌 `{item_title}`",
+                            reply_markup=build_cancel_queue_keyboard(queue_id),
+                        )
+                        await send_media_to_chat(
+                            bot=context.bot,
+                            chat_id=chat_id,
+                            file_path=downloaded_file,
+                            title=item_title,
+                            uploader=dl_info.get("uploader", "TeraBox") if dl_info else "TeraBox",
+                            duration_sec=None,
+                            url=url,
+                            quality="best",
+                            info=dl_info,
+                            progress_status_updater=lambda txt: edit_status_msg_safe(
+                                status_msg,
+                                f"📋 **Queue [{index}/{total_links}]** 📤 {txt}\n📌 `{item_title}`",
+                                reply_markup=build_cancel_queue_keyboard(queue_id),
+                            ),
+                        )
+                        item_success = True
+                        mark_link_completed(url)
+                        try:
+                            await record_resolved_link(
+                                user_id=user_id,
+                                username=update.effective_user.username,
+                                first_name=update.effective_user.first_name,
+                                last_name=update.effective_user.last_name,
+                                url=url,
+                                title=item_title,
+                                file_size=item_size,
+                                chat_id=chat_id,
+                                is_group=is_group,
+                            )
+                        except Exception as st_err:
+                            logger.error(f"Failed to record TeraBox stats: {st_err}")
+                    else:
+                        item_err = dl_err or "TeraBox download failed."
+
+            # ── 2. Diskwala Link ──
+            elif is_diskwala_url(url):
+                async with get_semaphore():
+                    dl_ok, downloaded_file, dl_info, dl_err = await route_download_media(
+                        url,
+                        quality="best",
+                        progress_updater=lambda txt: edit_status_msg_safe(
+                            status_msg,
+                            f"📋 **Queue [{index}/{total_links}]** 📥 {txt}\n🔗 `{url}`",
+                            reply_markup=build_cancel_queue_keyboard(queue_id),
+                        ),
+                    )
+                    if dl_ok and downloaded_file and os.path.exists(downloaded_file):
+                        item_size = os.path.getsize(downloaded_file)
+                        item_title = dl_info.get("title") if dl_info else Path(downloaded_file).name
+                        await edit_status_msg_safe(
+                            status_msg,
+                            f"📋 **Queue [{index}/{total_links}]** 📤 *Uploading {format_bytes(item_size)} to Telegram...*\n📌 `{item_title}`",
+                            reply_markup=build_cancel_queue_keyboard(queue_id),
+                        )
+                        await send_media_to_chat(
+                            bot=context.bot,
+                            chat_id=chat_id,
+                            file_path=downloaded_file,
+                            title=item_title,
+                            uploader=dl_info.get("uploader", "Diskwala") if dl_info else "Diskwala",
+                            duration_sec=None,
+                            url=url,
+                            quality="best",
+                            info=dl_info,
+                            progress_status_updater=lambda txt: edit_status_msg_safe(
+                                status_msg,
+                                f"📋 **Queue [{index}/{total_links}]** 📤 {txt}\n📌 `{item_title}`",
+                                reply_markup=build_cancel_queue_keyboard(queue_id),
+                            ),
+                        )
+                        item_success = True
+                        mark_link_completed(url)
+                        try:
+                            await record_resolved_link(
+                                user_id=user_id,
+                                username=update.effective_user.username,
+                                first_name=update.effective_user.first_name,
+                                last_name=update.effective_user.last_name,
+                                url=url,
+                                title=item_title,
+                                file_size=item_size,
+                                chat_id=chat_id,
+                                is_group=is_group,
+                            )
+                        except Exception as st_err:
+                            logger.error(f"Failed to record DiskWala stats: {st_err}")
+                    else:
+                        item_err = dl_err or "Diskwala download failed."
+
+            # ── 3. YouTube / Instagram / Facebook / Generic Engine ──
+            else:
+                info_ok, info, info_err = await route_extract_info(
+                    url,
+                    notify_admin_callback=lambda insp, tgt: notify_admin_of_captcha(context.bot, insp, tgt),
+                    progress_updater=lambda txt: edit_status_msg_safe(
+                        status_msg,
+                        f"📋 **Queue [{index}/{total_links}]** 🔍 {txt}",
+                        reply_markup=build_cancel_queue_keyboard(queue_id),
+                    ),
+                )
+                if info_ok and info:
+                    item_title = info.get("title", "Untitled Video")
+                    uploader = info.get("uploader", "Unknown Author")
+                    duration_sec = info.get("duration")
+
+                    async with get_semaphore():
+                        # Try 480p default
+                        dl_ok, downloaded_file, dl_info, dl_err = await route_download_media(
+                            url,
+                            quality="480",
+                            notify_admin_callback=lambda insp, tgt: notify_admin_of_captcha(context.bot, insp, tgt),
+                            progress_updater=lambda txt: edit_status_msg_safe(
+                                status_msg,
+                                f"📋 **Queue [{index}/{total_links}]** 📥 {txt}",
+                                reply_markup=build_cancel_queue_keyboard(queue_id),
+                            ),
+                        )
+                        # Fallback to best if 480 was unavailable
+                        if not dl_ok or not downloaded_file or not os.path.exists(downloaded_file):
+                            dl_ok, downloaded_file, dl_info, dl_err = await route_download_media(
+                                url,
+                                quality="best",
+                                progress_updater=lambda txt: edit_status_msg_safe(
+                                    status_msg,
+                                    f"📋 **Queue [{index}/{total_links}]** 📥 {txt}",
+                                    reply_markup=build_cancel_queue_keyboard(queue_id),
+                                ),
+                            )
+
+                        if dl_ok and downloaded_file and os.path.exists(downloaded_file):
+                            item_size = os.path.getsize(downloaded_file)
+                            if item_size <= MAX_FILE_SIZE_BYTES:
+                                await edit_status_msg_safe(
+                                    status_msg,
+                                    f"📋 **Queue [{index}/{total_links}]** 📤 *Uploading {format_bytes(item_size)} to Telegram...*\n📌 `{item_title}`",
+                                    reply_markup=build_cancel_queue_keyboard(queue_id),
+                                )
+                                await send_media_to_chat(
+                                    bot=context.bot,
+                                    chat_id=chat_id,
+                                    file_path=downloaded_file,
+                                    title=item_title,
+                                    uploader=uploader,
+                                    duration_sec=duration_sec,
+                                    url=url,
+                                    quality="480",
+                                    info=dl_info or info,
+                                    progress_status_updater=lambda txt: edit_status_msg_safe(
+                                        status_msg,
+                                        f"📋 **Queue [{index}/{total_links}]** 📤 {txt}\n📌 `{item_title}`",
+                                        reply_markup=build_cancel_queue_keyboard(queue_id),
+                                    ),
+                                )
+                                item_success = True
+                                mark_link_completed(url)
+                                try:
+                                    await record_resolved_link(
+                                        user_id=user_id,
+                                        username=update.effective_user.username,
+                                        first_name=update.effective_user.first_name,
+                                        last_name=update.effective_user.last_name,
+                                        url=url,
+                                        title=item_title,
+                                        file_size=item_size,
+                                        chat_id=chat_id,
+                                        is_group=is_group,
+                                    )
+                                except Exception as st_err:
+                                    logger.error(f"Failed to record stats: {st_err}")
+                            else:
+                                item_err = f"File is {format_bytes(item_size)}, exceeding {MAX_FILE_SIZE_MB}MB limit."
+                        else:
+                            item_err = dl_err or "Stream could not be downloaded."
+                else:
+                    item_err = info_err or "Could not extract video metadata."
+
+        except asyncio.CancelledError:
+            logger.info(f"[Queue {queue_id}] Task cancelled at item {index}.")
+            item_err = "Operation cancelled."
+            break
+        except Exception as ex:
+            logger.error(f"[Queue {queue_id}] Unexpected error on item {index}: {ex}", exc_info=True)
+            item_err = str(ex)[:120]
+        finally:
+            ACTIVE_TASKS.pop(task_id, None)
+            TASK_REQUESTERS.pop(task_id, None)
+            if downloaded_file:
+                remove_file_safely(downloaded_file)
+                downloaded_file = None
+
+        if item_success:
+            total_downloaded_bytes += item_size
+            successful.append({
+                "url": url,
+                "title": item_title or f"Video {index}",
+                "size": item_size,
+            })
+        else:
+            mark_link_failed(url)
+            failed.append({
+                "url": url,
+                "reason": item_err or "Download failed",
+            })
+
+        # Sequential cooldown between items
+        if index < total_links and not ACTIVE_QUEUES.get(queue_id, {}).get("cancelled"):
+            await asyncio.sleep(2)
+
+    was_cancelled = ACTIVE_QUEUES.get(queue_id, {}).get("cancelled", False)
+    ACTIVE_QUEUES.pop(queue_id, None)
+
+    title_banner = "🛑 **Multi-Link Queue Cancelled by User**" if was_cancelled else "🏁 **Multi-Link Queue Completed!**"
+
+    succ_lines = []
+    for i, s in enumerate(successful[:12], 1):
+        succ_lines.append(f"  {i}. ✅ `{s['title']}` ({format_bytes(s['size'])})")
+    if len(successful) > 12:
+        succ_lines.append(f"  ... and {len(successful) - 12} more files sent to chat.")
+
+    fail_lines = []
+    for i, f in enumerate(failed[:10], 1):
+        fail_lines.append(f"  {i}. ❌ `{f['url']}`\n     ↳ *Reason:* {f['reason']}")
+    if len(failed) > 10:
+        fail_lines.append(f"  ... and {len(failed) - 10} more failed.")
+
+    report = (
+        f"{title_banner}\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📊 **Batch Statistics:**\n"
+        f"• **Total Queued:** `{total_links}` links\n"
+        f"• **✅ Successfully Sent:** `{len(successful)}` ({format_bytes(total_downloaded_bytes)})\n"
+        f"• **❌ Failed:** `{len(failed)}`\n"
+    )
+    if skipped:
+        report += f"• **⏭️ Skipped (Cooldown):** `{len(skipped)}`\n"
+    report += "\n"
+
+    if succ_lines:
+        report += "✅ **Completed Files:**\n" + "\n".join(succ_lines) + "\n\n"
+
+    if fail_lines:
+        report += "❌ **Failed Links:**\n" + "\n".join(fail_lines) + "\n\n"
+
+    if not was_cancelled and len(failed) == 0 and len(successful) > 0:
+        report += "🎉 **All links were processed with 100% success!**"
+
+    try:
+        await status_msg.edit_text(report, parse_mode=constants.ParseMode.MARKDOWN)
+    except Exception:
+        try:
+            await update.message.reply_text(report, parse_mode=constants.ParseMode.MARKDOWN)
+        except Exception:
+            pass
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Detects URLs, checks group authorization, attempts 480p default download, and falls back to quality panel on failure."""
+    """Detects URLs, expands Telegraph/paste sites, checks authorization, and processes single or multi-link downloads."""
     if not update.message:
         return
 
@@ -1037,18 +1417,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_group and not is_group_allowed(chat.id):
         return
 
-    # Strictly check if message contains a web URL (http:// or https://)
-    match = URL_REGEX.search(text)
-    if not match:
+    # Extract all download links (including expanding Telegraph & paste sites)
+    links = await extract_all_download_links(text)
+    if not links:
         # Silently ignore non-link messages in groups to prevent conversation spam
         if not is_group:
             await update.message.reply_text(
-                "❌ No valid link detected. Please send a valid YouTube, Facebook, Instagram, or TeraBox video link."
+                "❌ No valid link detected. Please send a valid YouTube, Facebook, Instagram, TeraBox, or Telegraph link."
             )
         return
 
-    url = match.group(0)
-    user_id = update.effective_user.id
+    # ── Multi-Link Queue Mode ──
+    # If the message contains more than 1 link, process each link sequentially
+    if len(links) > 1:
+        await process_multi_link_queue(links, update, context, is_group)
+        return
+
+    url = links[0]
 
     # Anti-Bot Protection: Enforce 5-minute cooldown on duplicate link downloads
     on_cooldown, remaining_sec = is_link_on_cooldown(url)
@@ -1455,6 +1840,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     if action in (
         "terafetch_page", "terafetch_refresh", "teragphotos_transfer", "teragphotos_cancel",
         "teracheck_page", "teracheck_refresh", "teragphotos_transfer_missing",
+        "teratransfer_skip", "teratransfer_cancel", "teragphotos_skip",
     ):
         if not is_admin(user_id):
             await query.answer("⛔ This action is restricted to the bot developer.", show_alert=True)
@@ -1537,10 +1923,12 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             f"📦 **Queue:** `{len(missing_videos)}` missing videos\n"
             f"⏱️ **Cooldown:** `10s` between each transfer\n"
             "Initializing pipeline...",
+            reply_markup=build_teratransfer_keyboard(),
             parse_mode=constants.ParseMode.MARKDOWN,
         )
-        async def _update_status(txt: str):
-            await edit_status_msg_safe(status_msg, txt)
+        async def _update_status(txt: str, is_finished: bool = False):
+            kb = None if is_finished else build_teratransfer_keyboard()
+            await edit_status_msg_safe(status_msg, txt, reply_markup=kb)
         asyncio.create_task(execute_transfer_job(missing_videos, status_updater=_update_status))
         return
 
@@ -1565,14 +1953,30 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             f"🚀 **Transfer Pipeline Initialized**\n"
             f"Queue: `{len(videos)}` videos\n"
             "Cooldown: `10s` between transfers\n"
-            "Starting..."
+            "Starting...",
+            reply_markup=build_teratransfer_keyboard(),
         )
-        async def _update_status(txt: str):
-            await edit_status_msg_safe(status_msg, txt)
+        async def _update_status(txt: str, is_finished: bool = False):
+            kb = None if is_finished else build_teratransfer_keyboard()
+            await edit_status_msg_safe(status_msg, txt, reply_markup=kb)
         asyncio.create_task(execute_transfer_job(videos, status_updater=_update_status))
         return
 
-    if action == "teragphotos_cancel":
+    if action in ("teratransfer_skip", "teragphotos_skip"):
+        if not is_transfer_in_progress():
+            await query.answer("ℹ️ No active transfer job is currently running.", show_alert=True)
+            return
+        skipped = skip_current_transfer()
+        if skipped:
+            await query.answer("⏭️ Skipping current video! Purging cache and memory...", show_alert=False)
+        else:
+            await query.answer("⚠️ Could not skip; no file is currently transferring or transfer is ending.", show_alert=True)
+        return
+
+    if action in ("teratransfer_cancel", "teragphotos_cancel"):
+        if not is_transfer_in_progress():
+            await query.answer("ℹ️ No active transfer job is currently running.", show_alert=True)
+            return
         cancel_current_transfer()
         await query.answer("🛑 Transfer cancellation requested.", show_alert=True)
         return
@@ -1605,6 +2009,21 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await stop_vnc_session()
         await edit_query_message(query, "🛑 **VNC Browser Session Closed.**")
         await query.answer("VNC Closed.")
+        return
+
+    if action == "cancel_queue":
+        queue_id = parts[1] if len(parts) > 1 else ""
+        if queue_id in ACTIVE_QUEUES:
+            ACTIVE_QUEUES[queue_id]["cancelled"] = True
+            try:
+                await query.answer("🛑 Queue cancellation requested! Stopping after current item completes.", show_alert=True)
+            except Exception:
+                pass
+        else:
+            try:
+                await query.answer("⚠️ Queue is no longer active.", show_alert=False)
+            except Exception:
+                pass
         return
 
     if action == "cancel":
@@ -1996,6 +2415,13 @@ async def refresh_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ACTIVE_TASKS.clear()
     TASK_REQUESTERS.clear()
     URL_CACHE.clear()
+
+    for qid, qdata in list(ACTIVE_QUEUES.items()):
+        qdata["cancelled"] = True
+        qtask = qdata.get("task")
+        if qtask and not qtask.done():
+            qtask.cancel()
+    ACTIVE_QUEUES.clear()
 
     # Instantly recreate the concurrency semaphore so all slots are 100% free
     _SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
@@ -2868,12 +3294,14 @@ async def teratransfer_command(update: Update, context: ContextTypes.DEFAULT_TYP
         f"📦 **Queue:** `{len(videos)}` videos\n"
         f"⏱️ **Cooldown:** `10s` between each transfer\n"
         "Initializing pipeline...",
+        reply_markup=build_teratransfer_keyboard(),
         parse_mode=constants.ParseMode.MARKDOWN,
         reply_to_message_id=update.message.message_id,
     )
 
-    async def _update_status(txt: str):
-        await edit_status_msg_safe(status_msg, txt)
+    async def _update_status(txt: str, is_finished: bool = False):
+        kb = None if is_finished else build_teratransfer_keyboard()
+        await edit_status_msg_safe(status_msg, txt, reply_markup=kb)
 
     asyncio.create_task(execute_transfer_job(videos, status_updater=_update_status))
 
@@ -2941,6 +3369,36 @@ async def canceltransfer_command(update: Update, context: ContextTypes.DEFAULT_T
         parse_mode=constants.ParseMode.MARKDOWN,
         reply_to_message_id=update.message.message_id,
     )
+
+
+async def skiptransfer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Skips the currently transferring video in an active TeraBox -> Google Photos job.
+    Usage: /skiptransfer or /skip
+    """
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text(DEV_RESTRICTED_MESSAGE)
+        return
+
+    if not is_transfer_in_progress():
+        await update.message.reply_text("ℹ️ No active transfer job is currently running.")
+        return
+
+    skipped = skip_current_transfer()
+    if skipped:
+        await update.message.reply_text(
+            "⏭️ **Skip signal sent!**\n"
+            "The stuck transfer has been aborted, residual files purged from disk and memory, and the next file will start immediately.",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_to_message_id=update.message.message_id,
+        )
+    else:
+        await update.message.reply_text(
+            "⚠️ **Could not skip right now.**\nEither no file is currently downloading/uploading, or the transfer is already completing.",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_to_message_id=update.message.message_id,
+        )
 
 
 _OAUTH_HTTP_SERVER = None
@@ -3367,6 +3825,8 @@ def register_handlers(application):
     application.add_handler(CommandHandler("teratransfer", teratransfer_command))
     application.add_handler(CommandHandler("gtransfer", teratransfer_command))
     application.add_handler(CommandHandler("canceltransfer", canceltransfer_command))
+    application.add_handler(CommandHandler("skiptransfer", skiptransfer_command))
+    application.add_handler(CommandHandler("skip", skiptransfer_command))
     application.add_handler(CommandHandler("gphotos_auth", gphotos_auth_command))
     application.add_handler(CommandHandler("gauth", gphotos_auth_command))
     application.add_handler(CommandHandler("gphotos_code", gphotos_code_command))
